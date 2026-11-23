@@ -240,6 +240,8 @@ rba enable gdm            # scoped gdm-password override (login + lock screen)
 rba disable gdm           # rollback
 rba enable polkit         # scoped polkit-1 override
 rba disable polkit        # rollback
+rba enable sudo           # scoped sudo override
+rba disable sudo          # rollback
 ```
 
 - `enable` and `disable` require administrator rights and are scoped to one

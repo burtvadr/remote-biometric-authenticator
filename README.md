@@ -241,6 +241,8 @@ sudo ./packaging/arch/pam-gdm-rba.sh --dry-run
 sudo ./packaging/arch/pam-gdm-rba.sh
 sudo ./packaging/arch/pam-polkit-rba.sh --dry-run
 sudo ./packaging/arch/pam-polkit-rba.sh
+sudo ./packaging/arch/pam-sudo-rba.sh --dry-run
+sudo ./packaging/arch/pam-sudo-rba.sh
 ```
 
 The GDM override covers the GNOME login and lock screen. The polkit override

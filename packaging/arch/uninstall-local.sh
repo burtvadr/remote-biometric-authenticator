@@ -53,6 +53,10 @@ if [ -f /etc/pam.d/.polkit-1.device.rollback ]; then
     echo "==> rolling back the polkit-1 PAM override"
     bash "$ROOT/packaging/arch/pam-polkit-rba.sh" --rollback
 fi
+if [ -f /etc/pam.d/.sudo.device.rollback ]; then
+    echo "==> rolling back the sudo PAM override"
+    bash "$ROOT/packaging/arch/pam-sudo-rba.sh" --rollback
+fi
 
 # Safety: refuse to remove the module while any PAM stack still references it.
 if grep -rls 'pam_rba' /etc/pam.d/ 2>/dev/null; then
