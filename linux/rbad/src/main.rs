@@ -112,6 +112,7 @@ fn parse_args() -> Args {
             }
             "--host-name" => config.host_name = Some(value("--host-name")),
             "--no-mdns" => config.advertise_mdns = false,
+            "--mdns-interface" => config.mdns_interface = Some(value("--mdns-interface")),
             "--check" => check = true,
             "-h" | "--help" => usage(),
             other => {

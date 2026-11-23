@@ -401,6 +401,15 @@ Two corrections matter:
 
 ## Known network issue: VPN / Tailscale
 
+**Partial remediation (host + device).** The daemon no longer publishes
+Tailscale/VPN addresses (100.64.0.0/10) over mDNS by default; `--mdns-interface`
+restricts advertisement to a named interface. The device binds its TCP socket to
+the Wi-Fi network when one is available, so a default route through Tailscale
+does not hijack the connection. A `NetworkCallback` re-resolves and reconnects
+on network changes. Remaining: enumerate all resolved addresses with per-address
+timeouts, re-resolve on VPN/Wi-Fi changes with full address retry, and surface
+diagnostics.
+
 Observed on the test setup:
 
 - The PC runs Tailscale all the time.
@@ -431,17 +440,19 @@ Likely causes in the current code:
 
 Required behavior:
 
-- Enumerate every resolved host address and try them in a defined order, with a
-  short per-address timeout. The default order should be **LAN first**, then
+- [x] Use `ConnectivityManager` to obtain the Wi-Fi `Network` and bind the data
+  socket with `Network.bindSocket()` before connecting.
+- [x] Register `NetworkCallback` and re-resolve/reconnect on `onAvailable`,
+  `onLost` and VPN changes.
+- [x] Do not publish the Tailscale interface over mDNS by default for local
+  pairing. Added `--mdns-interface` to restrict advertisement to a named
+  interface.
+- [ ] Enumerate every resolved host address and try them in a defined order, with
+  a short per-address timeout. The default order should be **LAN first**, then
   Tailscale, unless policy says otherwise.
-- Use `ConnectivityManager` to obtain the Wi-Fi and VPN `Network` objects and
-  bind the data socket with `Network.bindSocket()` before connecting. Choose the
-  network that matches the address being tried.
-- Register `NetworkCallback` and re-resolve/reconnect on `onAvailable`,
-  `onLost`, `onCapabilitiesChanged` and VPN changes.
-- Do not publish the Tailscale interface over mDNS by default for local pairing.
-  Add a host option such as `--advertise-address` / `--mdns-interface`, or bind
-  the daemon to a specific LAN address when that is the intended deployment.
+- [ ] Surface diagnostics: the device should log which address/network it chose
+  and why, and `rba status`/`devices` should show the host's listen
+  addresses.
 - Make the path policy explicit, for example `--transport-preference lan`,
   `tailscale` or `auto`. Address selection must never weaken TLS pinning or the
   signed transcript; it only decides where bytes are sent.

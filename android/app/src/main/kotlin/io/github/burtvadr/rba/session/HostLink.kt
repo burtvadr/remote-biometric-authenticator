@@ -82,6 +82,8 @@ class HostLink(
     private var multicastLock: WifiManager.MulticastLock? = null
 
     /** Begins discovery and reconnect handling. Safe to call more than once. */
+    private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
+
     fun start() {
         val token = synchronized(linkLock) {
             if (running) return
@@ -91,6 +93,19 @@ class HostLink(
         }
         acquireMulticastLock()
         session.setPairingSettledListener { closeActiveForReconnect() }
+        // Re-resolve and reconnect when the network changes (Wi-Fi <-> VPN).
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+            as? android.net.ConnectivityManager
+        val cb = object : android.net.ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: android.net.Network) {
+                closeActiveForReconnect()
+            }
+            override fun onLost(network: android.net.Network) {
+                closeActiveForReconnect()
+            }
+        }
+        networkCallback = cb
+        cm?.registerDefaultNetworkCallback(cb)
         loop = scope.launch(Dispatchers.IO) { runLoop(token) }
     }
 
@@ -106,6 +121,12 @@ class HostLink(
         }
         loop?.cancel()
         loop = null
+        networkCallback?.let { cb ->
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+                as? android.net.ConnectivityManager
+            cm?.unregisterNetworkCallback(cb)
+        }
+        networkCallback = null
         session.setPairingSettledListener(null)
         releaseMulticastLock()
         session.detachTransport()

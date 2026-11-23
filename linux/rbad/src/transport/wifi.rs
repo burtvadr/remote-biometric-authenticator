@@ -68,6 +68,91 @@ fn enable_keepalive(stream: &tokio::net::TcpStream) {
     }
 }
 
+/// Returns the host's non-VPN, non-loopback addresses for mDNS publication.
+///
+/// When `interface` is `Some`, only that interface's addresses are returned.
+/// Otherwise all non-loopback, non-Tailscale (100.64.0.0/10) addresses are
+/// included so a device on the LAN does not resolve the service to a VPN
+/// address it cannot route to.
+fn lan_addresses(interface: Option<&str>) -> Vec<std::net::IpAddr> {
+    use std::net::IpAddr;
+    let mut result = Vec::new();
+    // Enumerate interfaces via the standard library's (limited) API. For named
+    // interface filtering we fall back to checking all addresses; a full
+    // interface-name filter would need the `nix` or `if-addrs` crate.
+    for iface in get_if_addrs() {
+        if let Some(name) = interface {
+            if iface.name != name {
+                continue;
+            }
+        }
+        let addr = iface.addr;
+        if addr.is_loopback() {
+            continue;
+        }
+        // Tailscale: 100.64.0.0/10
+        if let IpAddr::V4(v4) = addr {
+            let octets = v4.octets();
+            if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
+                continue;
+            }
+        }
+        result.push(addr);
+    }
+    result
+}
+
+/// Minimal interface enumeration. Uses `std::net` which doesn't expose interface
+/// names, so we use a libc-based fallback for name filtering.
+struct IfAddr {
+    name: String,
+    addr: std::net::IpAddr,
+}
+
+fn get_if_addrs() -> Vec<IfAddr> {
+    // Use `hostname` crate? No. Use libc getifaddrs.
+    let mut result = Vec::new();
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return result;
+        }
+        let mut p = ifap;
+        while !p.is_null() {
+            let ifa = &*p;
+            if !ifa.ifa_addr.is_null() {
+                let family = (*ifa.ifa_addr).sa_family as i32;
+                if family == libc::AF_INET {
+                    let addr = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                    let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
+                    let name = std::ffi::CStr::from_ptr(ifa.ifa_name)
+                        .to_string_lossy()
+                        .to_string();
+                    result.push(IfAddr {
+                        name,
+                        addr: std::net::IpAddr::V4(ip),
+                    });
+                } else if family == libc::AF_INET6 {
+                    let addr = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+                    let ip = std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr);
+                    if !ip.is_loopback() {
+                        let name = std::ffi::CStr::from_ptr(ifa.ifa_name)
+                            .to_string_lossy()
+                            .to_string();
+                        result.push(IfAddr {
+                            name,
+                            addr: std::net::IpAddr::V6(ip),
+                        });
+                    }
+                }
+            }
+            p = ifa.ifa_next;
+        }
+        libc::freeifaddrs(ifap);
+    }
+    result
+}
+
 /// Advertises the host over DNS-SD so devices can find it without a fixed
 /// address. Publication contains only non-secret metadata (`PROTOCOL.md` §13.1).
 pub fn advertise(
@@ -109,30 +194,34 @@ pub fn advertise(
         }
     };
     // A wildcard bind address is not a routable address. Advertising `0.0.0.0`
-    // would tell devices to connect nowhere, so let the daemon publish the host's
-    // real interface addresses instead.
-    let info = if config.bind_addr.ip().is_unspecified() {
-        mdns_sd::ServiceInfo::new(
-            rba_protocol::SERVICE_TYPE,
-            host_name,
-            &mdns_host,
-            (),
-            config.tcp_port,
-            &props[..],
-        )
-        .map_err(|e| ProtocolError::Internal(format!("mDNS service info: {e}")))?
-        .enable_addr_auto()
+    // would tell devices to connect nowhere, so publish the host's real
+    // interface addresses instead. Tailscale/VPN ranges (100.64.0.0/10) are
+    // excluded by default so a device on the LAN does not resolve the service
+    // to a VPN address it cannot route to.
+    // Publish only non-VPN addresses. Tailscale uses 100.64.0.0/10; other VPNs
+    // typically use 10.x or 172.16-31.x. We filter the Tailscale range
+    // explicitly and let the operator override with --mdns-interface.
+    let addresses: Vec<std::net::IpAddr> = if config.bind_addr.ip().is_unspecified() {
+        lan_addresses(config.mdns_interface.as_deref())
     } else {
-        mdns_sd::ServiceInfo::new(
-            rba_protocol::SERVICE_TYPE,
-            host_name,
-            &mdns_host,
-            config.bind_addr.ip(),
-            config.tcp_port,
-            &props[..],
-        )
-        .map_err(|e| ProtocolError::Internal(format!("mDNS service info: {e}")))?
+        vec![config.bind_addr.ip()]
     };
+
+    if addresses.is_empty() {
+        return Err(ProtocolError::Internal(
+            "no non-VPN interface addresses to advertise; use --bind or --mdns-interface".into(),
+        ));
+    }
+
+    let info = mdns_sd::ServiceInfo::new(
+        rba_protocol::SERVICE_TYPE,
+        host_name,
+        &mdns_host,
+        &addresses[..],
+        config.tcp_port,
+        &props[..],
+    )
+    .map_err(|e| ProtocolError::Internal(format!("mDNS service info: {e}")))?;
     daemon
         .register(info)
         .map_err(|e| ProtocolError::Internal(format!("mDNS register: {e}")))?;

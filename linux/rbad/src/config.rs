@@ -28,6 +28,10 @@ pub struct Config {
     pub bind_addr: std::net::SocketAddr,
     /// Announce the host over mDNS/DNS-SD.
     pub advertise_mdns: bool,
+    /// Interface name to advertise on (e.g. "eth0", "wlan0"). When set, only
+    /// this interface's addresses are published, which keeps VPN/Tailscale
+    /// addresses off the wire. When None, all non-VPN interfaces are used.
+    pub mdns_interface: Option<String>,
     /// Transport preference (`PROTOCOL.md` §13).
     pub transport: rba_protocol::types::Transport,
     /// Optional fixed device endpoint, used when mDNS is unavailable (guest
@@ -54,6 +58,7 @@ impl Default for Config {
             tcp_port: DEFAULT_TCP_PORT,
             bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], DEFAULT_TCP_PORT)),
             advertise_mdns: true,
+            mdns_interface: None,
             transport: rba_protocol::types::Transport::Wifi,
             device_endpoint: None,
             host_name: None,
@@ -72,6 +77,7 @@ impl Config {
             tcp_port: port,
             bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
             advertise_mdns: false,
+            mdns_interface: None,
             transport: rba_protocol::types::Transport::Wifi,
             device_endpoint: None,
             host_name: Some("test-host".into()),

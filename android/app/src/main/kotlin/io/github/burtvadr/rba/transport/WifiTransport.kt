@@ -1,6 +1,8 @@
 package io.github.burtvadr.rba.transport
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.util.Log
@@ -170,6 +172,18 @@ class WifiTransport(
     @Throws(IOException::class)
     fun connect(host: String, port: Int, connectTimeoutMillis: Int = 8000) {
         val plain = Socket()
+        // Bind to the Wi-Fi network when one is available, so a default route
+        // through a VPN (Tailscale, WireGuard) does not hijack the connection.
+        // The address being tried must still be reachable on that network.
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+            as? ConnectivityManager
+        val wifiNetwork = cm?.allNetworks?.firstOrNull { n ->
+            val caps = cm.getNetworkCapabilities(n)
+            caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true
+        }
+        if (wifiNetwork != null) {
+            wifiNetwork.bindSocket(plain)
+        }
         plain.connect(InetSocketAddress(host, port), connectTimeoutMillis)
 
         val factory = if (pinnedCertificate != null) {
