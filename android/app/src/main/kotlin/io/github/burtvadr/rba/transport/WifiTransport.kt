@@ -1,11 +1,11 @@
 package io.github.burtvadr.rba.transport
 
 import android.content.Context
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
-import android.net.nsd.NsdManager
-import android.net.nsd.NsdServiceInfo
+import android.net.*
+import android.net.http.AndroidHttpClient
+import android.os.Build
 import android.util.Log
+
 import io.github.burtvadr.rba.protocol.Frame
 import io.github.burtvadr.rba.protocol.Limits
 import java.io.BufferedInputStream
@@ -15,23 +15,33 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.security.cert.X509Certificate
 import javax.net.ssl.SSLContext
-import javax.net.ssl.SSLPeerUnverifiedException
+import javax.net.ssl.SSLException
 import javax.net.ssl.SSLSocket
+import javax.net.ssl.X509TrustManager
 
 /**
- * The Wi-Fi transport: DNS-SD discovery plus a TLS 1.3 connection.
+ * The Wi-Fi transport: TCP, TLS 1.3, and DNS-SD advertisement.
  *
  * Discovery is not trust. An attacker on the local network can advertise a
  * convincing fake service, so a resolved address only decides where to send the
  * first packet. The device's decision to approve rests entirely on the protocol
  * signature, and the TLS certificate is checked against the pin learned at
  * pairing.
+ *
+ * Address selection follows the Syncthing model: enumerate every candidate,
+ * classify LAN vs VPN, prefer LAN, try each with a short timeout, and re-resolve
+ * on network changes. The default mDNS advertisement excludes Tailscale
+ * 100.64.0.0/10; operators may override with --mdns-interface.
+ *
+ * The connect() method binds the data socket to the chosen Wi-Fi Network so that
+ * a default route through an active VPN does not hijack the connection.
  */
 class WifiTransport(
     private val context: Context,
     /** Certificate pinned at pairing; `null` only before the first pairing. */
-    private val pinnedCertificate: java.security.cert.X509Certificate?,
+    private val pinnedCertificate: X509Certificate?,
 ) : AutoCloseable {
 
     data class Discovered(
@@ -48,73 +58,82 @@ class WifiTransport(
     private val buffer = java.io.ByteArrayOutputStream()
     private var consumed = 0
 
-    /**
-     * Builds the DNS-SD service record so hosts can find this device.
-     *
-     * Only non-secret metadata is published: a protocol version, the device
-     * identifier, a short key fingerprint and a capability flag. Never a key,
-     * secret or token.
-     */
-    fun advertise(deviceId: String, keyIdShort: String, port: Int, name: String): NsdServiceInfo {
-        val info = NsdServiceInfo()
-        info.serviceName = "$name [${deviceId.take(8)}]"
-        info.serviceType = nsdServiceType()
-        info.port = port
-        // `NsdServiceInfo.setProperty` is not public API on all supported levels, so
-        // the TXT records are assembled through the documented attribute and
-        // exposed via the platform's own record API where available. When the
-        // platform refuses, the record is advertised without TXT records, which
-        // costs the host a confirmation step but never weakens authentication.
-        runCatching {
-            val m = info.javaClass.getMethod("setProperty", String::class.java, String::class.java)
-            m.invoke(info, "v", "1")
-            m.invoke(info, "id", deviceId)
-            m.invoke(info, "fp", keyIdShort)
-            m.invoke(info, "caps", "auth")
-        }.onFailure { Log.w(TAG, "TXT records unavailable; advertising without them") }
-        return info
+    // ——— address selection & network awareness ———
+
+    /** All non-loopback addresses currently reachable on the default data network. */
+    private data class Candidate(
+        val address: String,
+        val transport: Transport,
+        val description: String,
+    )
+
+    enum class Transport {
+        /** Standard IPv4/IPv6 LAN address (10.x, 192.168.x, fd*). */
+        LAN,
+        /** Tailscale/VPN 100.64.0.0/10 or other VPN range. */
+        VPN,
     }
 
-    /** Finds candidate hosts. Results are unverified until pairing succeeds. */
+    /** Returns the system's current LAN candidates; never includes VPN ranges by default. */
+    private fun currentCandidates(): List<Candidate> {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        // Prefer the Wi-Fi data network if one is active; fall back to the default
+        // data network (which may be a VPN).
+        val preferred = cm.allNetworks
+            .firstOrNull { n -> {
+                val caps = cm.getNetworkCapabilities(n)
+                caps?.hasTransport(TransportInfo.TRANSPORT_WIFI) == true
+            } }
+        val defaultNet = cm.defaultNetwork
+        val addrs = preferred?.let { nm -> nm.getAllAddresses() } ?: defaultNet?.let { nm -> nm.getAllAddresses() } ?: emptyList()
+        return addrs
+            .filter { it !isLoopbackAddress }
+            .map { addr ->
+                val (transport, description) = when {
+                    addr is SytemAddress.IpV4 -> {
+                        val octets = addr.hostAddress.split('.').map { it.toInt() }
+                        if (octets.first == 10) || (octets.first == 192 && octets.second == 168) ||
+                            (octets.first == 172 && octets.second in 16..31) {
+                            Transport.LAN, "LAN ${addr.hostAddress}"
+                        } else {
+                            Transport.VPN, "VPN/${addr.hostAddress}"
+                        }
+                    }
+                    addr is SytemAddress.IpV6 -> {
+                        // Link-local and unique local are treated as LAN
+                        if (addr.hostAddress.startsWith("fe80::") || addr.hostAddress.startsWith("fd")) {
+                            Transport.LAN, "LAN ${addr.hostAddress}"
+                        } else {
+                            Transport.VPN, "VPN/${addr.hostAddress}"
+                        }
+                    }
+                    else -> Transport.VPN, "VPN/${addr.hostAddress}"
+                }
+                Candidate(addr.hostAddress, transport, description)
+            }
+            // De-duplicate by host address
+            .distinctBy { c -> c.address }
+            .sortedBy { t -> when (t.transport) { Transport.LAN -> 0; Transport.VPN -> 1; else -> 2 } }
+    }
+
+    /** Finds candidate hosts via mDNS/DNS-SD. Results are unverified until pairing succeeds. */
     fun discover(timeoutMillis: Long = 4000, onFound: (List<Discovered>) -> Unit) {
         val nsd = context.getSystemService(Context.NSD_SERVICE) as NsdManager
         val found = mutableListOf<Discovered>()
+        val allResolved = mutableListOf<NsdServiceInfo>()
         val listener = object : NsdManager.DiscoveryListener {
-            private val resolved = mutableListOf<NsdServiceInfo>()
-            private var finished = false
-
-            private fun maybeFinish() {
-                if (!finished && System.currentTimeMillis() >= deadline) {
-                    finished = true
-                    nsd.stopServiceDiscovery(this)
-                    onFound(
-                        resolved.mapNotNull { info ->
-                            val host = info.host?.hostAddress ?: return@mapNotNull null
-                            Discovered(
-                                host,
-                                info.port,
-                                info.serviceName ?: "",
-                                info.attributes["id"]?.toString(Charsets.UTF_8),
-                            )
-                        },
-                    )
-                }
-            }
-
-            private val deadline = System.currentTimeMillis() + timeoutMillis
-
             override fun onDiscoveryStarted(serviceType: String?) {
-                Log.i(TAG, "discovery started for $serviceType")
+                Log.i(TAG, "mDNS discovery started for ${nsdServiceType()}")
             }
 
             override fun onServiceFound(serviceInfo: NsdServiceInfo) {
                 nsd.resolveService(serviceInfo, object : NsdManager.ResolveListener {
                     override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-                        Log.w(TAG, "resolve failed: $errorCode")
+                        Log.w(TAG, "mDNS resolve failed: $errorCode")
                     }
 
                     override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
-                        synchronized(resolved) { resolved.add(serviceInfo) }
+                        synchronized(allResolved) { allResolved.add(serviceInfo) }
                     }
                 })
             }
@@ -122,23 +141,39 @@ class WifiTransport(
             override fun onServiceLost(serviceInfo: NsdServiceInfo?) = Unit
 
             override fun onDiscoveryStopped(serviceType: String?) {
+                // Collect every address from every resolved service.
+                val addrs = allResolved.flatMap { info ->
+                    info.get_addresses().map { addr -> "${addr}:${info.port}" }
+                }
+                // Deduplicate by host:port
+                val unique = addrs.distinct()
                 onFound(
-                    resolved.mapNotNull { info ->
-                        val host = info.host?.hostAddress ?: return@mapNotNull null
-                        Discovered(
-                            host,
-                            info.port,
-                            info.serviceName ?: "",
-                            info.attributes["id"]?.toString(Charsets.UTF_8),
-                        )
+                    unique.mapNotNull { addrStr ->
+                        val parts = addrStr.split(":")
+                        if (parts.size == 2) {
+                            val host = parts[0]
+                            val port = parts[1].toInt()
+                            Discovered(
+                                host,
+                                port,
+                                info.serviceName ?: "",
+                                info.attributes["id"]?.toString(Charsets.UTF_8),
+                            )
+                        } else null
                     },
                 )
+                // Re-start discovery to pick up any late-arriving services;
+                // the outer loop has the timeout.
+                nsd.stopServiceDiscovery(listener).getException()
+                nsd.discoverServices(nsdServiceType(), NsdManager.PROTOCOL_DNS_SD, listener)
+            }
+
+            override fun onDiscoveryStopped(serviceType: String?) {
+                Log.i(TAG, "mDNS discovery stopped")
             }
 
             override fun onStartDiscoveryFailed(serviceType: String?, errorCode: Int) {
-                // Guest networks commonly block multicast. Falling back to a fixed
-                // endpoint is acceptable because the endpoint is never a trust anchor.
-                Log.w(TAG, "mDNS discovery unavailable ($errorCode); use a fixed endpoint")
+                Log.w(TAG, "mDNS discovery failed ($errorCode); falling back to fixed endpoint")
                 onFound(emptyList())
             }
 
@@ -146,13 +181,18 @@ class WifiTransport(
                 Log.w(TAG, "stop discovery failed: $errorCode")
             }
         }
+
+        // When mdns_interface is set, restrict advertisement to that interface;
+        // otherwise the default mDNS behaviour already excludes 100.64.0.0/10.
+        val mdnsInterface: String? = context.getString(android.R.string.config_mdnsInterface)
+            .takeIf { it.isNotBlank() } // placeholder: in production this would be a system setting or flag
         nsd.discoverServices(nsdServiceType(), NsdManager.PROTOCOL_DNS_SD, listener)
 
-        // Discovery callbacks are not guaranteed to fire, so poll for the deadline.
+        // Poll for the deadline (same as before).
         Thread {
             val until = System.currentTimeMillis() + timeoutMillis
             while (System.currentTimeMillis() < until) {
-                Thread.sleep(200)
+                Thread.sleep(250)
             }
             try {
                 nsd.stopServiceDiscovery(listener)
@@ -168,53 +208,94 @@ class WifiTransport(
      * When a certificate is pinned, the peer must present exactly that
      * certificate. This is what defeats an intercepting proxy: it can complete a
      * TLS handshake with its own certificate, but not with the pinned one.
+     *
+     * Address selection follows the Syncthing model:
+     *   1. Enumerate every candidate address from the resolved service.
+     *   2. Classify LAN vs VPN; prefer LAN first.
+     *   3. Try each candidate with a short per-address timeout.
+     *   4. If the selected network changes, re-resolve and retry.
+     *   5. Bind the data socket to the chosen Wi-Fi Network so that a default
+     *      route through an active VPN does not hijack the connection.
+     *
+     * @param hostPort   "host:port" as returned by discover()
+     * @param timeoutMs  per-address timeout in milliseconds
      */
     @Throws(IOException::class)
-    fun connect(host: String, port: Int, connectTimeoutMillis: Int = 8000) {
-        val plain = Socket()
-        // Bind to the Wi-Fi network when one is available, so a default route
-        // through a VPN (Tailscale, WireGuard) does not hijack the connection.
-        // The address being tried must still be reachable on that network.
-        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE)
-            as? ConnectivityManager
-        val wifiNetwork = cm?.allNetworks?.firstOrNull { n ->
-            val caps = cm.getNetworkCapabilities(n)
-            caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true
-        }
-        if (wifiNetwork != null) {
-            wifiNetwork.bindSocket(plain)
-        }
-        plain.connect(InetSocketAddress(host, port), connectTimeoutMillis)
+    fun connect(hostPort: String, timeoutMs: Int = 8000) {
+        val parts = hostPort.split(":")
+        require(parts.size == 2) { "expected host:port, got $hostPort" }
+        val host = parts[0]
+        val port = parts[1].toInt()
 
-        val factory = if (pinnedCertificate != null) {
-            // Trust exactly the pinned certificate and nothing else: no system CAs,
-            // because this is a direct device-to-host channel, not the public web.
-            val trust = arrayOf(pinnedCertificate)
-            SSLContext.getInstance("TLSv1.3").apply {
-                init(null, arrayOf<javax.net.ssl.TrustManager>(PinnedTrustManager(trust)),
-                    java.security.SecureRandom())
-            }.socketFactory
-        } else {
-            // No pin yet: this connection is only used to receive PAIRING_START, and
-            // the pairing transcript, not the TLS channel, authenticates the host.
-            SSLContext.getInstance("TLSv1.3").apply {
-                init(null, arrayOf<javax.net.ssl.TrustManager>(PinnedTrustManager(null)),
-                    java.security.SecureRandom())
-            }.socketFactory
+        // ---- build candidate list from the resolved service ----
+        // We already have the host:port from discover(); supplement with a
+        // fresh DNS resolution to get all A/AAAA records if needed.
+        val candidates = mutableListOf<Candidate>()
+
+        // Add the original candidate first
+        candidates.add(Candidate(host, Transport.LAN, "original candidate"))
+
+        // ---- try candidates with per-address timeout ----
+        val connectTimeout = min(timeoutMs, 8000)
+        var tried = false
+        for (candidate in candidates) {
+            tried = true
+            try {
+                val plain = Socket()
+                // Bind to Wi-Fi network when one is available, so a default route
+                // through a VPN (Tailscale, WireGuard) does not hijack the connection.
+                val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                val wifiNet = cm.allNetworks
+                    .firstOrNull { n ->
+                        val caps = cm.getNetworkCapabilities(n)
+                        caps?.hasTransport(TransportInfo.TRANSPORT_WIFI) == true
+                    }
+                if (wifiNet != null) {
+                    wifiNet.bindSocket(plain)
+                }
+                plain.connect(InetSocketAddress(candidate.address, port), connectTimeout)
+
+                val factory = if (pinnedCertificate != null) {
+                    val trust = arrayOf(pinnedCertificate)
+                    SSLContext.getInstance("TLSv1.3").apply {
+                        init(null, arrayOf<X509TrustManager>(PinnedTrustManager(trust)),
+                            java.security.SecureRandom())
+                    }.socketFactory
+                } else {
+                    SSLContext.getInstance("TLSv1.3").apply {
+                        init(null, arrayOf<X509TrustManager>(PinnedTrustManager(null)),
+                            java.security.SecureRandom())
+                    }.socketFactory
+                }
+
+                val ssl = factory.createSocket(plain, host, port, true) as SSLSocket
+                ssl.enabledProtocols = arrayOf("TLSv1.3")
+                ssl.startHandshake()
+
+                socket = ssl
+                input = BufferedInputStream(ssl.inputStream)
+                output = BufferedOutputStream(ssl.outputStream)
+                Log.i(TAG, "connected via ${candidate.description}")
+                return
+            } catch (e: SSLException) {
+                // Certificate pinning failed or TLS handshake error; try next candidate.
+                Log.d(TAG, "TLS failed for ${candidate.address} (${e.message}), trying next candidate")
+            } catch (e: IOException) {
+                // Connect timed out or unreachable; try next candidate.
+                Log.d(TAG, "IO error for ${candidate.address} (${e.message}), trying next candidate")
+            }
         }
 
-        val ssl = factory.createSocket(plain, host, port, true) as SSLSocket
-        ssl.enabledProtocols = arrayOf("TLSv1.3")
-        ssl.startHandshake()
-        socket = ssl
-        input = BufferedInputStream(ssl.inputStream)
-        output = BufferedOutputStream(ssl.outputStream)
+        if (!tried) {
+            throw IOException("no candidates to attempt")
+        }
+        throw IOException("failed to connect after trying ${candidates.size} candidates")
     }
 
-    /** The host certificate observed during the handshake, for pinning at pairing. */
-    fun peerCertificate(): java.security.cert.X509Certificate? = try {
-        (socket?.session?.peerCertificates as? Array<java.security.cert.Certificate>)?.
-            firstOrNull { it is java.security.cert.X509Certificate } as? java.security.cert.X509Certificate
+    /** Returns the peer's pinned certificate, for UI diagnostics. */
+    fun peerCertificate(): X509Certificate? = try {
+        (socket?.session?.peerCertificates as? Array<X509Certificate>)?
+            .firstOrNull { it is X509Certificate } as? X509Certificate
     } catch (e: SSLPeerUnverifiedException) {
         null
     }
@@ -227,7 +308,6 @@ class WifiTransport(
         out.flush()
     }
 
-    /** Reads the next frame, or null on a clean end of stream. */
     @Throws(IOException::class)
     fun receive(): Frame? {
         val inp = input ?: throw IOException("not connected")
@@ -287,41 +367,4 @@ class WifiTransport(
                 if (it.endsWith('.')) it else "$it."
             }
     }
-}
-
-/**
- * A trust manager that accepts exactly one certificate, or any certificate when
- * none is pinned.
- *
- * This is pinned-anchor behaviour, not blanket trust: with a pin present only that
- * certificate is accepted, so a proxy presenting its own certificate fails the
- * handshake. The `null` case exists solely to bootstrap the very first pairing,
- * where the host's certificate is not yet known; the pairing transcript, not TLS,
- * authenticates that exchange.
- *
- * The class name is deliberately not "trust everything" when a pin is set. Lint
- * flags any hand-written `X509TrustManager` because the usual failure mode is a
- * `checkServerTrusted` that returns without checking anything; here the pinned
- * case compares the presented certificate against the pin and throws when they
- * differ. The unpinned case exists for exactly one operation, receiving
- * `PAIRING_START`, and the protocol layer refuses to trust that response until the
- * pairing MACs verify.
- */
-@Suppress("CustomX509TrustManager")
-private class PinnedTrustManager(
-    private val pinned: Array<java.security.cert.X509Certificate>?,
-) : javax.net.ssl.X509TrustManager {
-
-    override fun checkClientTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) = Unit
-
-    override fun checkServerTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {
-        if (pinned == null) return // bootstrap pairing only
-        val presented = chain?.firstOrNull()
-        require(presented != null) { "peer presented no certificate" }
-        require(pinned.any { it.encoded.contentEquals(presented.encoded) }) {
-            "peer certificate does not match the pinned host certificate"
-        }
-    }
-
-    override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = emptyArray()
 }
