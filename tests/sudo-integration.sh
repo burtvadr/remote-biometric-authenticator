@@ -3,8 +3,8 @@
 #
 # Modifies /etc/pam.d/sudo, so it backs the file up first and restores it on exit,
 # whatever happens. The module is inserted as `sufficient`, which keeps the password
-# working as a fallback: if the phone is unreachable the command still authenticates.
-# That is the difference between "the phone is down" and "I cannot log in".
+# working as a fallback: if the device is unreachable the command still authenticates.
+# That is the difference between "the device is down" and "I cannot log in".
 #
 # Two details this script gets right that a naive test does not:
 #
@@ -12,8 +12,8 @@
 #     sudo authentication, so a root-driven test would skip the PAM stack entirely
 #     and prove nothing.
 #
-#   * The daemon listens on the real path, /run/phone-authd/control.sock. sudo
-#     sanitises the environment, so a PHONE_AUTH_SOCKET override set by the test
+#   * The daemon listens on the real path, /run/rba/control.sock. sudo
+#     sanitises the environment, so a RBA_SOCKET override set by the test
 #     would never reach the PAM module; testing against the default path is both
 #     simpler and more faithful to production.
 set -uo pipefail
@@ -22,11 +22,11 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$REPO/linux/target/debug"
 SECDIR="/usr/lib/x86_64-linux-gnu/security"
 PAM_SUDO=/etc/pam.d/sudo
-BACKUP="$PAM_SUDO.phone-auth.bak"
-RUNDIR=/run/phone-authd
+BACKUP="$PAM_SUDO.rba.bak"
+RUNDIR=/run/rba
 SOCKET="$RUNDIR/control.sock"
-WORK="${ALP_SUDO_WORK:-/var/tmp/alp-sudo}"
-PORT="${ALP_SUDO_PORT:-47777}"
+WORK="${RBA_SUDO_WORK:-/var/tmp/rba-sudo}"
+PORT="${RBA_SUDO_PORT:-47777}"
 ME="${SUDO_USER:-$(logname 2>/dev/null || echo user)}"
 
 pass=0; fail=0
@@ -40,7 +40,7 @@ DAEMON_PID=""; SIM_PID=""
 #
 # `$!` alone is not enough when the helper is launched through sudo: it captures the
 # sudo wrapper, and killing that leaves the real daemon running. A leaked daemon keeps
-# holding /run/phone-authd/control.sock, so the next run talks to a *stale* daemon on a
+# holding /run/rba/control.sock, so the next run talks to a *stale* daemon on a
 # different port -- which does not fail loudly, it pairs against the wrong process and
 # reports success. That is a false pass, which is worse than a failure.
 spawn_grouped() {
@@ -77,7 +77,7 @@ cleanup() {
         cat "$BACKUP" > "$PAM_SUDO"
         rm -f "$BACKUP"
         if cmp -s "$BACKUP" "$PAM_SUDO"; then :; fi
-        echo "Rollback complete: phone_auth references now: $(grep -c phone_auth "$PAM_SUDO" || true)"
+        echo "Rollback complete: rba references now: $(grep -c rba "$PAM_SUDO" || true)"
     fi
     return 0
 }
@@ -105,7 +105,7 @@ asuser() { /usr/sbin/runuser -u "$ME" -- "$@"; }
 # That is a false pass, so it is checked rather than assumed.
 require_free_socket() {
     local sock="$1"
-    if [ -S "$sock" ] && asuser phone-authctl --socket "$sock" status >/dev/null 2>&1; then
+    if [ -S "$sock" ] && asuser rba --socket "$sock" status >/dev/null 2>&1; then
         echo "ERROR: something is already serving $sock." >&2
         echo "       A previous run leaked a daemon. Stop it first, or the test would" >&2
         echo "       silently exercise that one instead of a fresh daemon." >&2
@@ -115,7 +115,7 @@ require_free_socket() {
 }
 
 start_daemon() {
-    asuser "$BIN/phone-authd" --state-dir "$WORK/state" --socket "$SOCKET" \
+    asuser "$BIN/rbad" --state-dir "$WORK/state" --socket "$SOCKET" \
         --audit-log "$WORK/audit.log" --port "$PORT" --bind "127.0.0.1:$PORT" --no-mdns \
         >"$WORK/daemon.log" 2>&1 &
     DAEMON_PID=$!
@@ -124,17 +124,17 @@ start_daemon() {
 }
 
 pair_device() {
-    asuser "$BIN/phone-authctl" --socket "$SOCKET" pair --yes --timeout 45000 >"$WORK/pair.log" 2>&1 &
+    asuser "$BIN/rba" --socket "$SOCKET" pair --yes --timeout 45000 >"$WORK/pair.log" 2>&1 &
     local p=$!
     sleep 1
-    asuser timeout 45 "$BIN/phone-auth-sim" pair --host "127.0.0.1:$PORT" --name "Pixel 9" \
-        --daemon "$BIN/phone-authd" --daemon-arg --state-dir --daemon-arg "$WORK/state" \
+    asuser timeout 45 "$BIN/rba-sim" pair --host "127.0.0.1:$PORT" --name "Pixel 9" \
+        --daemon "$BIN/rbad" --daemon-arg --state-dir --daemon-arg "$WORK/state" \
         >"$WORK/sim-pair.log" 2>&1
     wait "$p"
 }
 
 serve() {
-    spawn_asuser "$BIN/phone-auth-sim" serve --host "127.0.0.1:$PORT" --name "Pixel 9" \
+    spawn_asuser "$BIN/rba-sim" serve --host "127.0.0.1:$PORT" --name "Pixel 9" \
         --ca "$WORK/state/host.crt" --timeout "$1" --behaviour "$2" \
         >"$WORK/sim-serve.log" 2>&1
     sleep 1.5
@@ -147,10 +147,10 @@ echo "=== sudo integration (edits /etc/pam.d/sudo, restores it on exit) ==="
 [ "$(id -u)" -eq 0 ] || { echo "must run as root: installing the module and editing /etc/pam.d require it"; exit 1; }
 
 step "install the module"
-( cd "$REPO/linux" && cargo build --release -p pam-phone-auth ) >/dev/null 2>&1
-install -m 0755 "$REPO/linux/target/release/libpam_phone_auth.so" "$SECDIR/pam_phone_auth.so"
-echo "  $SECDIR/pam_phone_auth.so"
-echo "  exports: $(nm -D --defined-only "$SECDIR/pam_phone_auth.so" | grep -c pam_sm_) pam_sm_* entry points"
+( cd "$REPO/linux" && cargo build --release -p pam-rba ) >/dev/null 2>&1
+install -m 0755 "$REPO/linux/target/release/libpam_rba.so" "$SECDIR/pam_rba.so"
+echo "  $SECDIR/pam_rba.so"
+echo "  exports: $(nm -D --defined-only "$SECDIR/pam_rba.so" | grep -c pam_sm_) pam_sm_* entry points"
 
 step "create $RUNDIR (the daemon's production socket path)"
 rm -rf "$RUNDIR" "$WORK"; mkdir -p "$RUNDIR" "$WORK"
@@ -158,21 +158,21 @@ chown "$ME":"$ME" "$RUNDIR" "$WORK"
 # The simulator caches its identity in /tmp under its device name. An earlier run
 # of this suite as root leaves a root-owned file that the unprivileged run below
 # cannot overwrite, which looks like a mysterious "Permission denied".
-rm -f /tmp/phone-auth-sim-*.json
+rm -f /tmp/rba-sim-*.json
 
 step "back up the sudo stack"
 cp -a "$PAM_SUDO" "$BACKUP"
 echo "  saved to $BACKUP"
 sha256sum "$PAM_SUDO" | sed 's/^/  original: /'
 
-step "insert pam_phone_auth as sufficient, before the password fallback"
+step "insert pam_rba as sufficient, before the password fallback"
 python3 - "$PAM_SUDO" <<'PY'
 import sys
 p = sys.argv[1]
 out, done = [], False
 for line in open(p).read().splitlines():
     if not done and line.startswith("@include common-auth"):
-        out.append("auth    sufficient  pam_phone_auth.so purpose=sudo debug")
+        out.append("auth    sufficient  pam_rba.so purpose=sudo debug")
         done = True
     out.append(line)
 if not done:
@@ -189,15 +189,15 @@ if pair_device; then
     ok "paired"
 else
     bad "pairing failed"
-    echo "  --- phone-authctl ---"; sed 's/^/    | /' "$WORK/pair.log"
+    echo "  --- rba ---"; sed 's/^/    | /' "$WORK/pair.log"
     echo "  --- simulator ---"; sed 's/^/    | /' "$WORK/sim-pair.log"
     echo "  --- daemon ---"; sed 's/^/    | /' "$WORK/daemon.log"
     exit 1
 fi
 
-step "A. sudo with the phone approving and a deliberately wrong password"
+step "A. sudo with the device approving and a deliberately wrong password"
 # The password is wrong on purpose. pam_unix cannot authenticate with it, so a
-# success here can only mean the phone authenticated the user.
+# success here can only mean the device authenticated the user.
 serve 120 approve
 before=$(audit_count)
 asuser sudo -k 2>/dev/null
@@ -205,9 +205,9 @@ out=$(printf 'definitely-not-the-password\n' | asuser sudo -S -p '' id 2>&1); rc
 stop_sim
 echo "$out" | sed 's/^/    | /'
 if [ $rc -eq 0 ] && echo "$out" | grep -q 'uid=0'; then
-    ok "sudo succeeded on the phone's word alone, despite a wrong password"
+    ok "sudo succeeded on the device's word alone, despite a wrong password"
 else
-    bad "sudo did not authenticate with the phone (rc=$rc)"
+    bad "sudo did not authenticate with the device (rc=$rc)"
 fi
 after=$(audit_count)
 if [ "$after" -gt "$before" ]; then
@@ -226,7 +226,7 @@ else
     bad "the record does not name $ME"
 fi
 
-step "B. sudo with the phone declining: must fall back to the password"
+step "B. sudo with the device declining: must fall back to the password"
 serve 120 deny
 before=$(audit_count)
 asuser sudo -k 2>/dev/null
@@ -236,7 +236,7 @@ echo "$out" | sed 's/^/    | /'
 if [ $rc -ne 0 ]; then
     ok "the decline was not enough; the stack fell through and the password failed"
 else
-    bad "sudo succeeded despite the phone declining"
+    bad "sudo succeeded despite the device declining"
 fi
 if [ "$(audit_count)" -gt "$before" ]; then
     ok "the decline was recorded in the audit log"
@@ -246,16 +246,16 @@ fi
 
 step "C. a local user may not authenticate as somebody else"
 # Runs before any device is contacted, so no simulator is needed. This is the check
-# that stops an unprivileged process from asking the phone to vouch for root.
-out=$(asuser "$BIN/phone-authctl" --socket "$SOCKET" authenticate --user root \
+# that stops an unprivileged process from asking the device to vouch for root.
+out=$(asuser "$BIN/rba" --socket "$SOCKET" auth --user root \
         --purpose sudo --service sudo 2>&1); rc=$?
 echo "$out" | sed 's/^/    | /'
 if [ $rc -ne 0 ] && echo "$out" | grep -qiE 'caller is|root|denied|not permitted|mismatch'; then
-    ok "$ME cannot have the phone authenticate root"
+    ok "$ME cannot have the device authenticate root"
 else
     bad "$ME was able to ask for root authentication (rc=$rc)"
 fi
-out=$(asuser "$BIN/phone-authctl" --socket "$SOCKET" authenticate --user "$ME" \
+out=$(asuser "$BIN/rba" --socket "$SOCKET" auth --user "$ME" \
         --purpose probe --service probe 2>&1); rc=$?
 if echo "$out" | grep -qiE 'caller is .* but requested|mismatch'; then
     ok "the refusal names the mismatch, so it is diagnosable"

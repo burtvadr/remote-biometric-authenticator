@@ -1,0 +1,18 @@
+[package]
+name = "rba"
+description = "Command-line interface to rbad"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rba"
+path = "src/main.rs"
+
+[dependencies]
+rba-protocol.workspace = true
+rbad = { path = "../rbad" }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "time"] }

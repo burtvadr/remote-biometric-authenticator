@@ -1,6 +1,6 @@
 # Threat model
 
-Scope: an Android phone acting as a remote authenticator for a Linux machine.
+Scope: an Android device acting as a remote authenticator for a Linux machine.
 
 Each entry below is covered by a test. The test name is given so the mapping from
 claim to evidence is checkable.
@@ -11,10 +11,10 @@ claim to evidence is checkable.
 |---|---|---|
 | Ability to authenticate as a Linux user | daemon + PAM | the whole point |
 | Device private key | Android Keystore | non-exportable; signing is the approval |
-| Host private key | `/var/lib/phone-authd/host.key` | identifies the host to the phone |
-| Paired-device registry | `/var/lib/phone-authd/registry.json` | defines who is trusted |
+| Host private key | `/var/lib/rba/host.key` | identifies the host to the device |
+| Paired-device registry | `/var/lib/rba/registry.json` | defines who is trusted |
 | Request context | in flight | determines what was approved |
-| Audit log | `/var/log/phone-authd/audit.log` | accountability |
+| Audit log | `/var/log/rba/audit.log` | accountability |
 
 ## Adversaries, and what stops each
 
@@ -24,14 +24,14 @@ claim to evidence is checkable.
 | 2 | Spoofs mDNS | Discovery is not trust; identity is the paired key, verified per request | `an_impostor_reusing_a_known_device_id_is_refused` |
 | 3 | Spoofs BLE | Same: address, name and service UUID are routing data only | `a_session_hello_for_another_host_is_refused` |
 | 4 | Malicious local process | Control socket uses `SO_PEERCRED`; requested user must match the peer UID | `an_unprivileged_caller_cannot_authenticate_as_another_user` |
-| 5 | Impersonates the phone | Needs the private key, which is non-exportable and biometric-gated | `a_signature_over_a_different_scope_is_refused` |
+| 5 | Impersonates the device | Needs the private key, which is non-exportable and biometric-gated | `a_signature_over_a_different_scope_is_refused` |
 | 6 | Replays a captured response | `request_id` and `challenge` are consumed before verification | `challenge_cannot_be_reused_after_consumption` |
 | 7 | Confused deputy | All ten scope fields are signed and cross-checked | `rejects_signature_for_a_different_user`, `…different_purpose` |
 | 8 | Intermittent network access | Requests expire; a partial exchange grants nothing | `a_stalled_device_fails_closed_without_partial_authorization` |
 | 9 | Reads app storage | Private key is not in storage at all | Keystore property, `DeviceAuthKey` |
 | 10 | Compromises the app process | Gets no more than the user would approve, one request at a time | design property |
-| 11 | Rooted phone | Out of scope — see limitations | documented |
-| 12 | Steals the phone | Requires the user's biometric on the stolen device | design property |
+| 11 | Rooted device | Out of scope — see limitations | documented |
+| 12 | Steals the device | Requires the user's biometric on the stolen device | design property |
 | 13 | Re-enrolls biometrics | Keystore key is invalidated; device must re-pair | `setInvalidatedByBiometricEnrollment(true)` |
 | 14 | Tricks the user | Signed context is displayed before the prompt; display text is marked unverified | `with_unsigned_display_text` vector |
 | 15 | Malicious local service claiming to be the authenticator | Registry decides; nothing self-asserts | `an_unknown_device_is_refused` |
@@ -92,9 +92,9 @@ Stated rather than hidden:
 | TLS pinning | tested with a real handshake | `tls.rs` |
 | BLE segmentation | tested, including truncation and poisoning | `BleFraming.kt`, `BleSegmentationTest` |
 | Android app compiles and lints clean | verified | `make android-all` |
-| PAM failure behaviour | **tested against a live libpam stack**, including real denial, timeout, tamper and misconfiguration paths | `pam-phone-auth`, `tests/pam-integration.sh` |
+| PAM failure behaviour | **tested against a live libpam stack**, including real denial, timeout, tamper and misconfiguration paths | `pam-rba`, `tests/pam-integration.sh` |
 | Every password prompt on the system | **verified through each service's own stack** — polkit-1, gdm-password, sudo, login, su — from one line in `common-auth` | `tests/common-auth-integration.sh` |
-| Rate limiting under a flood | verified: a rate-limited request never reaches the phone | same |
+| Rate limiting under a flood | verified: a rate-limited request never reaches the device | same |
 | Recovery path | verified: a decline falls through to the password, never a lockout | same |
 | Android Keystore and BiometricPrompt | **not** executed — needs a device | `DeviceAuthKey.kt` |
 | polkit agent | **registers with a live polkitd**; challenge routing fails, see below | `polkit-agent`, `tests/polkit-integration.sh` |

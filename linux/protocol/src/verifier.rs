@@ -1,6 +1,6 @@
 //! Host-side verification of an authentication response.
 //!
-//! This is the single place where "the phone approved this exact thing" is
+//! This is the single place where "the device approved this exact thing" is
 //! decided. It takes the outstanding request that the replay guard has already
 //! consumed, and the device's stored public key. It never trusts any value
 //! supplied by the peer for the public key, the device id, the username, the

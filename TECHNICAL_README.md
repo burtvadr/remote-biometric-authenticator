@@ -1,4 +1,4 @@
-# Android Linux Remote Authenticator — Technical README
+# Remote Biometric Authenticator — Technical README
 
 ## Technology direction
 
@@ -21,32 +21,24 @@ Both transports use the same authentication protocol and security model.
 ## Repository layout
 
 ```text
-android-fprint/
-│
-├── linux/
-│   ├── phone-authd/          # Main Rust daemon
-│   ├── phone-authctl/        # Rust CLI
-│   ├── pam-phone-auth/       # Thin PAM adapter
-│   ├── polkit/               # polkit integration
-│   └── transports/
-│       ├── wifi/
-│       └── bluetooth/
-│
-├── android/
-│   └── app/
-│       ├── ui/               # Jetpack Compose
-│       ├── biometric/        # BiometricPrompt integration
-│       ├── keystore/         # Android Keystore
-│       ├── pairing/          # Device pairing
-│       ├── protocol/         # Kotlin protocol implementation
-│       └── transport/
-│           ├── wifi/
-│           └── bluetooth/
+rba/
 │
 ├── protocol/
 │   ├── specification/        # Language-independent protocol spec
-│   ├── schemas/
-│   └── test-vectors/
+│   └── test-vectors/         # Shared conformance fixtures
+│
+├── linux/
+│   ├── protocol/             # Rust protocol, crypto, framing
+│   ├── rbad/                 # Rust daemon
+│   ├── rba/                  # Rust CLI
+│   ├── rba-sim/              # Simulated authenticator
+│   ├── pam-rba/              # Thin PAM adapter
+│   ├── polkit-agent/         # Optional headless polkit agent
+│   └── systemd/              # rbad.service and rbad.socket
+│
+├── android/
+│   ├── protocol/             # Kotlin protocol implementation
+│   └── app/                  # Compose UI, Keystore, transports
 │
 ├── packaging/
 │   ├── debian/
@@ -54,11 +46,7 @@ android-fprint/
 │   ├── fedora/
 │   └── opensuse/
 │
-├── tests/
-│   ├── integration/
-│   ├── replay/
-│   ├── spoofing/
-│   └── malformed/
+├── tests/                    # End-to-end, PAM, sudo, polkit scripts
 │
 └── docs/
 ```
@@ -76,8 +64,8 @@ Rust is the preferred language for the security-sensitive daemon because it avoi
 The primary Rust components are:
 
 ```text
-phone-authd
-phone-authctl
+rbad
+rba
 transport implementations
 protocol implementation
 cryptographic verification
@@ -91,7 +79,7 @@ policy enforcement
 The main process is:
 
 ```text
-phone-authd
+rbad
 ```
 
 Responsibilities:
@@ -122,7 +110,7 @@ Do not put all of this functionality inside PAM.
 Build:
 
 ```text
-pam_phone_auth.so
+pam_rba.so
 ```
 
 as a **very thin adapter**.
@@ -131,7 +119,7 @@ The PAM module should:
 
 1. obtain the PAM authentication context
 2. verify the local username/context
-3. communicate with `phone-authd`
+3. communicate with `rbad`
 4. wait for the authentication result
 5. return the appropriate PAM result
 
@@ -151,10 +139,10 @@ Architecture:
 PAM
  │
  ▼
-pam_phone_auth.so
+pam_rba.so
  │
  ▼
-phone-authd
+rbad
  │
  ├── Wi-Fi
  └── Bluetooth
@@ -166,7 +154,7 @@ This keeps PAM failure modes and ABI compatibility issues isolated from the main
 
 # Local Linux IPC
 
-PAM should communicate with `phone-authd` over a protected local IPC mechanism.
+PAM should communicate with `rbad` over a protected local IPC mechanism.
 
 Preferred options include:
 
@@ -419,7 +407,7 @@ Use Android's Network Service Discovery APIs for mDNS/DNS-SD discovery.
 Example service:
 
 ```text
-_android-fprint._tcp.local.
+_rba._tcp.local.
 ```
 
 mDNS is only discovery.
@@ -675,7 +663,7 @@ expiration
 Use a protocol/domain separator such as:
 
 ```text
-ANDROID_LINUX_AUTH_V1
+RBA_AUTH_V1
 ```
 
 to prevent cross-protocol signing confusion.
@@ -720,7 +708,7 @@ The final architecture is:
                  └──────────┬──────────┘
                             │
                             ▼
-                       phone-authd
+                       rbad
 ```
 
 Changing from Wi-Fi to Bluetooth should not change:
@@ -775,7 +763,7 @@ Core architecture:
 ```text
 Android biometric
         ↓
-phone-authd
+rbad
         ↓
 PAM / polkit
 ```
@@ -785,7 +773,7 @@ Optional future compatibility:
 ```text
 Android
    ↓
-phone-authd
+rbad
    ↓
 fprint compatibility adapter
    ↓
@@ -831,9 +819,9 @@ Do not add FIDO2 merely for branding or complexity. Add it if it solves a concre
 The Linux package should install:
 
 ```text
-phone-authd
-phone-authctl
-pam_phone_auth.so
+rbad
+rba
+pam_rba.so
 systemd service/socket files
 polkit integration files
 configuration files
@@ -871,9 +859,9 @@ The project can use a Cargo workspace:
 ```text
 linux/
   Cargo.toml
-  phone-authd/
-  phone-authctl/
-  pam-phone-auth/
+  rbad/
+  rba/
+  pam-rba/
 ```
 
 The final distro build should follow the distribution's packaging/build rules.
@@ -978,7 +966,7 @@ state machines
 Build:
 
 ```text
-phone-authd
+rbad
 ```
 
 with Wi-Fi transport first.
@@ -1006,7 +994,7 @@ Wi-Fi transport
 Add:
 
 ```text
-pam_phone_auth.so
+pam_rba.so
 ```
 
 as a thin adapter.
@@ -1030,7 +1018,7 @@ Investigate only after the previous layers are stable.
 The first meaningful milestone is:
 
 ```bash
-$ phone-authctl list
+$ rba devices
 ```
 
 Output:
@@ -1047,7 +1035,7 @@ Paired authenticators:
 Then:
 
 ```bash
-$ phone-authctl authenticate --user alice --purpose sudo
+$ rba auth --user alice --purpose sudo
 ```
 
 Output:

@@ -1,6 +1,6 @@
 [package]
-name = "android-fprint-protocol"
-description = "Language-independent wire protocol and crypto for the Android remote biometric authenticator"
+name = "rba-protocol"
+description = "Language-independent wire protocol and crypto for the Remote Biometric Authenticator"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

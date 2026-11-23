@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <!-- Pre-Compose window background; Compose supplies the real theme. -->
-    <style name="Theme.PhoneAuth" parent="android:Theme.Material.NoActionBar" />
+    <style name="Theme.Rba" parent="android:Theme.Material.NoActionBar" />
 </resources>

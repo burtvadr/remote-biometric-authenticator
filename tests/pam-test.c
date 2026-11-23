@@ -25,7 +25,7 @@
 #include <unistd.h>
 
 /*
- * A silent conversation. The phone is the prompt, so the module must never ask the
+ * A silent conversation. The device is the prompt, so the module must never ask the
  * terminal for anything. If some other stack entry does try to prompt, it receives
  * PAM_CONV_ERR and fails visibly rather than hanging the test.
  */

@@ -8,14 +8,14 @@ approve anything on its own. They all do the same two things:
 1. tell the user a request arrived — *who*, *what*, *which machine* — and
 2. report the user's yes or no.
 
-The judgement happens in `phone-authd`, against a signature over a challenge that is
+The judgement happens in `rbad`, against a signature over a challenge that is
 consumed on arrival and bound to a Linux user. A frontend that gets this wrong is not a
 smaller bug, it is the whole security model.
 
 ## The contract every frontend honours
 
 ```text
-phone-authctl authenticate --user U --purpose P --service S
+rba auth --user U --purpose P --service S
     -> ok / code        (never a key, never a signature, never a secret)
 ```
 
@@ -38,9 +38,9 @@ share:
 
 | Concern | Where it lives |
 |---|---|
-| Is this request authentic? | `phone-authd`, signature verification |
+| Is this request authentic? | `rbad`, signature verification |
 | Is it for *this* user, on *this* machine? | daemon, bound to the signed context |
-| What does the phone show? | the request's signed, unsigned-only prose fields |
+| What does the device show? | the request's signed, unsigned-only prose fields |
 | Rate limiting, replay, freshness | daemon and app, per protocol §10–§12 |
 
 The cost is one more process and one socket. The benefit is that a KDE user and an XFCE
@@ -50,7 +50,7 @@ user are running *the same security code*, and a bug fixed once is fixed for eve
 
 Ordered by how much they are worth building first, not by how easy they are.
 
-### 1. `phone-authctl` — the reference frontend (exists)
+### 1. `rba` — the reference frontend (exists)
 
 The CLI is the reference implementation of the contract above, and it is what the
 integration tests drive. It is also genuinely useful on its own for a server or over

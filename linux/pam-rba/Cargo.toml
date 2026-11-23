@@ -1,0 +1,19 @@
+[package]
+name = "pam-rba"
+description = "Thin PAM adapter: forwards an authentication request to rbad"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "pam_rba"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+rba-protocol.workspace = true
+rbad = { path = "../rbad" }
+serde.workspace = true
+serde_json.workspace = true
+libc = "0.2"

@@ -1,0 +1,12 @@
+[Unit]
+Description=Remote Biometric Authenticator control socket
+
+[Socket]
+# Socket activation is the recommended integration: the socket's group ownership
+# is what authorises a client, and it exists before the daemon does.
+ListenStream=/run/rba/control.sock
+SocketGroup=rba
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target

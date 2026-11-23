@@ -1,18 +1,18 @@
 [package]
-name = "phone-auth-polkit-agent"
-description = "polkit authentication agent that obtains the authentication event from an Android authenticator"
+name = "rba-polkit-agent"
+description = "polkit authentication agent that obtains the authentication event from a remote authenticator"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "phone-auth-polkit-agent"
+name = "rba-polkit-agent"
 path = "src/main.rs"
 
 [dependencies]
-android-fprint-protocol.workspace = true
-phone-authd = { path = "../phone-authd" }
+rba-protocol.workspace = true
+rbad = { path = "../rbad" }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }

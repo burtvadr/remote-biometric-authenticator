@@ -6,12 +6,12 @@
 
 use std::path::{Path, PathBuf};
 
-use android_fprint_protocol::cbor;
-use android_fprint_protocol::crypto::{self, PrivateKey, PublicKey};
-use android_fprint_protocol::frame::Frame;
-use android_fprint_protocol::messages::Message;
-use android_fprint_protocol::pairing::PairingSession;
-use android_fprint_protocol::types::{AuthRequest, Challenge, Id};
+use rba_protocol::cbor;
+use rba_protocol::crypto::{self, PrivateKey, PublicKey};
+use rba_protocol::frame::Frame;
+use rba_protocol::messages::Message;
+use rba_protocol::pairing::PairingSession;
+use rba_protocol::types::{AuthRequest, Challenge, Id};
 use serde_json::Value;
 
 fn vectors_dir() -> PathBuf {
@@ -127,7 +127,7 @@ fn message_vectors_round_trip() {
         );
 
         assert!(
-            android_fprint_protocol::messages::MESSAGE_NAMES
+            rba_protocol::messages::MESSAGE_NAMES
                 .iter()
                 .any(|(c, _)| *c == expected_type),
             "{name}: unknown message type {expected_type}"
@@ -176,7 +176,7 @@ fn auth_request_vector_matches_our_encoding() {
         baseline["signing_input_sha256"].as_str().unwrap()
     );
     // The domain separator is fixed and the version byte follows the NUL.
-    assert_eq!(v["domain_separator"], "ANDROID_LINUX_AUTH_V1");
+    assert_eq!(v["domain_separator"], "RBA_AUTH_V1");
     assert_eq!(
         v["signed_fields"].as_array().unwrap().len(),
         10,

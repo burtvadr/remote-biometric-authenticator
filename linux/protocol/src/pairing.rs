@@ -202,7 +202,7 @@ impl PairingSession {
         Ok(())
     }
 
-    /// `p = HMAC(pairing_secret, "ALP-PAIR-V1" || 0x00 || transcript)`.
+    /// `p = HMAC(pairing_secret, "RBA-PAIR-V1" || 0x00 || transcript)`.
     ///
     /// Including the transcript — ids, long-term keys, nonces and ephemeral keys
     /// — binds the displayed code to the keys that will actually be enrolled.
@@ -395,11 +395,11 @@ fn req_eph_public(v: &Value, name: &str) -> Result<[u8; PUBKEY_LEN]> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CodeEntry {
-    /// The Linux host displays the code; the phone must not display it and must
+    /// The Linux host displays the code; the device must not display it and must
     /// require the operator to type it.
     #[default]
     Device,
-    /// The phone displays the code; the Linux host must not display it and must
+    /// The device displays the code; the Linux host must not display it and must
     /// require the operator to type it.
     Host,
 }
@@ -493,7 +493,7 @@ impl PairingStart {
                 "code must be empty or exactly six ASCII digits".into(),
             ));
         }
-        // Absent means the recommended mode: the host displays, the phone types.
+        // Absent means the recommended mode: the host displays, the device types.
         let code_entry = opt_text(&v, "code_entry")?
             .as_deref()
             .map(CodeEntry::parse)
@@ -539,7 +539,7 @@ pub struct PairingSubmit {
     /// Device ephemeral ECDH public key, completing the pairing secret.
     pub device_eph_pubkey: [u8; PUBKEY_LEN],
     pub mac: [u8; 32],
-    /// Revocation tokens for older pairings this phone wants the host to clean up.
+    /// Revocation tokens for older pairings this device wants the host to clean up.
     ///
     /// These are bearer capabilities, not proof of same-installation identity.
     /// The host processes them after `mac` verifies and before it commits the new
@@ -852,8 +852,8 @@ mod tests {
             .unwrap();
         let host_code = host_view.code().unwrap();
 
-        // Phone sees the attacker as the host.
-        let phone_view = PairingSession::new_device(
+        // Device sees the attacker as the host.
+        let device_view = PairingSession::new_device(
             Id::from_slice(&[1u8; 16]).unwrap(),
             [2u8; 32],
             encode_public_key(&attacker_host_eph),
@@ -865,10 +865,10 @@ mod tests {
             CodeEntry::Device,
         )
         .unwrap();
-        let phone_code = phone_view.code().unwrap();
+        let device_code = device_view.code().unwrap();
 
         assert_ne!(
-            host_code, phone_code,
+            host_code, device_code,
             "an on-path key substitution produced the same code on both endpoints"
         );
     }

@@ -1,15 +1,15 @@
-//! A polkit authentication agent backed by an Android authenticator.
+//! A polkit authentication agent backed by a remote authenticator.
 //!
 //! # What this does and does not do
 //!
 //! polkit decides *which* actions require authentication and *who* may perform them.
 //! That policy lives in polkit's rules and in its backend and is deliberately not
-//! duplicated here. This agent supplies only the one thing a phone can supply —
+//! duplicated here. This agent supplies only the one thing a device can supply —
 //! evidence that a particular local user is present:
 //!
 //! ```text
 //! polkit  ->  "user 1000 wants to do X; authenticate them"   (authorization)
-//! agent   ->  phone proves user 1000 is present              (authentication)
+//! agent   ->  device proves user 1000 is present              (authentication)
 //! ```
 //!
 //! Conflating the two is the mistake a project like this tends to make, so this agent
@@ -42,7 +42,7 @@
 //! * If no authenticator is paired or connected, the agent reports the failure and
 //!   lets polkit fall through to whatever else is available. It does not invent a
 //!   denial.
-//! * If the user declines on the phone, that is a real answer, not a missing one.
+//! * If the user declines on the device, that is a real answer, not a missing one.
 //! * If polkit cancels the challenge, the agent stops rather than answering late.
 
 use std::collections::{HashMap, HashSet};
@@ -60,9 +60,9 @@ const AGENT_IFACE: &str = "org.freedesktop.PolicyKit1.AuthenticationAgent";
 /// `CheckAuthorizationFlags.ALLOW_USER_INTERACTION`
 const ALLOW_USER_INTERACTION: u32 = 1;
 
-/// Outer bound on waiting for the phone.
+/// Outer bound on waiting for the device.
 ///
-/// This is only the outer bound. The phone's own freshness window is much shorter, so
+/// This is only the outer bound. The device's own freshness window is much shorter, so
 /// this exists to stop a challenge from hanging a desktop action indefinitely rather
 /// than to decide the outcome.
 const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -77,7 +77,7 @@ type Subject = (String, HashMap<String, OwnedValue>);
 ///
 /// Scanning the details for the first value that happens to be a uint32 would be a
 /// serious mistake: a subject carries both `uid` and `pid`, and picking up the pid
-/// would have the agent ask the phone to authenticate whoever owns that process
+/// would have the agent ask the device to authenticate whoever owns that process
 /// rather than the person being checked.
 fn subject_uid(subject: &Subject) -> Option<i32> {
     i32::try_from(subject.1.get("uid")?.clone()).ok()
@@ -105,24 +105,24 @@ struct Config {
     socket: std::path::PathBuf,
 }
 
-/// Asks `phone-authd` to authenticate a Linux user.
+/// Asks `rbad` to authenticate a Linux user.
 ///
 /// `Ok(true)` only when the daemon verified a signature over a fresh challenge naming
 /// exactly this user. Everything else — including any error — is a refusal.
-async fn authenticate_via_phone(
+async fn authenticate_via_device(
     config: &Config,
     unix_user: i32,
     action_id: &str,
 ) -> Result<bool, String> {
-    let user = phone_authd::ipc::user_for_uid(unix_user as u32)
+    let user = rbad::ipc::user_for_uid(unix_user as u32)
         .ok_or_else(|| format!("no local user account for uid {unix_user}"))?;
 
-    let request = phone_authd::ipc::ClientRequest::Authenticate {
+    let request = rbad::ipc::ClientRequest::Authenticate {
         user: user.clone(),
-        // `polkit`, so the phone's prompt says this is a desktop authorisation
+        // `polkit`, so the device's prompt says this is a desktop authorisation
         // rather than a login or a sudo.
         purpose: "polkit".into(),
-        // The action id as the service, so the phone names the exact action.
+        // The action id as the service, so the device names the exact action.
         service: action_id.to_owned(),
         operation: "authenticate".into(),
         device: None,
@@ -131,21 +131,21 @@ async fn authenticate_via_phone(
 
     // The control client is blocking; the agent is async.
     let socket = config.socket.clone();
-    let call = tokio::task::spawn_blocking(move || phone_authd::ipc::call(&socket, &request));
+    let call = tokio::task::spawn_blocking(move || rbad::ipc::call(&socket, &request));
     match tokio::time::timeout(CHALLENGE_TIMEOUT, call).await {
         Ok(Ok(Ok(response))) => {
             if response.authenticated() {
                 Ok(true)
             } else {
                 Err(format!(
-                    "the phone declined ({})",
+                    "the device declined ({})",
                     response.code.unwrap_or_else(|| "denied".into())
                 ))
             }
         }
-        Ok(Ok(Err(e))) => Err(format!("phone-authd unreachable: {e}")),
-        Ok(Err(join)) => Err(format!("phone-authd task failed: {join}")),
-        Err(_) => Err("the phone did not answer in time".into()),
+        Ok(Ok(Err(e))) => Err(format!("rbad unreachable: {e}")),
+        Ok(Err(join)) => Err(format!("rbad task failed: {join}")),
+        Err(_) => Err("the device did not answer in time".into()),
     }
 }
 
@@ -170,14 +170,14 @@ impl Agent {
 
         let Some(uid) = subject_uid(&subject) else {
             // Without a uid there is no Linux user to name, so there is nothing
-            // meaningful to ask the phone. Reporting the failure lets polkit fall
+            // meaningful to ask the device. Reporting the failure lets polkit fall
             // back rather than treating this as a refusal.
             tracing::warn!(action = %action_id, "challenge carried no uid; cannot name a Linux user");
             return Ok(());
         };
         tracing::info!(action = %action_id, uid, "challenge details");
 
-        let outcome = authenticate_via_phone(&self.config, uid, &action_id).await;
+        let outcome = authenticate_via_device(&self.config, uid, &action_id).await;
 
         if self.cancelled.lock().await.contains(&cancellation_id) {
             tracing::info!(action = %action_id, "cancelled while waiting; not answering");
@@ -251,8 +251,8 @@ impl Agent {
         }
 
         match outcome {
-            Ok(true) => tracing::info!(action = %action_id, "authenticated by the phone"),
-            Ok(false) => tracing::info!(action = %action_id, "the phone declined"),
+            Ok(true) => tracing::info!(action = %action_id, "authenticated by the device"),
+            Ok(false) => tracing::info!(action = %action_id, "the device declined"),
             Err(e) => tracing::info!(action = %action_id, "not authenticated: {e}"),
         }
         Ok(())
@@ -288,9 +288,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let mut config = Config {
-        socket: std::env::var_os("PHONE_AUTH_SOCKET")
+        socket: std::env::var_os("RBA_SOCKET")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(phone_authd::config::DEFAULT_SOCKET)),
+            .unwrap_or_else(|| std::path::PathBuf::from(rbad::config::DEFAULT_SOCKET)),
     };
     let mut verbose = false;
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -316,7 +316,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let connection = zbus::Connection::system().await?;
 
-    const AGENT_PATH: &str = "/org/androidfprint/PolkitAgent";
+    const AGENT_PATH: &str = "/org/rba/PolkitAgent";
     let object_path: &str = AGENT_PATH;
     // polkit 127 names a subject by *kind* only; the identifying fields live in the
     // details. The older "unix-process:<pid>" spelling is rejected outright with

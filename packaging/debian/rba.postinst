@@ -1,0 +1,31 @@
+#!/bin/sh
+# Post-install: create the group, validate the configuration, and never touch a
+# user's PAM stack without a backup and a way back.
+set -e
+
+case "$1" in
+configure)
+    if ! getent group rba >/dev/null; then
+        groupadd --system rba
+    fi
+    if ! id -u rba >/dev/null 2>&1; then
+        useradd --system --gid rba --home-dir /var/lib/rba \
+            --no-create-home --shell /usr/sbin/nologin rba
+    fi
+
+    # Validate before enabling anything. If the daemon cannot start, the
+    # installation must not leave a broken PAM stack behind.
+    if ! /usr/libexec/rbad --check; then
+        echo "rba: configuration check failed; not enabling PAM integration" >&2
+        exit 0
+    fi
+
+    # No PAM stack is modified here. The README documents the one-line change and
+    # the required backup, because a wrong PAM edit locks users out of their
+    # machines.
+    ;;
+esac
+
+#DEBHELPER#
+
+exit 0

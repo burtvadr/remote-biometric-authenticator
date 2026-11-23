@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Proves the thing the whole project actually wants: a password prompt anywhere on the
-# system authenticates with the phone, with no per-service editing.
+# system authenticates with the device, with no per-service editing.
 #
 # The single insertion into /etc/pam.d/common-auth is the entire change. Debian and
 # Ubuntu deliberately factor every auth stack through it, and /etc/pam.d/other is the
@@ -14,14 +14,14 @@
 # Backups up common-auth and restores it on exit, however it exits.
 set -uo pipefail
 
-REPO="${ALP_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+REPO="${RBA_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 B="$REPO/linux/target/debug"
 SECDIR=/usr/lib/x86_64-linux-gnu/security
 COMMON=/etc/pam.d/common-auth
-BAK=$COMMON.phone-auth.bak
-SOCKET=/run/phone-authd/control.sock
-W=/var/tmp/alp-common
-PORT="${ALP_PORT:-48201}"
+BAK=$COMMON.rba.bak
+SOCKET=/run/rba/control.sock
+W=/var/tmp/rba-common
+PORT="${RBA_PORT:-48201}"
 
 pass=0; fail=0
 ok()  { echo "  PASS: $*"; pass=$((pass+1)); }
@@ -35,7 +35,7 @@ DAEMON_PID=""; SIM_PID=""
 #
 # `$!` alone is not enough when the helper is launched through sudo: it captures the
 # sudo wrapper, and killing that leaves the real daemon running. A leaked daemon keeps
-# holding /run/phone-authd/control.sock, so the next run talks to a *stale* daemon on a
+# holding /run/rba/control.sock, so the next run talks to a *stale* daemon on a
 # different port -- which does not fail loudly, it pairs against the wrong process and
 # reports success. That is a false pass, which is worse than a failure.
 spawn_grouped() {
@@ -69,14 +69,14 @@ cleanup() {
         rm -f "$BAK"
         echo
         echo "Restored $COMMON from backup."
-        echo "phone_auth references now: $(grep -c phone_auth "$COMMON" || true)"
+        echo "rba references now: $(grep -c rba "$COMMON" || true)"
     fi
     return 0
 }
 trap cleanup EXIT
 trap 'cleanup; exit 130' INT TERM HUP
 
-ME="${ALP_TEST_USER:-${SUDO_USER:-user}}"
+ME="${RBA_TEST_USER:-${SUDO_USER:-user}}"
 # runuser by absolute path, and a real binary rather than a shell function: spawn_grouped
 # hands the command to setsid, which can only exec a program. A function here fails with
 # "setsid: failed to execute asuser" and the daemon silently never starts.
@@ -90,7 +90,7 @@ asuser() { /usr/sbin/runuser -u "$ME" -- "$@"; }
 # That is a false pass, so it is checked rather than assumed.
 require_free_socket() {
     local sock="$1"
-    if [ -S "$sock" ] && asuser phone-authctl --socket "$sock" status >/dev/null 2>&1; then
+    if [ -S "$sock" ] && asuser rba --socket "$sock" status >/dev/null 2>&1; then
         echo "ERROR: something is already serving $sock." >&2
         echo "       A previous run leaked a daemon. Stop it first, or the test would" >&2
         echo "       silently exercise that one instead of a fresh daemon." >&2
@@ -111,34 +111,34 @@ echo "=== one-line common-auth test (edits $COMMON, restores it on exit) ==="
 restart_stack() {
     local behaviour="$1" log="$2"
     kill_groups
-    spawn_asuser "$B/phone-authd" --state-dir "$W/state" --socket "$SOCKET" \
+    spawn_asuser "$B/rbad" --state-dir "$W/state" --socket "$SOCKET" \
         --audit-log "$W/audit.log" --port "$PORT" --bind "127.0.0.1:$PORT" --no-mdns \
         >>"$W/daemon.log" 2>&1
     for _ in $(seq 1 60); do [ -S "$SOCKET" ] && break; sleep 0.2; done
     sleep 1
-    spawn_asuser "$B/phone-auth-sim" serve --host "127.0.0.1:$PORT" --name "Pixel 9" \
+    spawn_asuser "$B/rba-sim" serve --host "127.0.0.1:$PORT" --name "Pixel 9" \
         --ca "$W/state/host.crt" --timeout 600 --behaviour "$behaviour" >"$log" 2>&1
     sleep 2
 }
 
 step "install the module"
-( cd "$REPO/linux" && cargo build --release -p pam-phone-auth ) >/dev/null 2>&1
-install -m 0755 "$REPO/linux/target/release/libpam_phone_auth.so" "$SECDIR/pam_phone_auth.so"
-echo "  installed $(ls -la "$SECDIR/pam_phone_auth.so" | awk '{print $5}') bytes"
+( cd "$REPO/linux" && cargo build --release -p pam-rba ) >/dev/null 2>&1
+install -m 0755 "$REPO/linux/target/release/libpam_rba.so" "$SECDIR/pam_rba.so"
+echo "  installed $(ls -la "$SECDIR/pam_rba.so" | awk '{print $5}') bytes"
 
 step "start the daemon and pair a simulator"
 require_free_socket "$SOCKET"
 
-rm -rf "$W"; mkdir -p "$W" /run/phone-authd; chown "$ME":"$ME" "$W" /run/phone-authd
-rm -f /tmp/phone-auth-sim-*.json
-spawn_asuser "$B/phone-authd" --state-dir "$W/state" --socket "$SOCKET" --audit-log "$W/audit.log" \
+rm -rf "$W"; mkdir -p "$W" /run/rba; chown "$ME":"$ME" "$W" /run/rba
+rm -f /tmp/rba-sim-*.json
+spawn_asuser "$B/rbad" --state-dir "$W/state" --socket "$SOCKET" --audit-log "$W/audit.log" \
     --port "$PORT" --bind "127.0.0.1:$PORT" --no-mdns >"$W/daemon.log" 2>&1
 for _ in $(seq 1 60); do [ -S "$SOCKET" ] && break; sleep 0.2; done
-asuser "$B/phone-authctl" --socket "$SOCKET" pair --yes --timeout 45000 >"$W/pair.log" 2>&1 &
+asuser "$B/rba" --socket "$SOCKET" pair --yes --timeout 45000 >"$W/pair.log" 2>&1 &
 PAIR=$!
 sleep 1
-asuser timeout 45 "$B/phone-auth-sim" pair --host "127.0.0.1:$PORT" --name "Pixel 9" \
-    --daemon "$B/phone-authd" --daemon-arg --state-dir --daemon-arg "$W/state" >"$W/simpair.log" 2>&1
+asuser timeout 45 "$B/rba-sim" pair --host "127.0.0.1:$PORT" --name "Pixel 9" \
+    --daemon "$B/rbad" --daemon-arg --state-dir --daemon-arg "$W/state" >"$W/simpair.log" 2>&1
 wait $PAIR
 ok "paired"
 echo 1234 | sudo -S -p "" chown "$ME":"$ME" "$W/pair.log" 2>/dev/null
@@ -151,13 +151,13 @@ python3 - "$COMMON" <<'PY'
 import sys
 path = sys.argv[1]
 lines = open(path).read().splitlines()
-line = "auth\tsufficient\tpam_phone_auth.so purpose=auth debug"
+line = "auth\tsufficient\tpam_rba.so purpose=auth debug"
 out, done = [], False
 for l in lines:
     # Before the per-package block, which is the place pam-auth-update's own comment
     # recommends for a local module.
     if not done and l.startswith("auth") and "pam_unix" in l:
-        out.append("# Android remote authenticator (inserted by the phone-auth test; remove to roll back)")
+        out.append("# Android remote authenticator (inserted by the rba test; remove to roll back)")
         out.append(line)
         done = True
     out.append(l)
@@ -190,15 +190,15 @@ for svc in polkit-1 gdm-password sudo login su; do
     out=$(asuser "$W/pam-test" "$svc" "$ME" 2>&1); rc=$?
     verdict=$(printf '%s' "$out" | grep -oE 'authenticate: [A-Z_]+ \([0-9]+\)' | head -1)
     echo "    | $svc -> ${verdict:-<no verdict>}"
-    if [ $rc -eq 0 ]; then ok "$svc authenticated on the phone's word"
+    if [ $rc -eq 0 ]; then ok "$svc authenticated on the device's word"
     else bad "$svc did not authenticate (rc=$rc)"; fi
 done
 
 step "the sixth prompt in a minute must be rate-limited, not prompted for"
 # RATE_AUTH is 5 per 60s per device per user (PROTOCOL §12). The five services above
-# spend the whole budget, so this one must be refused *without* disturbing the phone --
+# spend the whole budget, so this one must be refused *without* disturbing the device --
 # which is the property that matters: a flood of requests must not turn into a flood of
-# fingerprint dialogs on someone's phone.
+# fingerprint dialogs on someone's device.
 out=$(asuser "$W/pam-test" sudo "$ME" 2>&1); rc=$?
 echo "    | $(printf '%s' "$out" | grep -oE 'authenticate: [A-Z_]+ \([0-9]+\)' | head -1)"
 if [ $rc -ne 0 ] && grep -q '"code":"RATE_LIMITED"' "$W/audit.log"; then
@@ -210,12 +210,12 @@ BEFORE_PROMPTS=$(grep -c 'Authorize:' "$W/sim.log" 2>/dev/null || echo 0)
 out=$(asuser "$W/pam-test" login "$ME" 2>&1) || true
 AFTER_PROMPTS=$(grep -c 'Authorize:' "$W/sim.log" 2>/dev/null || echo 0)
 if [ "$BEFORE_PROMPTS" = "$AFTER_PROMPTS" ]; then
-    ok "a rate-limited request never reached the phone ($AFTER_PROMPTS prompts total)"
+    ok "a rate-limited request never reached the device ($AFTER_PROMPTS prompts total)"
 else
-    bad "a rate-limited request still prompted the phone ($BEFORE -> $AFTER)"
+    bad "a rate-limited request still prompted the device ($BEFORE -> $AFTER)"
 fi
 
-step "the phone declines: every one of those must fall back to the password"
+step "the device declines: every one of those must fall back to the password"
 # A fresh daemon, so this exercises the decline rather than the rate limit.
 restart_stack deny "$W/sim2.log"
 out=$(asuser "$W/pam-test" sudo "$ME" 2>&1); rc=$?
@@ -223,7 +223,7 @@ echo "    | $(printf '%s' "$out" | grep -oE 'authenticate: [A-Z_]+ \([0-9]+\)' |
 if [ $rc -ne 0 ]; then
     ok "a decline did not authenticate; the stack fell through to the password"
 else
-    bad "authenticated despite the phone declining"
+    bad "authenticated despite the device declining"
 fi
 
 step "audit trail"

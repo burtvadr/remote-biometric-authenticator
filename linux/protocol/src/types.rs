@@ -137,7 +137,7 @@ impl Transport {
 // ---------------------------------------------------------------------------
 
 /// The exact set of signed field names. This is the authorization scope: a
-/// change here changes what the phone has actually approved.
+/// change here changes what the device has actually approved.
 pub const SIGNED_FIELDS: [&str; 10] = [
     "challenge",
     "device_id",
@@ -151,7 +151,7 @@ pub const SIGNED_FIELDS: [&str; 10] = [
     "username",
 ];
 
-/// What the phone is being asked to approve.
+/// What the device is being asked to approve.
 ///
 /// The ten *signed* fields are the authorization scope. `display_*` fields are
 /// unsigned prose shown to the operator and MUST NOT influence the signature
@@ -263,7 +263,7 @@ impl AuthRequest {
     /// The exact bytes that get signed (`PROTOCOL.md` §8.2):
     ///
     /// ```text
-    /// "ANDROID_LINUX_AUTH_V1" || 0x00 || 0x01 || canonical_cbor(core_map)
+    /// "RBA_AUTH_V1" || 0x00 || 0x01 || canonical_cbor(core_map)
     /// ```
     pub fn signing_input(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(crypto::DOMAIN_SIGNING.len() + 2 + 256);
@@ -644,17 +644,17 @@ mod tests {
     #[test]
     fn signing_input_has_the_specified_prefix() {
         let si = sample().signing_input();
-        let domain = b"ANDROID_LINUX_AUTH_V1";
+        let domain = b"RBA_AUTH_V1";
         assert_eq!(
             domain.len(),
-            21,
-            "spec documents this as a 21-byte separator"
+            11,
+            "spec documents this as an 11-byte separator"
         );
-        assert_eq!(&si[..21], domain);
-        assert_eq!(si[21], 0x00, "NUL separator");
-        assert_eq!(si[22], 0x01, "protocol version");
+        assert_eq!(&si[..11], domain);
+        assert_eq!(si[11], 0x00, "NUL separator");
+        assert_eq!(si[12], 0x01, "protocol version");
         // Body is canonical CBOR for a 10-pair map: 0xA0 + 10 = 0xAA.
-        assert_eq!(si[23], 0xaa);
+        assert_eq!(si[13], 0xaa);
     }
 
     #[test]

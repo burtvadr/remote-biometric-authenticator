@@ -1,5 +1,4 @@
-//! Wire protocol and cryptography for the Android remote biometric
-//! authenticator.
+//! Wire protocol and cryptography for the Remote Biometric Authenticator.
 //!
 //! This crate is the Linux-side implementation of
 //! `protocol/specification/PROTOCOL.md`. The Android application implements the
@@ -42,7 +41,7 @@ pub const PROTOCOL_VERSION: u64 = 1;
 pub const MAX_FRAME_PAYLOAD: usize = 65_536;
 
 /// DNS-SD service type (`PROTOCOL.md` §13.1).
-pub const SERVICE_TYPE: &str = "_android-fprint._tcp.local.";
+pub const SERVICE_TYPE: &str = "_rba._tcp.local.";
 
 /// BLE GATT identifiers (`PROTOCOL.md` §13.2). Project-assigned 128-bit UUIDs in
 /// a private range; they are routing data and never identity.
@@ -63,7 +62,7 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Version string reported by `phone-authctl --version` and in logs.
+/// Version string reported by `rba --version` and in logs.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(test)]
@@ -99,6 +98,6 @@ mod tests {
 
     #[test]
     fn service_type_matches_the_specification() {
-        assert_eq!(SERVICE_TYPE, "_android-fprint._tcp.local.");
+        assert_eq!(SERVICE_TYPE, "_rba._tcp.local.");
     }
 }

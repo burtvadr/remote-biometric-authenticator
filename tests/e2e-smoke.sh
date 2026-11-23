@@ -4,12 +4,12 @@
 set -uo pipefail
 
 BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../linux/target/debug" && pwd)"
-WORK="${1:-/tmp/alp-e2e}"
-PORT="${ALP_PORT:-47311}"
+WORK="${1:-/tmp/rba-e2e}"
+PORT="${RBA_PORT:-47311}"
 SOCK="$WORK/control.sock"
-CTL="$BIN_DIR/phone-authctl"
-DAEMON="$BIN_DIR/phone-authd"
-SIM="$BIN_DIR/phone-auth-sim"
+CTL="$BIN_DIR/rba"
+DAEMON="$BIN_DIR/rbad"
+SIM="$BIN_DIR/rba-sim"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 step() { echo; echo "=== $* ==="; }
@@ -33,7 +33,7 @@ echo "daemon pid $DAEMON_PID on port $PORT"
 CTL_SOCK="--socket $SOCK"
 
 step "no authenticators paired yet"
-"$CTL" $CTL_SOCK list | grep -q "No authenticators" || fail "expected an empty list"
+"$CTL" $CTL_SOCK devices | grep -q "No authenticators" || fail "expected an empty list"
 
 step "pair"
 "$CTL" $CTL_SOCK pair --yes >"$WORK/pair.log" 2>&1 &
@@ -46,13 +46,13 @@ SIM_RC=$?
 wait "$PAIR_PID" 2>/dev/null
 PAIR_RC=$?
 echo "--- simulator (rc=$SIM_RC) ---"; cat "$WORK/sim-pair.log"
-echo "--- phone-authctl pair (rc=$PAIR_RC) ---"; cat "$WORK/pair.log"
+echo "--- rba pair (rc=$PAIR_RC) ---"; cat "$WORK/pair.log"
 [ "$SIM_RC" -eq 0 ] || fail "simulator pairing failed"
 grep -q "Compare this code" "$WORK/sim-pair.log" || fail "no code was displayed"
 grep -qi "confirm" "$WORK/pair.log" || true
 
-step "list now shows the paired device"
-"$CTL" $CTL_SOCK list | tee "$WORK/list.log"
+step "devices now shows the paired device"
+"$CTL" $CTL_SOCK devices | tee "$WORK/list.log"
 grep -q "Pixel 9" "$WORK/list.log" || fail "paired device not listed"
 grep -q "paired" "$WORK/list.log" || fail "device is not in the paired state"
 
@@ -62,13 +62,13 @@ step "hold a connection open and authenticate"
 SIM_SERVE_PID=$!
 sleep 1.5
 USER_NAME="$(id -un)"
-"$CTL" $CTL_SOCK authenticate --user "$USER_NAME" --purpose sudo --service sudo \
+"$CTL" $CTL_SOCK auth --user "$USER_NAME" --purpose sudo --service sudo \
         --timeout 30000 >"$WORK/auth.log" 2>&1
 AUTH_RC=$?
 kill "$SIM_SERVE_PID" 2>/dev/null
 wait "$SIM_SERVE_PID" 2>/dev/null
-echo "--- phone (rc) ---"; tail -6 "$WORK/sim-serve.log"
-echo "--- phone-authctl authenticate (rc=$AUTH_RC) ---"; cat "$WORK/auth.log"
+echo "--- device (rc) ---"; tail -6 "$WORK/sim-serve.log"
+echo "--- rba auth (rc=$AUTH_RC) ---"; cat "$WORK/auth.log"
 [ "$AUTH_RC" -eq 0 ] || fail "authentication failed"
 grep -q "Authenticated" "$WORK/auth.log" || fail "no success reported"
 
@@ -77,7 +77,7 @@ step "a second authentication must fail: replay of the same challenge is impossi
     --ca "$WORK/state/host.crt" --timeout 30 --behaviour stall >"$WORK/sim-stall.log" 2>&1 &
 STALL_PID=$!
 sleep 1.5
-timeout 20 "$CTL" $CTL_SOCK authenticate --user "$USER_NAME" --purpose sudo --timeout 2500 \
+timeout 20 "$CTL" $CTL_SOCK auth --user "$USER_NAME" --purpose sudo --timeout 2500 \
     >"$WORK/auth-timeout.log" 2>&1
 TIMEOUT_RC=$?
 kill "$STALL_PID" 2>/dev/null

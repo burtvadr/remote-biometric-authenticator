@@ -1,5 +1,5 @@
 {
-  "code": "830728",
+  "code": "511366",
   "code_entry": "device",
   "description": "Pairing transcript. Both sides derive the same ephemeral ECDH secret bound to the full transcript; the code and MACs prove it.",
   "device_ephemeral": {
@@ -11,7 +11,7 @@
     "key_id_hex": "d12fb2a6953f71ca1db2bb3853709e1afa1835b83c0dd113b64eeadeddeb4913",
     "public_key_hex": "04f68b1de0f5ce686192f4bd0fd34163863f2e89d385f8bcfb85979533a57ac9b04f022ab6b096c8bf42804d8e67d38b3f88866980cc903f68fde9d2e143d93267"
   },
-  "device_mac_hex": "1f4aa0dac46f1a6b2fcb67d0bfc910ce5b8fdf18e16d30d17b243a6c86d23db4",
+  "device_mac_hex": "1fb16a654e53c122bf593908cf3dff4707cd8c26148837c631516f317677a613",
   "host_ephemeral": {
     "private_scalar_hex": "7777777777777777777777777777777777777777777777777777777777777777",
     "public_key_hex": "04e45054eb5b1abd976650f7f395bf51d0d8dd193e0174e7a14a1c8c127fbdf2dbaefe3293b0445f3f92bf8e108202e009415c899499620c71b7f6df9021132c9c"
@@ -21,11 +21,11 @@
     "key_id_hex": "16edb9b8cf52e98c431dbf8802a0f25cc000bff5315a04ac02235b423b239c08",
     "public_key_hex": "04418b9b63bd211b39c0f97628be371fa2dc1714f9272dd6bc33e1a60f1562398372891f6a9194aa9efcb0981159bad37674592302517c59efcd84588b188129e4"
   },
-  "host_mac_hex": "0a21e479622d912c6057dd926d152605e1f0f5bfa9160f3befa35545496fc2ec",
+  "host_mac_hex": "4486493f690feb2f7d53daa7532ace9e1323b3cb5ef8e37030ea4e3e91d249f4",
   "must_differ": [
     {
       "expect_valid": false,
-      "mac_hex": "b43b242aec683c653fbea11535dd711941a7505b31c26f1c2bf6ffcb6e9f8bf4",
+      "mac_hex": "669bdb032a9697245f442e04d34bf8a00e9fd7cce875e0fd5f655e1aa71d1635",
       "name": "substituted_device_key",
       "reason": "an attacker substituting its own device key cannot produce the MAC the host will accept"
     }

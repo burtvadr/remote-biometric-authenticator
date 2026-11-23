@@ -4,8 +4,8 @@
 # Registers a real authentication agent with the running polkitd over the system bus
 # and drives a real authorization through it:
 #
-#   pkcheck -> polkitd -> Authenticate() -> phone-auth-polkit-agent
-#           -> phone-authd -> TLS -> phone-auth-sim
+#   pkcheck -> polkitd -> Authenticate() -> rba-polkit-agent
+#           -> rbad -> TLS -> rba-sim
 #           -> agent -> CheckAuthorization() -> polkitd -> decision
 #
 # The test uses its own action id, its own rule file and its own policy file, and
@@ -30,15 +30,15 @@
 # product.
 #
 # It also asserts the negative cases, which matter more than the positive one: an
-# action must not be authorized after the phone declines, and it must not stay
+# action must not be authorized after the device declines, and it must not stay
 # authorized once the agent that granted it is gone. An authorization that outlives its
 # evidence is the failure mode that actually bites.
 set -uo pipefail
 
-REPO="${ALP_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+REPO="${RBA_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 BIN="$REPO/linux/target/debug"
-SOCKET=/run/phone-authd/control.sock
-RULE=/etc/polkit-1/rules.d/50-phone-auth-test.rules
+SOCKET=/run/rba/control.sock
+RULE=/etc/polkit-1/rules.d/50-rba-test.rules
 # polkitd's compiled-in search path is /usr/share/polkit-1/actions,
 # /etc/polkit-1/actions and /run/polkit-1/actions. It does NOT read
 # /usr/share/polkit-1/actions.d -- despite that directory existing here -- so a policy
@@ -49,10 +49,10 @@ RULE=/etc/polkit-1/rules.d/50-phone-auth-test.rules
 # not exist at boot, so creating it later fires no file-monitor events and the action
 # never appears -- which looks exactly like the agent failing. The file is removed on
 # exit, and the name makes its origin obvious.
-POLICY=/usr/share/polkit-1/actions/com.androidfprint.test.policy
-WORK="${ALP_POLKIT_WORK:-/var/tmp/alp-polkit}"
-PORT="${ALP_POLKIT_PORT:-47951}"
-ACTION=com.androidfprint.test
+POLICY=/usr/share/polkit-1/actions/io.github.burtvadr.rba.test.policy
+WORK="${RBA_POLKIT_WORK:-/var/tmp/rba-polkit}"
+PORT="${RBA_POLKIT_PORT:-47951}"
+ACTION=io.github.burtvadr.rba.test
 
 # pkcheck must name a process owned by the user running it. Using the script's own
 # pid does not work: the script is root while pkcheck is not, and polkit rejects a
@@ -76,7 +76,7 @@ DAEMON_PID=""; SIM_PID=""
 #
 # `$!` alone is not enough when the helper is launched through sudo: it captures the
 # sudo wrapper, and killing that leaves the real daemon running. A leaked daemon keeps
-# holding /run/phone-authd/control.sock, so the next run talks to a *stale* daemon on a
+# holding /run/rba/control.sock, so the next run talks to a *stale* daemon on a
 # different port -- which does not fail loudly, it pairs against the wrong process and
 # reports success. That is a false pass, which is worse than a failure.
 spawn_grouped() {
@@ -117,9 +117,9 @@ trap 'cleanup; exit 130' INT TERM HUP
 # root unconditionally -- a root pkcheck would succeed without ever consulting an
 # agent, which would make every assertion here vacuous. So the interactive half runs
 # as an ordinary admin user.
-ME="${ALP_TEST_USER:-${SUDO_USER:-user}}"
+ME="${RBA_TEST_USER:-${SUDO_USER:-user}}"
 if [ "$(id -u)" -eq 0 ] && [ "$ME" = root ]; then
-    echo "need a non-root admin user; set ALP_TEST_USER" >&2
+    echo "need a non-root admin user; set RBA_TEST_USER" >&2
     exit 1
 fi
 # runuser by absolute path, and a real binary rather than a shell function: spawn_grouped
@@ -135,7 +135,7 @@ asuser() { /usr/sbin/runuser -u "$ME" -- "$@"; }
 # That is a false pass, so it is checked rather than assumed.
 require_free_socket() {
     local sock="$1"
-    if [ -S "$sock" ] && asuser phone-authctl --socket "$sock" status >/dev/null 2>&1; then
+    if [ -S "$sock" ] && asuser rba --socket "$sock" status >/dev/null 2>&1; then
         echo "ERROR: something is already serving $sock." >&2
         echo "       A previous run leaked a daemon. Stop it first, or the test would" >&2
         echo "       silently exercise that one instead of a fresh daemon." >&2
@@ -170,8 +170,8 @@ cat > "$POLICY" <<EOF
 <policyconfig>
   <vendor>Android Remote Authenticator</vendor>
   <action id="$ACTION">
-    <description>Phone authenticator integration test</description>
-    <message>Authentication is required for the phone authenticator test action</message>
+    <description>Device authenticator integration test</description>
+    <message>Authentication is required for the device authenticator test action</message>
     <defaults>
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>
@@ -181,7 +181,7 @@ cat > "$POLICY" <<EOF
 </policyconfig>
 EOF
 cat > "$RULE" <<EOF
-// Temporary rule for the phone-authenticator integration test. Removed on exit.
+// Temporary rule for the authenticator integration test. Removed on exit.
 polkit.addRule(function (action, subject) {
     if (action.id == "$ACTION") {
         return polkit.Result.AUTH_ADMIN;
@@ -214,35 +214,35 @@ require_free_socket "$SOCKET"
 rm -rf "$WORK"; mkdir -p "$WORK"
 # /run may already hold a socket from an earlier test; it is root-owned, so this has
 # to happen as root rather than being done by the daemon.
-rm -rf /run/phone-authd; mkdir -p /run/phone-authd
-chown "$ME":"$ME" "$WORK" /run/phone-authd
-rm -f /tmp/phone-auth-sim-*.json
+rm -rf /run/rba; mkdir -p /run/rba
+chown "$ME":"$ME" "$WORK" /run/rba
+rm -f /tmp/rba-sim-*.json
 start_daemon() {
-    spawn_asuser "$BIN/phone-authd" --state-dir "$WORK/state" --socket "$SOCKET" --audit-log "$WORK/audit.log" \
+    spawn_asuser "$BIN/rbad" --state-dir "$WORK/state" --socket "$SOCKET" --audit-log "$WORK/audit.log" \
         --port "$PORT" --bind "127.0.0.1:$PORT" --no-mdns >"$WORK/daemon.log" 2>&1
     for _ in $(seq 1 60); do [ -S "$SOCKET" ] && return 0; sleep 0.2; done
     echo "daemon failed to start"; cat "$WORK/daemon.log"; exit 1
 }
 start_daemon
-asuser "$BIN/phone-authctl" --socket "$SOCKET" pair --yes --timeout 45000 >"$WORK/pair.log" 2>&1 &
+asuser "$BIN/rba" --socket "$SOCKET" pair --yes --timeout 45000 >"$WORK/pair.log" 2>&1 &
 PAIR=$!
 sleep 1
-asuser timeout 45 "$BIN/phone-auth-sim" pair --host "127.0.0.1:$PORT" --name "Pixel 9" \
-    --daemon "$BIN/phone-authd" --daemon-arg --state-dir --daemon-arg "$WORK/state" \
+asuser timeout 45 "$BIN/rba-sim" pair --host "127.0.0.1:$PORT" --name "Pixel 9" \
+    --daemon "$BIN/rbad" --daemon-arg --state-dir --daemon-arg "$WORK/state" \
     >"$WORK/simpair.log" 2>&1
 wait $PAIR
 ok "paired"
 
 serve() {
-    spawn_asuser "$BIN/phone-auth-sim" serve --host "127.0.0.1:$PORT" --name "Pixel 9" \
+    spawn_asuser "$BIN/rba-sim" serve --host "127.0.0.1:$PORT" --name "Pixel 9" \
         --ca "$WORK/state/host.crt" --timeout "$1" --behaviour "$2" >"$WORK/sim.log" 2>&1
     sleep 1.5
 }
 stop_sim() { kill_groups; }
 
-step "A. the phone approves: polkit authorizes the action"
+step "A. the device approves: polkit authorizes the action"
 serve 90 approve
-spawn_asuser "$BIN/phone-auth-polkit-agent" --socket "$SOCKET" >"$WORK/agent.log" 2>&1
+spawn_asuser "$BIN/rba-polkit-agent" --socket "$SOCKET" >"$WORK/agent.log" 2>&1
 for _ in $(seq 1 40); do grep -q 'waiting for challenges' "$WORK/agent.log" 2>/dev/null && break; sleep 0.25; done
 if grep -q 'registered with polkit' "$WORK/agent.log"; then
     ok "the agent registered with polkitd (polkitd accepted the subject and object path)"
@@ -253,7 +253,7 @@ fi
 out=$(asuser timeout 90 pkcheck -p "$(subject_pid)" --action-id "$ACTION" --allow-user-interaction 2>&1); rc=$?
 echo "    | $out (rc=$rc)"
 if [ $rc -eq 0 ]; then
-    ok "pkcheck was authorized after the phone authenticated the user"
+    ok "pkcheck was authorized after the device authenticated the user"
 elif echo "$out" | grep -q 'no agent is available'; then
     bad "polkitd registered no eligible agent: it says none is available for this subject.
          The agent registered successfully, so this is polkit deciding the agent is not
@@ -263,14 +263,14 @@ else
     bad "pkcheck was not authorized (rc=$rc)"
 fi
 if grep -q 'authenticated' "$WORK/agent.log"; then
-    ok "the agent reports the phone authenticated the challenge"
+    ok "the agent reports the device authenticated the challenge"
 else
     bad "the agent never authenticated"; sed 's/^/    | /' "$WORK/agent.log"
 fi
 if grep -q 'Authorize:' "$WORK/sim.log"; then
-    ok "the phone was asked, naming the action: $(grep -m1 'Authorize:' "$WORK/sim.log" | sed 's/.*Authorize: //')"
+    ok "the device was asked, naming the action: $(grep -m1 'Authorize:' "$WORK/sim.log" | sed 's/.*Authorize: //')"
 else
-    bad "the phone was never asked"
+    bad "the device was never asked"
 fi
 if grep -q '"service":"'"$ACTION"'"' "$WORK/audit.log" 2>/dev/null; then
     ok "the daemon recorded the polkit action id as the service"
@@ -279,15 +279,15 @@ else
 fi
 stop_sim
 
-step "B. the phone declines: polkit must refuse"
+step "B. the device declines: polkit must refuse"
 serve 90 deny
 out=$(asuser timeout 90 pkcheck -p "$(subject_pid)" --action-id "$ACTION" --allow-user-interaction 2>&1); rc=$?
 stop_sim
 echo "    | $out (rc=$rc)"
 if [ $rc -ne 0 ]; then
-    ok "polkit refused after the phone declined"
+    ok "polkit refused after the device declined"
 else
-    bad "polkit authorized even though the phone declined"
+    bad "polkit authorized even though the device declined"
 fi
 if grep -q '"code":"USER_CANCELLED"' "$WORK/audit.log" 2>/dev/null; then
     ok "the decline is in the audit log"

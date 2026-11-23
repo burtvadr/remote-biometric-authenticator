@@ -1,46 +1,32 @@
 #!/usr/bin/env bash
-# Install the local Android authenticator for Arch Linux.
+# Install the Remote Biometric Authenticator for Arch Linux.
 #
 # Run as root:
-#   sudo ./packaging/arch/install-local.sh \
-#       --state-from /tmp/alp-live/state
+#   sudo ./packaging/arch/install-local.sh
 #
-# The optional --state-from preserves an existing pairing (host key and
-# certificate pin). Without it the daemon starts fresh and the phone must pair
-# again.
+# There is no state migration: the daemon starts with a fresh host identity and
+# every device must pair again.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-STATE_FROM=""
-PAM_FILE="/etc/pam.d/sudo"
-PAM_LINE="auth        sufficient    pam_phone_auth.so purpose=sudo"
 
 usage() {
     cat <<EOF
-Usage: sudo $0 [--state-from DIR]
-
-  --state-from DIR   copy host.id, host.key, host.crt, host-tls.key and
-                     registry.json from DIR into /var/lib/phone-authd
-                     (only when the target state directory is empty)
+Usage: sudo $0
 
 This installs:
-  /usr/libexec/phone-authd
-  /usr/local/bin/phone-authctl
-  /usr/lib/security/pam_phone_auth.so
-  /etc/systemd/system/phone-authd.service
-  one PAM line in $PAM_FILE
+  /usr/libexec/rbad
+  /usr/local/bin/rba
+  /usr/lib/security/pam_rba.so
+  /etc/systemd/system/rbad.service
 
-It does not touch /etc/pam.d/system-auth.
+It does not modify any PAM stack. Enable the scoped GDM or polkit integration
+separately with packaging/arch/pam-gdm-rba.sh or pam-polkit-rba.sh.
 EOF
 }
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --state-from)
-            [ "$#" -ge 2 ] || { echo "--state-from needs a directory" >&2; exit 2; }
-            STATE_FROM="$2"
-            shift 2
-            ;;
         -h|--help)
             usage
             exit 0
@@ -59,9 +45,9 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 for f in \
-    "$ROOT/linux/target/release/phone-authd" \
-    "$ROOT/linux/target/release/phone-authctl" \
-    "$ROOT/linux/target/release/libpam_phone_auth.so"; do
+    "$ROOT/linux/target/release/rbad" \
+    "$ROOT/linux/target/release/rba" \
+    "$ROOT/linux/target/release/libpam_rba.so"; do
     [ -x "$f" ] || {
         echo "missing $f" >&2
         echo "Build it first as your normal user: make release" >&2
@@ -69,59 +55,39 @@ for f in \
     }
 done
 
-if [ -n "$STATE_FROM" ] && [ ! -d "$STATE_FROM" ]; then
-    echo "state directory does not exist: $STATE_FROM" >&2
-    exit 1
+echo "==> creating the rba account"
+if ! getent group rba >/dev/null; then
+    groupadd --system rba
 fi
-
-echo "==> creating the phone-auth account"
-if ! getent group phone-auth >/dev/null; then
-    groupadd --system phone-auth
-fi
-if ! id -u phone-auth >/dev/null 2>&1; then
+if ! id -u rba >/dev/null 2>&1; then
     useradd --system \
-        --gid phone-auth \
-        --home-dir /var/lib/phone-authd \
+        --gid rba \
+        --home-dir /var/lib/rba \
         --no-create-home \
         --shell /usr/bin/nologin \
-        phone-auth
+        rba
 fi
 
 echo "==> installing binaries"
-install -Dm0755 "$ROOT/linux/target/release/phone-authd" /usr/libexec/phone-authd
-install -Dm0755 "$ROOT/linux/target/release/phone-authctl" /usr/local/bin/phone-authctl
-install -Dm0755 "$ROOT/linux/target/release/libpam_phone_auth.so" \
-    /usr/lib/security/pam_phone_auth.so
+install -Dm0755 "$ROOT/linux/target/release/rbad" /usr/libexec/rbad
+install -Dm0755 "$ROOT/linux/target/release/rba" /usr/local/bin/rba
+install -Dm0755 "$ROOT/linux/target/release/libpam_rba.so" \
+    /usr/lib/security/pam_rba.so
 
 echo "==> installing the service"
-install -Dm0644 "$ROOT/linux/systemd/phone-authd.service" \
-    /etc/systemd/system/phone-authd.service
+install -Dm0644 "$ROOT/linux/systemd/rbad.service" \
+    /etc/systemd/system/rbad.service
 
 echo "==> preparing state and log directories"
-install -d -o phone-auth -g phone-auth -m 0700 /var/lib/phone-authd
-install -d -o phone-auth -g phone-auth -m 0750 /var/log/phone-authd
-
-if [ -n "$STATE_FROM" ]; then
-    if find /var/lib/phone-authd -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
-        echo "state directory is not empty; refusing to overwrite it with $STATE_FROM" >&2
-        echo "remove /var/lib/phone-authd manually if you really want to replace it" >&2
-        exit 1
-    fi
-    echo "==> migrating the existing pairing from $STATE_FROM"
-    for f in host.id host.key host.crt host-tls.key registry.json; do
-        if [ -f "$STATE_FROM/$f" ]; then
-            install -o phone-auth -g phone-auth -m 0600 "$STATE_FROM/$f" \
-                "/var/lib/phone-authd/$f"
-        fi
-    done
-fi
+install -d -o rba -g rba -m 0700 /var/lib/rba
+install -d -o rba -g rba -m 0750 /var/log/rba
 
 if ss -ltn 'sport = :47123' 2>/dev/null | grep -q LISTEN; then
     # An upgrade runs while the old service is still listening. Stop our own
     # service first; refuse only if some other process owns the port.
-    if systemctl is-active --quiet phone-authd 2>/dev/null; then
-        echo "==> stopping the existing phone-authd service"
-        systemctl stop phone-authd
+    if systemctl is-active --quiet rbad 2>/dev/null; then
+        echo "==> stopping the existing rbad service"
+        systemctl stop rbad
     fi
 fi
 
@@ -131,62 +97,44 @@ if ss -ltn 'sport = :47123' 2>/dev/null | grep -q LISTEN; then
     exit 1
 fi
 
-echo "==> enabling and starting phone-authd"
+echo "==> enabling and starting rbad"
 systemctl daemon-reload
-systemctl enable phone-authd
-systemctl restart phone-authd
+systemctl enable rbad
+systemctl restart rbad
 
 for _ in $(seq 1 40); do
-    if [ -S /run/phone-authd/control.sock ]; then
+    if [ -S /run/rba/control.sock ]; then
         break
     fi
     sleep 0.25
 done
-if [ ! -S /run/phone-authd/control.sock ]; then
-    echo "phone-authd did not create /run/phone-authd/control.sock" >&2
-    systemctl --no-pager --full status phone-authd >&2 || true
+if [ ! -S /run/rba/control.sock ]; then
+    echo "rbad did not create /run/rba/control.sock" >&2
+    systemctl --no-pager --full status rbad >&2 || true
     exit 1
 fi
 
-echo "==> allowing the desktop user to use the control socket"
-if ! id -nG desktop | tr ' ' '\n' | grep -qx phone-auth; then
-    usermod -aG phone-auth desktop
-    echo "added desktop to the phone-auth group; a new login is needed for"
-    echo "unprivileged phone-authctl access. Root/PAM can already connect."
-fi
-
-echo "==> adding the PAM hook to $PAM_FILE"
-if grep -q 'pam_phone_auth\.so' "$PAM_FILE"; then
-    echo "PAM hook already present; leaving it alone"
-else
-    backup="$PAM_FILE.bak.$(date +%Y%m%d-%H%M%S)"
-    cp -a "$PAM_FILE" "$backup"
-    tmp="$(mktemp)"
-    if ! awk -v line="$PAM_LINE" '
-        BEGIN { inserted = 0 }
-        /^[[:space:]]*auth[[:space:]]+include[[:space:]]+system-auth[[:space:]]*$/ && !inserted {
-            print line
-            inserted = 1
-        }
-        { print }
-        END { if (!inserted) exit 42 }
-    ' "$PAM_FILE" > "$tmp"; then
-        rm -f "$tmp"
-        echo "could not find 'auth include system-auth' in $PAM_FILE" >&2
-        echo "restore is available at $backup" >&2
-        exit 1
+echo "==> allowing the invoking user to use the control socket"
+install_user="${SUDO_USER:-}"
+if [ -n "$install_user" ] && [ "$install_user" != root ]; then
+    if ! id -nG "$install_user" | tr ' ' '\n' | grep -qx rba; then
+        usermod -aG rba "$install_user"
+        echo "added $install_user to the rba group; a new login is needed for"
+        echo "unprivileged rba access. Root/PAM can already connect."
     fi
-    install -m 0644 -o root -g root "$tmp" "$PAM_FILE"
-    rm -f "$tmp"
-    echo "backup: $backup"
+else
+    echo "run this through sudo as the user who should use rba to add that account to the rba group"
 fi
 
 echo
 echo "==> installed"
-systemctl --no-pager --full status phone-authd | sed -n '1,12p'
+systemctl --no-pager --full status rbad | sed -n '1,12p'
 echo
-echo "Pair from the phone if this is a fresh state:"
-echo "  phone-authctl pair"
+echo "Pair from the device if this is a fresh state:"
+echo "  rba pair"
 echo
-echo "Then test (the phone should prompt):"
-echo "  sudo -k && sudo -v"
+echo "Then enable one scoped integration and keep a root TTY open:"
+echo "  sudo $ROOT/packaging/arch/pam-gdm-rba.sh --dry-run"
+echo "  sudo $ROOT/packaging/arch/pam-polkit-rba.sh --dry-run"
+echo
+echo "The sudo, sshd, su, login and gdm-fingerprint stacks are left unchanged."

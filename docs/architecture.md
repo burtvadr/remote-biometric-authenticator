@@ -22,7 +22,7 @@
                              │
                              ▼
                     ┌──────────────────┐
-                    │  phone-authd     │
+                    │  rbad     │
                     │                  │
                     │ pairing          │
                     │ verification     │
@@ -69,7 +69,7 @@ shared secret after pairing.
 | Party | Long-term key | Storage |
 |---|---|---|
 | Android device | `device_auth` (ECDSA P-256) | Android Keystore, non-exportable, biometric-gated |
-| Linux host | `host_identity` (ECDSA P-256) | `/var/lib/phone-authd/host.key`, root-only |
+| Linux host | `host_identity` (ECDSA P-256) | `/var/lib/rba/host.key`, root-only |
 
 Linux stores the device's **public** key. A shared pre-shared key is not a trust
 anchor here, only a possible bootstrap convenience — pairing authenticates keys
@@ -83,17 +83,17 @@ directly instead.
 | Protocol | `linux/protocol` | Canonical CBOR, framing, crypto, verification |
 | Protocol | `android/protocol` | Independent Kotlin implementation |
 | Vectors | `protocol/test-vectors/` | Proof the two implementations agree |
-| Engine | `linux/phone-authd` | Challenges, dispatch, verification, pairing |
-| Registry | `linux/phone-authd` | Which device keys are trusted |
-| Transport | `linux/phone-authd/transport` | Wi-Fi (TLS/mDNS) and BLE adapters |
-| IPC | `linux/phone-authd` | `SO_PEERCRED`-authorised control socket |
-| Integration | `linux/pam-phone-auth` | Thin PAM adapter |
+| Engine | `linux/rbad` | Challenges, dispatch, verification, pairing |
+| Registry | `linux/rbad` | Which device keys are trusted |
+| Transport | `linux/rbad/transport` | Wi-Fi (TLS/mDNS) and BLE adapters |
+| IPC | `linux/rbad` | `SO_PEERCRED`-authorised control socket |
+| Integration | `linux/pam-rba` | Thin PAM adapter |
 | UI | `android/app` | Compose screens, biometric, keystore, transports |
-| Test | `linux/phone-auth-sim` | Fake device, including misbehaving ones |
+| Test | `linux/rba-sim` | Fake device, including misbehaving ones |
 
 ## Why the protocol is transport-independent
 
-`PROTOCOL.md` §13 defines one message set. `android-fprint-protocol` has no
+`PROTOCOL.md` §13 defines one message set. `rba-protocol` has no
 transport code at all; the adapters in `transport/` move frames without inspecting
 payloads to make security decisions.
 
@@ -109,7 +109,7 @@ bytes per characteristic value, so frames are split and reassembled verbatim.
 * **Not a defence against a compromised Linux host.** If root is owned, the PAM
   stack and the daemon can be altered. This provides authentication *to* a healthy
   system.
-* **Not a defence against a compromised Android device.** A rooted phone can use
+* **Not a defence against a compromised Android device.** A rooted device can use
   the key. The model assumes the OS, Keystore and app package are intact.
 * **Not forward-secret against a later key compromise.** The pairing code is a
   keyed integrity check over the transcript, not a PAKE. Documented in
@@ -123,7 +123,7 @@ bytes per characteristic value, so frames are split and reassembled verbatim.
 Every failure is a denial: unknown device, invalid signature, expired request,
 replay, transport interruption, ambiguous user, unknown protocol version, malformed
 input, pairing mismatch. `PROTOCOL.md` §44 lists them; the security test suite in
-`linux/phone-authd/tests/security.rs` asserts each one.
+`linux/rbad/tests/security.rs` asserts each one.
 
 Whether the *PAM stack* then falls through to a password is the stack's
 `sufficient`/`required` ordering, not the module's decision.

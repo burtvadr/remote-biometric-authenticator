@@ -20,7 +20,7 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "android-fprint"
+rootProject.name = "rba"
 
 // The protocol module is pure Kotlin with no Android dependencies, so its
 // conformance vectors can be run without an emulator or an Android SDK. It is

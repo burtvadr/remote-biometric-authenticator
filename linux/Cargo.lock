@@ -12,23 +12,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "android-fprint-protocol"
-version = "0.1.0"
-dependencies = [
- "base64",
- "getrandom 0.2.17",
- "hex",
- "hkdf",
- "hmac",
- "p256",
- "rand_core",
- "serde_json",
- "sha2",
- "tokio",
- "zeroize",
-]
-
-[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -630,12 +613,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "pam-phone-auth"
+name = "pam-rba"
 version = "0.1.0"
 dependencies = [
- "android-fprint-protocol",
  "libc",
- "phone-authd",
+ "rba-protocol",
+ "rbad",
  "serde",
  "serde_json",
 ]
@@ -654,71 +637,6 @@ checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
 dependencies = [
  "base64",
  "serde_core",
-]
-
-[[package]]
-name = "phone-auth-polkit-agent"
-version = "0.1.0"
-dependencies = [
- "android-fprint-protocol",
- "futures-util",
- "phone-authd",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "zbus",
-]
-
-[[package]]
-name = "phone-auth-sim"
-version = "0.1.0"
-dependencies = [
- "android-fprint-protocol",
- "base64",
- "hex",
- "p256",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "tokio",
- "tokio-rustls",
-]
-
-[[package]]
-name = "phone-authctl"
-version = "0.1.0"
-dependencies = [
- "android-fprint-protocol",
- "phone-authd",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "phone-authd"
-version = "0.1.0"
-dependencies = [
- "android-fprint-protocol",
- "getrandom 0.2.17",
- "hex",
- "libc",
- "mdns-sd",
- "p256",
- "phone-auth-sim",
- "rand_core",
- "rcgen",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tokio-rustls",
- "zeroize",
 ]
 
 [[package]]
@@ -808,6 +726,88 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
  "getrandom 0.2.17",
+]
+
+[[package]]
+name = "rba"
+version = "0.1.0"
+dependencies = [
+ "rba-protocol",
+ "rbad",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "rba-polkit-agent"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "rba-protocol",
+ "rbad",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zbus",
+]
+
+[[package]]
+name = "rba-protocol"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "getrandom 0.2.17",
+ "hex",
+ "hkdf",
+ "hmac",
+ "p256",
+ "rand_core",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
+name = "rba-sim"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "hex",
+ "p256",
+ "rba-protocol",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
+name = "rbad"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "hex",
+ "libc",
+ "mdns-sd",
+ "p256",
+ "rand_core",
+ "rba-protocol",
+ "rba-sim",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-rustls",
+ "zeroize",
 ]
 
 [[package]]

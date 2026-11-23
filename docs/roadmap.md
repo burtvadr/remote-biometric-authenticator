@@ -10,7 +10,7 @@ take precedence over feature work.
 | Area | Today |
 |---|---|
 | Host OS | **Linux only**. Tested on Arch Linux. Debian/Ubuntu PAM instructions exist; Fedora/BSD/macOS/Windows are not supported. |
-| Phone | **Android 9+** (`minSdk 28`), debug APK. Tested on a Motorola Edge 30 Ultra, API 37. No iOS app. |
+| Device | **Android 9+** (`minSdk 28`), debug APK. Tested on a Motorola Edge 30 Ultra, API 37. No iOS app. |
 | Transport | **Wi-Fi** end to end. BLE framing/segmentation is tested; BlueZ/central wiring is not. |
 | Host integration | Linux-PAM; **sudo works today**. Target: GDM password login plus `pkexec`/`systemctl` through polkit. See [Integration target](#integration-target-gnome-login-pkexec-and-systemctl). |
 | Service manager | systemd unit + Unix control socket. |
@@ -24,7 +24,7 @@ those stacks is a deployment decision with a larger prompt-fatigue surface.
 
 ### Why the other prompts do not work yet
 
-On the tested Arch machine, the installed phone line is only in
+On the tested Arch machine, the installed device line is only in
 `/etc/pam.d/sudo`. The other paths are:
 
 ```text
@@ -41,17 +41,17 @@ GDM fingerprint login   -> /usr/lib/pam.d/gdm-fingerprint
 ```
 
 Arch keeps vendor PAM files under `/usr/lib/pam.d`; local overrides belong in
-`/etc/pam.d`. Editing the vendor files is not durable. Adding the phone module to
+`/etc/pam.d`. Editing the vendor files is not durable. Adding the device module to
 `system-auth` would affect many services at once and is deliberately not the
 default. Adding it to polkit or GDM must be tested with a root TTY available.
 
 ## Integration target: GNOME login, pkexec and systemctl
 
 Current priority: make **GNOME login**, **pkexec** and **systemctl**
-authentication work with the phone's fingerprint, without turning the rest of the
-system into an accidental phone-only machine.
+authentication work with the device's fingerprint, without turning the rest of the
+system into an accidental device-only machine.
 
-“Fingerprint” here means the phone's biometric prompt through this app, not a
+“Fingerprint” here means the device's biometric prompt through this app, not a
 local `fprintd` sensor. GDM's existing fingerprint path (`gdm-fingerprint` +
 `pam_fprintd`) is separate and must keep working.
 
@@ -69,20 +69,20 @@ managers/lock screens may use different service names (KDE has `kde` and
 `kde-fingerprint`).
 
 ```bash
-sudo ./packaging/arch/pam-gdm-phone.sh --dry-run
-sudo ./packaging/arch/pam-gdm-phone.sh
+sudo ./packaging/arch/pam-gdm-rba.sh --dry-run
+sudo ./packaging/arch/pam-gdm-rba.sh
 ```
 
 Then lock with `Super+L`, press Enter or submit the password form, and approve
-the phone prompt. The script keeps a backup and supports:
+the device prompt. The script keeps a backup and supports:
 
 ```bash
-sudo ./packaging/arch/pam-gdm-phone.sh --rollback
+sudo ./packaging/arch/pam-gdm-rba.sh --rollback
 ```
 
 Keep a root TTY open. The existing session keyring is already unlocked when you
 started the session with a password, so screen unlock does not need a new keyring
-password. A cold GDM login with phone-only authentication may still leave the
+password. A cold GDM login with device-only authentication may still leave the
 login keyring locked; that is a separate problem.
 
 ### Privilege, immutable systems and GDM
@@ -96,7 +96,7 @@ Installing this integration is an **administrator action**, not a user action:
   (overlay, package layering, rpm-ostree, transactional update). The mechanism
   changes; the privilege requirement does not.
 - An admin can install it once; daily pairing and use do not require root. The
-  user only needs access to the control socket (the `phone-auth` group).
+  user only needs access to the control socket (the `rba` group).
 
 At the **GDM login screen there is no active user session**. The greeter runs as
 `gdm`; the user selects an account, and the system PAM stack authenticates that
@@ -117,7 +117,7 @@ Consequences:
 - A future fprintd-compatible adapter is also a system service; it does not
   remove the administrator requirement.
 - If you have no admin rights, use the password or a local fingerprint sensor.
-  `phone-authctl` can still authenticate a user-run command if the socket is
+  `rba` can still authenticate a user-run command if the socket is
   accessible, but it cannot change GDM, the lock screen or PAM.
 
 ### Scope
@@ -125,9 +125,9 @@ Consequences:
 - GDM password login.
 - `pkexec` and `systemctl` actions that ask polkit for authentication.
 - `sudo` continues to work as it does now.
-- Password fallback must remain. If the phone is unavailable, cancelled or
+- Password fallback must remain. If the device is unavailable, cancelled or
   times out, the normal password path continues.
-- Do **not** add the phone to `/etc/pam.d/system-auth`. That file is included by
+- Do **not** add the device to `/etc/pam.d/system-auth`. That file is included by
   GDM, polkit, login and sshd; editing it would change all of them at once.
 
 ### Planned PAM layout
@@ -137,22 +137,22 @@ of the `auth` stack:
 
 ```text
 /etc/pam.d/gdm-password
-  auth  sufficient  pam_phone_auth.so  purpose=gdm  timeout_ms=5000
+  auth  sufficient  pam_rba.so  purpose=gdm  timeout_ms=5000
   auth  include     system-local-login
   ...
 
 /etc/pam.d/polkit-1
-  auth  sufficient  pam_phone_auth.so  purpose=polkit  timeout_ms=5000
+  auth  sufficient  pam_rba.so  purpose=polkit  timeout_ms=5000
   auth  include     system-auth
   ...
 ```
 
 The rest of each vendor file remains unchanged.
 
-Do not put the phone in `gdm-fingerprint` initially. That stack is owned by
+Do not put the device in `gdm-fingerprint` initially. That stack is owned by
 `pam_fprintd` and is only entered when GDM selects the local fingerprint method.
 The first target is the password form: the user submits the form, PAM reaches the
-phone module, and the phone prompt appears. A separate “phone” authentication
+device module, and the device prompt appears. A separate “device” authentication
 method in the GDM UI is a later experiment, not part of this change.
 
 ### Process identity is part of the integration
@@ -163,7 +163,7 @@ method in the GDM UI is a later experiment, not part of this change.
   `authorize_caller` behavior should work, but this must be verified on the live
   greeter.
 - `polkitd` runs as `polkitd`. PAM may execute inside polkitd, which means:
-  - it needs access to `/run/phone-authd/control.sock` (group membership or a
+  - it needs access to `/run/rba/control.sock` (group membership or a
     narrow ACL), and
   - `authorize_caller` currently allows root or the caller's own account only.
     A request from `polkitd` for the target desktop account would be refused.
@@ -184,7 +184,7 @@ the live machine:
 
 - [ ] Which process runs PAM for `pkexec`/`systemctl`? Is it
       `polkit-agent-helper-1`, `pkexec`, or polkitd? What UID does it run as?
-- [ ] Can that process reach `/run/phone-authd/control.sock` (root, group, ACL)?
+- [ ] Can that process reach `/run/rba/control.sock` (root, group, ACL)?
 - [ ] Does `authorize_caller` accept the caller/target pair? A helper running as
       the desktop user can ask for that user; a helper running as polkitd cannot
       ask for desktop without an explicit trusted-service policy.
@@ -193,7 +193,7 @@ the live machine:
       `/usr/lib/pam.d`?
 - [ ] Which concrete action was tested (`pkexec ...`, `systemctl restart ...`)?
       Some `systemctl` operations do not authenticate at all.
-- [ ] Does the phone show the target user, `purpose=polkit`, and the operation?
+- [ ] Does the device show the target user, `purpose=polkit`, and the operation?
 - [ ] Does cancel/timeout fall back to the polkit password dialog?
 - [ ] Does `PAM_TEXT_INFO` appear in the polkit dialog, or is it dropped?
 - [ ] Is this single-user only? Root-targeting polkit actions require SEC-004
@@ -206,7 +206,7 @@ Read-only recon before changing anything:
 cat /usr/lib/pam.d/polkit-1
 ls -l /usr/lib/polkit-1/polkit-agent-helper-1
 # trigger one pkexec/systemctl authentication, then:
-journalctl -b --no-pager | grep -i 'polkit\|pam_unix\|pam_phone'
+journalctl -b --no-pager | grep -i 'polkit\|pam_unix\|pam_rba'
 ```
 
 On the tested Arch machine:
@@ -216,7 +216,7 @@ On the tested Arch machine:
   `polkit-agent-helper@.service`.
 - That unit has `PrivateNetwork=yes`, `RestrictAddressFamilies=AF_UNIX` and
   `ProtectSystem=strict`. A Unix-socket connection to
-  `/run/phone-authd/control.sock` should still be possible, but the helper's UID
+  `/run/rba/control.sock` should still be possible, but the helper's UID
   and group access must be confirmed.
 - The journal shows `polkit-agent-helper-1` running `pam_unix(polkit-1:auth)`,
   then polkitd reporting the authorization result. It does not show which UID the
@@ -225,14 +225,14 @@ On the tested Arch machine:
 Use:
 
 ```bash
-sudo ./packaging/arch/pam-polkit-phone.sh --dry-run
+sudo ./packaging/arch/pam-polkit-rba.sh --dry-run
 ```
 
-The installer adds the same `sufficient` phone line before
+The installer adds the same `sufficient` device line before
 `auth include system-auth`; it does not edit the vendor file. Rollback is:
 
 ```bash
-sudo ./packaging/arch/pam-polkit-phone.sh --rollback
+sudo ./packaging/arch/pam-polkit-rba.sh --rollback
 ```
 
 The PAM message added for GDM is best-effort and consumer-specific. It is not a
@@ -240,7 +240,7 @@ reason to assume the polkit dialog will display it.
 
 ### Prompt quality
 
-The phone prompt must show enough to make a correct decision:
+The device prompt must show enough to make a correct decision:
 
 - the target Linux account;
 - the PAM service/purpose (`gdm`, `polkit`, `sudo`);
@@ -250,34 +250,34 @@ The phone prompt must show enough to make a correct decision:
 The prompt must not show an unsigned display name as the host identity. Account
 and operation come from the signed request context.
 
-### Password field plus a visible phone option
+### Password field plus a visible device option
 
 The current PAM integration cannot show both at once. GNOME's lock screen is not
 a generic PAM UI: it knows a password field and, through fprintd, a local
 fingerprint method. It does not render arbitrary PAM modules as buttons.
 
-With the phone line first:
+With the device line first:
 
 ```text
-auth sufficient pam_phone_auth.so ...
+auth sufficient pam_rba.so ...
 auth include system-local-login
 ```
 
-PAM tries the phone first. If it succeeds, the password stack is skipped. If it
+PAM tries the device first. If it succeeds, the password stack is skipped. If it
 fails or times out, the password path runs. That is an invisible priority order,
 not two visible choices.
 
-To show a password field **and** a phone biometric option side by side, one of
+To show a password field **and** a device biometric option side by side, one of
 these is required:
 
 1. **A fprintd-compatible virtual device** — GNOME/KDE show their normal
    biometric UI and keep the password field. This is the clean desktop path, but
    it is a system service, conflicts with a real fprintd unless proxied, and the
    fprintd API does not carry the PAM service/operation context.
-2. **A GDM/gnome-shell patch or extension** — add a phone button to the lock
+2. **A GDM/gnome-shell patch or extension** — add a device button to the lock
    screen. Not portable, security-sensitive, and not recommended as the first
    path.
-3. **PAM only** — accept that the phone is tried before the password and the
+3. **PAM only** — accept that the device is tried before the password and the
    password appears after the timeout. This is what works today.
 
 Do not try to fake two PAM methods by stacking `optional` and `sufficient`
@@ -290,13 +290,13 @@ review.
 
 ### Waiting, fallback and the “looks broken” problem
 
-The lock screen test now works, but the host shows no visible “check your phone”
+The lock screen test now works, but the host shows no visible “check your device”
 message while PAM waits. That is a real UX gap, not an authentication failure.
 
 Current behavior:
 
-- PAM calls the phone module first.
-- If the phone is paired and connected but not answered, the module waits up to
+- PAM calls the device module first.
+- If the device is paired and connected but not answered, the module waits up to
   `timeout_ms` (5 s in the gdm line by default).
 - If the daemon has no connected device, it should return quickly and fall
   through to the password.
@@ -305,17 +305,17 @@ Current behavior:
 
 Ownership of the problem:
 
-- **Ours:** the timeout choice, the lack of a fast “no phone connected” path, and
+- **Ours:** the timeout choice, the lack of a fast “no device connected” path, and
   the fact that the module does not emit a visible PAM message.
-- **GNOME/GDM:** the lock-screen UI does not expose a generic “phone
+- **GNOME/GDM:** the lock-screen UI does not expose a generic “device
   authenticator” method or a clear waiting indicator. A native fprintd adapter
   would show a device, but that is a larger future project.
 
 Required tests:
 
-- [ ] Lock with the phone powered off or in airplane mode. Press Enter. Confirm
+- [ ] Lock with the device powered off or in airplane mode. Press Enter. Confirm
       the password prompt appears after the timeout, not a dead screen.
-- [ ] Lock with the phone connected but not approved. Confirm the same fallback.
+- [ ] Lock with the device connected but not approved. Confirm the same fallback.
 - [ ] Lock with the daemon stopped. Confirm fallback is immediate.
 - [ ] If the password prompt does not return, treat it as a bug in our PAM
       integration, not a GNOME limitation.
@@ -323,7 +323,7 @@ Required tests:
 The PAM module now sends a best-effort `PAM_TEXT_INFO` message:
 
 ```text
-Check your phone to approve this request.
+Check your device to approve this request.
 ```
 
 Terminals and some PAM consumers display it. GDM's lock screen may ignore
@@ -335,8 +335,8 @@ Possible improvements, in order:
 
 1. Keep the lock-screen timeout short (5 s by default) and configurable with
    `--timeout`; test whether 5 s is long enough in practice.
-2. Add a fast pre-check so an unpaired/disconnected phone returns immediately.
-3. Emit a PAM info message asking the user to check the phone, if GDM displays it.
+2. Add a fast pre-check so an unpaired/disconnected device returns immediately.
+3. Emit a PAM info message asking the user to check the device, if GDM displays it.
 4. Document the wait in the UI/README.
 5. Only then consider a native fprintd-compatible device or a GNOME UI patch.
 
@@ -346,19 +346,19 @@ Possible improvements, in order:
 - Back up each file separately:
   `gdm-password.bak.<timestamp>`, `polkit-1.bak.<timestamp>`.
 - Change one stack at a time.
-- Test with the phone offline, with the phone cancelling, and with a wrong
+- Test with the device offline, with the device cancelling, and with a wrong
   password typed into the GDM/polkit dialog.
 - Keep `sufficient`: password must remain available.
 - Remove `debug` from the installed line; it is troubleshooting-only.
 
 ### Test matrix
 
-- GDM password login with the phone present.
-- GDM password login with the phone absent → password still works.
-- GDM login when the phone cancels → password still works.
+- GDM password login with the device present.
+- GDM password login with the device absent → password still works.
+- GDM login when the device cancels → password still works.
 - Local `fprintd` fingerprint login still works.
-- `pkexec` allowed action with phone; denied/cancelled action with password.
-- `systemctl` action that triggers polkit with phone; cancel/timeout.
+- `pkexec` allowed action with device; denied/cancelled action with password.
+- `systemctl` action that triggers polkit with device; cancel/timeout.
 - `sudo` still works.
 - `ssh` password/key login is unchanged.
 - `su` is unchanged.
@@ -366,7 +366,7 @@ Possible improvements, in order:
 
 ### Security caveat
 
-Until SEC-004 ownership and account policy lands, the phone is still host-wide.
+Until SEC-004 ownership and account policy lands, the device is still host-wide.
 That is acceptable for a single-user pilot with an explicit warning, but not for
 a multi-user machine. Polkit actions can target root; enabling them makes
 `allow_root`/ownership urgent.
@@ -381,11 +381,11 @@ The corrected plan, in the order it should be built:
    revoked records stay revoked.
 2. **Enforcement** — `self` scope only; target UID must equal owner UID; root is
    always denied; delegation is denied; policy is checked before a challenge is
-   generated or sent to the phone.
+   generated or sent to the device.
 3. **Administration** — `selected` accounts, `allow_root` for target UID 0,
    `allow_elevated`, canonical operation mapping, admin CLI and audit of
    approver + target.
-4. **Phone and protocol** — advertise policy in `PAIRING_RESULT` or a signed
+4. **Device and protocol** — advertise policy in `PAIRING_RESULT` or a signed
    policy message; show the target account/operation; test migration.
 
 Two corrections matter:
@@ -401,10 +401,10 @@ Two corrections matter:
 Observed on the test setup:
 
 - The PC runs Tailscale all the time.
-- The phone and PC are on the same Wi-Fi; pairing and authentication work with
-  Tailscale off on the phone.
-- Turning Tailscale **on** on the phone makes this app stop working.
-- Syncthing on the same phone continues to work normally.
+- The device and PC are on the same Wi-Fi; pairing and authentication work with
+  Tailscale off on the device.
+- Turning Tailscale **on** on the device makes this app stop working.
+- Syncthing on the same device continues to work normally.
 
 This is our bug, not a Tailscale bug. The network path is available; the app does
 not choose it correctly.
@@ -412,7 +412,7 @@ not choose it correctly.
 Likely causes in the current code:
 
 - The host binds `0.0.0.0` and mDNS uses `enable_addr_auto()`, so it publishes
-  **every** host address, including the Tailscale `100.x` address. The phone may
+  **every** host address, including the Tailscale `100.x` address. The device may
   resolve the service to the Tailscale address, the LAN address, or both.
 - Android `NsdServiceInfo` is reduced to a single `host` in
   `WifiTransport.discover()`. The app tries that one address and has no fallback
@@ -442,8 +442,8 @@ Required behavior:
 - Make the path policy explicit, for example `--transport-preference lan`,
   `tailscale` or `auto`. Address selection must never weaken TLS pinning or the
   signed transcript; it only decides where bytes are sent.
-- Surface diagnostics: the phone should log which address/network it chose and
-  why, and `phone-authctl status`/`devices` should show the host's listen
+- Surface diagnostics: the device should log which address/network it chose and
+  why, and `rba status`/`devices` should show the host's listen
   addresses.
 
 Do not make “disable Tailscale” or “allow local network access” the only
@@ -488,14 +488,14 @@ the same fallback role for this deployment.
 
 Acceptance criteria:
 
-- [ ] Pairing and authentication work with the PC's Tailscale up and the phone's
+- [ ] Pairing and authentication work with the PC's Tailscale up and the device's
       Tailscale on, over the LAN.
 - [ ] Authentication works over Tailscale `100.x` when policy allows it and the
-      phone has Tailscale on.
+      device has Tailscale on.
 - [ ] Toggling Tailscale or switching Wi-Fi reconnects without restarting the app.
 - [ ] mDNS does not advertise unintended interfaces by default.
 - [ ] All resolved addresses are tried, with a bounded timeout each.
-- [ ] Tests cover VPN on/off on the phone and Tailscale up on the host; address
+- [ ] Tests cover VPN on/off on the device and Tailscale up on the host; address
       choice remains a routing decision, not an authentication decision.
 
 ## Syncthing as reference code
@@ -552,7 +552,7 @@ These are properties every implementation must keep, even in the minimal version
 - Isolate one bad address or interface: it must not stop the retry loop.
 - Avoid tight reconnect loops; use backoff and respect Doze/battery limits.
 - Log attempts, chosen path and failover reason; expose them in
-  `phone-authctl status`/`devices`.
+  `rba status`/`devices`.
 - Test VPN on/off, Wi-Fi changes, LAN-only, Tailscale-only, no route, and
   dual-stack hosts.
 - Never let an address choice bypass certificate pinning, signature checks or
@@ -582,16 +582,16 @@ virtual biometric device through the same documented interfaces, honestly?”
 ### Options
 
 1. **PAM only (current)** — scoped `gdm-password` and `polkit-1` overrides.
-   No native fingerprint icon; the phone prompt appears after the password form
+   No native fingerprint icon; the device prompt appears after the password form
    is submitted. Smallest, most portable, no fake device.
 2. **fprintd-compatible service** — implement the documented D-Bus API with a
-   virtual device named “Android phone (Pixel 9)”. `VerifyStart` triggers the
-   phone challenge; a successful signature is reported as a verify result.
+   virtual device named “Android device (Pixel 9)”. `VerifyStart` triggers the
+   device challenge; a successful signature is reported as a verify result.
    No hardware is faked. Problems: it conflicts with a real `fprintd`; losing the
-   local sensor unless proxied; enrollment becomes “pair phone”, not “scan
-   finger”; the API carries the target user but not the PAM service, so the phone
+   local sensor unless proxied; enrollment becomes “pair device”, not “scan
+   finger”; the API carries the target user but not the PAM service, so the device
    cannot distinguish GDM from sudo from polkit.
-3. **libfprint virtual driver** — add a C driver that verifies via the phone.
+3. **libfprint virtual driver** — add a C driver that verifies via the device.
    Most native, but it is LGPL code in our 0BSD tree, requires a patched or
    separately packaged libfprint, needs synthetic print data, and runs inside a
    root system daemon. Heavy maintenance and a large new trust boundary.
@@ -599,19 +599,19 @@ virtual biometric device through the same documented interfaces, honestly?”
 
 ### Where the line is
 
-A virtual device is **not** a lie if it is named as a remote phone authenticator,
+A virtual device is **not** a lie if it is named as a remote device authenticator,
 uses the documented interface correctly, and does not claim a local sensor
 captured a fingerprint. It becomes a lie when the UI says “fingerprint sensor”,
 when enrollment data pretends to be a fingerprint template, or when the weaker
 remote trust model is hidden from the user.
 
-The clean framing is: **the phone is a biometric authenticator exposed through
+The clean framing is: **the device is a biometric authenticator exposed through
 fprintd**, not a fake USB fingerprint reader.
 
 ### Security constraints
 
 - The service must verify the D-Bus caller and target user; no user may trigger
-  another account's phone prompt.
+  another account's device prompt.
 - `fprintd`'s API does not carry PAM service/operation context. Consent quality is
   worse than the direct PAM path unless the protocol is extended.
 - Pairing and revocation must map to enrollment and print deletion.
@@ -664,12 +664,12 @@ Capabilities are **not** authorization. They describe what an endpoint can do,
 not what it is allowed to do. The effective action is the intersection of:
 
 1. **host capability** — the host can request it;
-2. **device capability** — the phone can display/approve it;
+2. **device capability** — the device can display/approve it;
 3. **host policy** — this device is authorised for this Linux user/operation;
 4. **device policy** — the user enabled that operation/factor;
 5. **user consent** — biometric/approval at the time of the request.
 
-A phone toggle can only narrow what the phone will accept. It must never grant a
+A device toggle can only narrow what the device will accept. It must never grant a
 host permission the host policy does not already allow. A host toggle can only
 narrow what the host will request. Neither side may silently assume the other's
 capability.
@@ -685,7 +685,7 @@ capability.
 - No secrets, private keys, tokens or credentials are included.
 - A capability downgrade after authentication is not silently accepted. If the
   session is renegotiated, the host and device must both agree to the new set.
-- The host enforces authorization server-side. Capability data from the phone is
+- The host enforces authorization server-side. Capability data from the device is
   advisory input to policy, never the policy itself.
 - Capability advertisements are privacy-sensitive: they can reveal OS, hardware
   class and enabled services. Prefer coarse values and keep them off mDNS.
@@ -719,9 +719,9 @@ three independent layers.
 
 | Layer | Stored where | Who may change it | What it can do |
 |---|---|---|---|
-| Device consent | Android app-private settings | The phone user, gated by biometric/app lock if enabled | Narrow which negotiated operations/factors the phone will accept |
-| Per-user host policy | Per-UID daemon state or `$XDG_CONFIG_HOME/phone-auth/policy.json`, mode `0600` | The same Linux user through the local control socket (`SO_PEERCRED`) | Allow/narrow operations for that user's own account |
-| Global host policy | `/etc/phone-auth/policy.json`, root-owned `0600` | root only | Device-to-user binding, root/privileged operations, machine-wide integrations |
+| Device consent | Android app-private settings | The device user, gated by biometric/app lock if enabled | Narrow which negotiated operations/factors the device will accept |
+| Per-user host policy | Per-UID daemon state or `$XDG_CONFIG_HOME/rba/policy`, line-oriented, mode `0600` | The same Linux user through the local control socket (`SO_PEERCRED`) | Allow/narrow operations for that user's own account |
+| Global host policy | `/etc/rba/policy`, line-oriented, root-owned `0600` | root only | Device-to-user binding, root/privileged operations, machine-wide integrations |
 | Integration installation | PAM/polkit/GDM files, systemd unit, socket ownership | root only | Makes the mechanism available at all |
 
 ### Device-side Security options
@@ -750,7 +750,7 @@ casual tampering; it cannot protect against a rooted or compromised OS.
 The PC does not need `sudo` to change a user's own policy if the daemon enforces
 peer identity:
 
-- A local client connects to the root/`phone-auth` control socket.
+- A local client connects to the root/`rba` control socket.
 - The daemon reads `SO_PEERCRED` and only permits that UID to change its own
   policy.
 - Per-user policy is stored atomically with mode `0600` and audited.
@@ -768,13 +768,13 @@ from the toggle:
 
 - **Installed but disabled:** the module is present, returns unavailable/ignore,
   and the normal password path continues.
-- **Installed and enabled:** the phone may be asked for the operations allowed by
-  both host policy and phone consent.
-- **Not installed:** the phone cannot authenticate that service, regardless of
+- **Installed and enabled:** the device may be asked for the operations allowed by
+  both host policy and device consent.
+- **Not installed:** the device cannot authenticate that service, regardless of
   app toggles.
 
-Use `sufficient`, not `required`, for the phone line unless the operator
-explicitly wants a phone-or-lockout policy. Keep an integration-specific rollback
+Use `sufficient`, not `required`, for the device line unless the operator
+explicitly wants a device-or-lockout policy. Keep an integration-specific rollback
 file and a root TTY while changing PAM.
 
 ### Disable, mask, or uninstall?
@@ -786,32 +786,32 @@ PAM files again:
 | State / action | What it means | Root needed? | Effect |
 |---|---|---|---|
 | Install integration | Add the PAM/polkit/GDM line, module and service | Yes | Makes the mechanism available |
-| Enable integration | Policy allows the action for a user/device | No for your own policy; yes for global/other users | Phone may authenticate this action |
-| Disable integration | Policy denies the action, or the phone masks it | No for your own policy / phone mask; yes for global/other users | Module is present but the action is not approved |
-| Phone mask | This phone refuses the action | No | Host may still ask; with `sufficient` it falls through to password |
-| Daemon stopped/masked | `phone-authd` is not running; PAM line remains | Yes for systemd mask/stop | Module cannot reach the daemon; password path continues |
+| Enable integration | Policy allows the action for a user/device | No for your own policy; yes for global/other users | Device may authenticate this action |
+| Disable integration | Policy denies the action, or the device masks it | No for your own policy / device mask; yes for global/other users | Module is present but the action is not approved |
+| Device mask | This device refuses the action | No | Host may still ask; with `sufficient` it falls through to password |
+| Daemon stopped/masked | `rbad` is not running; PAM line remains | Yes for systemd mask/stop | Module cannot reach the daemon; password path continues |
 | Uninstall | Remove `/etc/pam.d` override, module and, if desired, package | Yes | The integration no longer exists |
 
 Runtime policy should be the normal switch. It is reversible, auditable, and does
 not risk a broken PAM stack. Uninstall is for cleaning the machine, not for daily
 toggling.
 
-A **phone-side mask** is the narrowest switch of all: no sudo, no PAM edit. It
-only means this phone will refuse requests for that action. The host may still
+A **device-side mask** is the narrowest switch of all: no sudo, no PAM edit. It
+only means this device will refuse requests for that action. The host may still
 invoke the PAM module; with `sufficient`, a refusal or unavailable daemon falls
 through to the password. A host per-user policy disable also needs no sudo for
 that user's own actions. Removing the line globally, changing another user's
 policy, or uninstalling the module/package needs root.
 
-The phone can hide or grey out an action it has masked; that is only a UI hint.
-The host must still enforce its own policy, and the phone must still refuse an
+The device can hide or grey out an action it has masked; that is only a UI hint.
+The host must still enforce its own policy, and the device must still refuse an
 unexpected request for a masked action.
 
 Recommendations for implementation:
 
 - Track `installed` (packaging/manifest) separately from `enabled` (policy).
   Do not infer installation by parsing PAM files at runtime.
-- Add a `phone-authctl integrations` view showing installed, available, enabled
+- Add a `rba integrations` view showing installed, available, enabled
   and disabled actions.
 - Let a user disable their own actions without root; require root for global
   actions or device-to-user binding changes.
@@ -830,13 +830,13 @@ Recommended model:
 - The host registry stores an allow-list of Linux users/UIDs per paired device.
 - Pairing defaults to the account that started the host-side pairing; root or a
   host administrator can add another account later.
-- The phone shows the host as `archlinux` plus **Accounts: desktop, alice** (or
+- The device shows the host as `archlinux` plus **Accounts: desktop, alice** (or
   the configured labels).
 - The host enforces the allow-list on every request.
-- The phone displays the signed username and may keep a per-account consent
-  toggle. A phone-side deny only narrows; it does not grant another account.
-- A user who wants an independent trust relationship should pair their own phone
-  (a separate device record), not reuse another user's phone silently.
+- The device displays the signed username and may keep a per-account consent
+  toggle. A device-side deny only narrows; it does not grant another account.
+- A user who wants an independent trust relationship should pair their own device
+  (a separate device record), not reuse another user's device silently.
 
 Account scope is a policy dimension, not a new host identity. Support all of these
 without duplicating `host_id`:
@@ -844,20 +844,20 @@ without duplicating `host_id`:
 | Scope | Pairing | Who authorises | App shows |
 |---|---|---|---|
 | `self` (default) | The pairing user only | User + host operator | `archlinux` / `desktop` |
-| `selected` | A list of accounts | Host admin/root, phone confirms the list | `archlinux` / `desktop, alice` |
+| `selected` | A list of accounts | Host admin/root, device confirms the list | `archlinux` / `desktop, alice` |
 | `all` | Every normal account, **excluding root** | root, explicit warning | `archlinux` / all accounts |
 | `all+root` | Every account including root | root, separate explicit flag | strong root warning |
-| Per-user device | One phone/key per user | That user pairs independently | separate device records |
+| Per-user device | One device/key per user | That user pairs independently | separate device records |
 
-The recommended defaults are `self` and a separate phone per user when independent
+The recommended defaults are `self` and a separate device per user when independent
 compromise domains are wanted. `selected` and `all` are convenience modes for a
-shared phone; they do not change the device key. `all+root` should be treated as a
+shared device; they do not change the device key. `all+root` should be treated as a
 deliberate, strongly discouraged policy.
 
-If the phone must enforce the allow-list locally, the host needs to advertise it:
+If the device must enforce the allow-list locally, the host needs to advertise it:
 a `PAIRING_RESULT` account list, a capability/policy message after pairing, or a
 signed `SESSION_HELLO` extension. The host policy remains authoritative even if
-the phone list is stale. A sensible wire shape is:
+the device list is stale. A sensible wire shape is:
 
 ```text
 account_scope: "self" | "selected" | "all"
@@ -867,60 +867,60 @@ allow_root: false                // separate, default false
 
 The scope and accounts must be bound to the pairing transcript or a signed policy
 message; the device displays the final scope and the host enforces it. Expanding
-the scope later should require host authorisation and, ideally, a fresh phone
+the scope later should require host authorisation and, ideally, a fresh device
 confirmation. Shrinking the scope can be host-side.
 
-A shared device key across accounts means a compromised phone can approve any
+A shared device key across accounts means a compromised device can approve any
 account in its scope. Per-account toggles are consent filters, not separate
 security domains. Users who need independent compromise domains should pair
-separate phones/keys.
+separate devices/keys.
 
 Do not model this as `host_id = archlinux/alice`. That would duplicate host
 identity and TLS pins per account and make the machine look like many hosts.
 
 ### Worked multi-user scenarios
 
-**One PC, two users, two phones.** This is the recommended independent-trust
+**One PC, two users, two devices.** This is the recommended independent-trust
 model:
 
 ```text
 host: archlinux
-  phone A -> device record A, account_scope=self, accounts=[desktop]
-  phone B -> device record B, account_scope=self, accounts=[alice]
+  device A -> device record A, account_scope=self, accounts=[desktop]
+  device B -> device record B, account_scope=self, accounts=[alice]
 
 desktop is in wheel; alice is not.
 ```
 
-- Phone A can authenticate `desktop` for login, unlock, polkit and `sudo`.
-  Whether `sudo` actually succeeds is still decided by `sudoers`; the phone
+- Device A can authenticate `desktop` for login, unlock, polkit and `sudo`.
+  Whether `sudo` actually succeeds is still decided by `sudoers`; the device
   proves *who* desktop is, it does not grant the privilege.
-- Phone B can authenticate `alice` for login, unlock and user-level polkit
+- Device B can authenticate `alice` for login, unlock and user-level polkit
   prompts. It cannot make `sudo` succeed because `alice` is not in `sudoers`.
   The host should also refuse to send `auth.sudo` requests to a device whose
   account scope does not include an account allowed to use it.
-- A request for `desktop` from phone B must be refused by the host before the
-  phone is asked. The phone is not a second authorization system.
-- The two phones have separate device keys; compromise of one does not become
+- A request for `desktop` from device B must be refused by the host before the
+  device is asked. The device is not a second authorization system.
+- The two devices have separate device keys; compromise of one does not become
   compromise of the other.
 
-**One phone, two users.** Supported through `selected` scope, but it is one
+**One device, two users.** Supported through `selected` scope, but it is one
 compromise domain:
 
 ```text
-phone A -> account_scope=selected, accounts=[desktop, alice]
+device A -> account_scope=selected, accounts=[desktop, alice]
 ```
 
-The phone shows both accounts. The host still enforces each account's normal
-rights. A phone compromise can approve any account in its scope; use separate
-phones if that matters.
+The device shows both accounts. The host still enforces each account's normal
+rights. A device compromise can approve any account in its scope; use separate
+devices if that matters.
 
-**One phone, all normal accounts.** `account_scope=all`, excluding root. This is
+**One device, all normal accounts.** `account_scope=all`, excluding root. This is
 convenience for a shared device and a larger blast radius. It does not make every
 account an administrator.
 
 **Root.** `allow_root` is separate and defaults to false. `all+root` is a
 deliberate, strongly discouraged policy; root can already change `sudoers`,
-polkit and PAM, so treating a phone as a root factor deserves its own warning and
+polkit and PAM, so treating a device as a root factor deserves its own warning and
 audit entry.
 
 ### Per-account and per-device policy matrix
@@ -928,27 +928,27 @@ audit entry.
 A device is not just “allowed” or “not allowed”. The host policy needs four
 separate questions:
 
-1. **Device principal** — whose phone is it? (`desktop`'s phone, `alice`'s phone)
+1. **Device principal** — whose device is it? (`desktop`'s device, `alice`'s device)
 2. **Target account** — which Linux user is being authenticated? (`desktop` or
    `alice`)
 3. **Operation** — login, unlock, user-level auth, polkit action, `sudo`, root?
-4. **Device consent** — does the phone user approve this specific request now?
+4. **Device consent** — does the device user approve this specific request now?
 
 The effective decision is the intersection of all four, plus the account's normal
-`sudoers`/polkit rights. A phone can never grant a right the account does not
+`sudoers`/polkit rights. A device can never grant a right the account does not
 already have.
 
-Example configuration for 1 PC, 2 phones, 2 accounts:
+Example configuration for 1 PC, 2 devices, 2 accounts:
 
 ```text
 account desktop  (in wheel)
-  phone A -> principal desktop
-  phone B -> principal alice
+  device A -> principal desktop
+  device B -> principal alice
 
 account alice    (not in wheel)
 ```
 
-| Target account | Operation | Phone A (desktop) | Phone B (alice) |
+| Target account | Operation | Device A (desktop) | Device B (alice) |
 |---|---|---|---|
 | desktop | login / unlock / user auth | allowed, configurable | **denied by default**; can be enabled as delegated login |
 | desktop | `sudo` / elevated polkit | allowed by host policy; still checked by sudoers/polkit | **never** |
@@ -957,41 +957,41 @@ account alice    (not in wheel)
 
 This gives every combination you described:
 
-- **Phone login for the non-root user can be disabled entirely.** Set
-  `phone_login=false` for `alice`; PAM ignores the phone module for that account
+- **Device login for the non-root user can be disabled entirely.** Set
+  `device_login=false` for `alice`; PAM ignores the device module for that account
   and the password is required.
-- **Phone login for the non-root user can be enabled** for alice's own phone,
+- **Device login for the non-root user can be enabled** for alice's own device,
   limited to login/unlock/user-level auth.
-- **The sudo user's phone can be allowed to log in as alice** as a delegated
+- **The sudo user's device can be allowed to log in as alice** as a delegated
   login, or denied. Default: denied.
-- **The non-root phone can never get elevated rights**, even if its owner asks.
+- **The non-root device can never get elevated rights**, even if its owner asks.
   The host should not send `sudo`/root requests to it; sudoers/polkit still deny
   if one somehow arrives.
-- **The non-root phone cannot log in as the sudo user** unless the host
+- **The non-root device cannot log in as the sudo user** unless the host
   administrator explicitly enables that delegation; default: denied.
 
 Suggested policy fields:
 
 ```text
 account alice:
-  phone_login: false | true
-  allowed_phones: [phone-B]           # or a device-id list
-  allow_delegated_login_from: [phone-A]  # default empty
+  device_login: false | true
+  allowed_devices: [device-B]           # or a device-id list
+  allow_delegated_login_from: [device-A]  # default empty
   allowed_operations: [login, unlock, user-auth]
   allow_elevated: false               # always false unless root policy says otherwise
 
 account desktop:
-  phone_login: true
-  allowed_phones: [phone-A]
+  device_login: true
+  allowed_devices: [device-A]
   allow_delegated_login_from: []
   allowed_operations: [login, unlock, user-auth, sudo, polkit-admin]
   allow_elevated: true                # still constrained by sudoers/polkit
 ```
 
-Cross-account authentication is **delegation**, not identity sharing: the phone
+Cross-account authentication is **delegation**, not identity sharing: the device
 prompt must show both “who is approving” and “which account is being signed in”.
-Audit it as a delegated decision. Default it to off. A shared phone or a phone
-allowed to log in as another account is one compromise domain; separate phones
+Audit it as a delegated decision. Default it to off. A shared device or a device
+allowed to log in as another account is one compromise domain; separate devices
 remain the stronger model.
 
 Do not implement this by reusing an admin session or by silently switching the
@@ -1000,16 +1000,16 @@ policy decides whether that device is permitted to name it.
 
 ### Authentication is not authorization
 
-| Layer | Decides | Phone role |
+| Layer | Decides | Device role |
 |---|---|---|
 | Pairing | Is this device/host key trusted? | Consent + code entry |
 | Account scope | Which Linux accounts may this device approve? | Displays and may narrow |
 | PAM authentication | Is this the claimed user? | Strong-biometric signature |
 | `sudoers` | May this user run `sudo`? | None |
 | polkit | Is this action allowed for this user? | None; the prompt may use PAM |
-| Phone consent | Does the human approve this request? | Final accept/deny |
+| Device consent | Does the human approve this request? | Final accept/deny |
 
-A phone for a non-admin user is therefore useful without any root access: it
+A device for a non-admin user is therefore useful without any root access: it
 replaces password entry for login, screen unlock and user-level authentication
 prompts. It cannot turn that user into an administrator, and the host must never
 present it as if it could.
@@ -1020,8 +1020,8 @@ Installing a PAM/polkit/GDM line is machine-wide and needs root. The account
 scope and per-user enable/disable policy are separate:
 
 - a user can enable/disable their own operations without root;
-- a phone can mask an operation without root;
-- adding an account to a phone's scope, enabling global actions, or allowing root
+- a device can mask an operation without root;
+- adding an account to a device's scope, enabling global actions, or allowing root
   needs host administrator/root authorization;
 - uninstalling the integration needs root.
 
@@ -1040,48 +1040,48 @@ for example:
 - `login.sshd`
 - `unlock.screen`
 
-The phone displays only actions the host advertises, and the host still enforces
+The device displays only actions the host advertises, and the host still enforces
 its own policy. A stale toggle for an action the host no longer advertises is
 ignored, not treated as consent.
 
 ## CLI and pairing UX
 
-The current `phone-authctl pair` flow is secure enough to finish a pairing, but
+The current `rba pair` flow is secure enough to finish a pairing, but
 the interaction is awkward and misleading. It should feel like `adb`, not like a
 guided wizard.
 
 ### What it does today
 
 ```text
-$ sudo phone-authctl pair
+$ sudo rba pair
 Pairing open for 120s.
-Start pairing on the phone now.
+Start pairing on the device now.
 
-Pairing code (shown only here; enter it on the phone):
+Pairing code (shown only here; enter it on the device):
 
       ┌────────────────┐
       │  198168  │
       └────────────────┘
 
-Send this pairing to the phone? [y/N] y
+Send this pairing to the device? [y/N] y
 Confirming pairing…
-Host record saved. Enter the code on the phone to finish pairing.
+Host record saved. Enter the code on the device to finish pairing.
 Host side pairing finished.
 ```
 
 Problems:
 
-- The host asks `Send this pairing to the phone?` **after** already showing the
-  code and receiving the phone's submission. The question describes an action
+- The host asks `Send this pairing to the device?` **after** already showing the
+  code and receiving the device's submission. The question describes an action
   that already happened.
-- `Host record saved` appears before the phone has confirmed anything. The host
-  has persisted its side; the phone may still reject, timeout or lose the link.
+- `Host record saved` appears before the device has confirmed anything. The host
+  has persisted its side; the device may still reject, timeout or lose the link.
   This reads like success when the pairing is not finished.
 - The boxed code is noisy, and the important value is buried in prose.
 - The command exits as soon as the host side is done, without saying whether the
-  phone stored the host. A user has to guess from the app.
+  device stored the host. A user has to guess from the app.
 - `sudo` or a fresh group login is needed for the control socket, and the error
-  does not explain the stale-group case. `phone-authctl pair` should work as the
+  does not explain the stale-group case. `rba pair` should work as the
   desktop user, and a permission failure should print the exact `newgrp`/re-login
   hint.
 - `list` is a prose dump, not a stable table, and there is no single place to see
@@ -1094,9 +1094,9 @@ One explicit command opens a short-lived pairing session, prints one code, waits
 and reports one final result:
 
 ```text
-$ phone-authctl pair
-Waiting for phone... (120s)
-Code: 198168  type this on the phone
+$ rba pair
+Waiting for device... (120s)
+Code: 198168  type this on the device
 
 Paired  Pixel 9
   host    archlinux
@@ -1104,65 +1104,140 @@ Paired  Pixel 9
 ```
 
 - No host-side `[y/N]`. Running `pair` is already the operator's decision; the
-  phone's typed code or Allow is the human gate. If a host confirmation is ever
+  device's typed code or Allow is the human gate. If a host confirmation is ever
   wanted, make it an explicit `--confirm`, not the default.
 - Print the code as a plain line, not box art. Keep it out of logs.
-- Do not print `Paired` until the phone has persisted the host and acknowledged
-  it. Before that, say `Waiting for phone confirmation`.
+- Do not print `Paired` until the device has persisted the host and acknowledged
+  it. Before that, say `Waiting for device confirmation`.
 - On failure, print one line and a non-zero exit:
-  `Pairing failed: code mismatch` / `Pairing timed out` / `Pairing cancelled on phone`.
+  `Pairing failed: code mismatch` / `Pairing timed out` / `Pairing cancelled on device`.
 - Stable exit codes: `0` paired, `1` failure, `2` usage/cannot connect.
 - Ctrl-C cancels the session; the host must delete the pending record.
-- `--json` emits one machine-readable object with `state`, `code`, `device`,
-  `host`, `expires_at` and `error`; human text goes to stderr when `--json` is on.
+- Text output and stable exit codes are the contract.
 - `--timeout` changes the session lifetime; it does not change the protocol
   maximum.
 
 A device view should be boring and scriptable, like `adb devices`:
 
 ```text
-$ phone-authctl devices
+$ rba devices
 DEVICE                    MODEL                 STATE       LAST SEEN
 Pixel 9 (91620145)        motorola edge 30 ultra connected   12:08
 ```
 
-`phone-authctl list` can remain as an alias for one release, then be retired.
+`rba list` is replaced by `rba devices`; there is no alias.
 
 ### Protocol change needed for honest completion
 
 Right now the host persists its device record before it sends `PAIRING_RESULT`,
-while the phone persists only after its human gate. That is why the CLI can say
-`Host record saved` while the phone still has not accepted.
+while the device persists only after its human gate. That is why the CLI can say
+`Host record saved` while the device still has not accepted.
 
 To make the CLI truthful, add a final device-to-host acknowledgement after the
-phone persists, for example `PAIRING_CONFIRMED`:
+device persists, for example `PAIRING_CONFIRMED`:
 
 1. Host verifies `device_mac`, stores the record as **pending**, sends
    `PAIRING_RESULT`.
-2. Phone verifies `host_mac`, asks the operator, then persists.
-3. Phone sends `PAIRING_CONFIRMED` (bound to the same session/transcript).
+2. Device verifies `host_mac`, asks the operator, then persists.
+3. Device sends `PAIRING_CONFIRMED` (bound to the same session/transcript).
 4. Host promotes the record to **paired** and the CLI prints `Paired`.
 5. Timeout, rejection, code mismatch or link loss deletes the pending record.
 
 Until that exists, the CLI must not claim the pairing is complete; it should say
-`Host side complete; waiting for the phone` and leave the final state to
-`phone-authctl devices`.
+`Host side complete; waiting for the device` and leave the final state to
+`rba devices`.
 
 ### Acceptance criteria
 
-- [ ] `phone-authctl pair` is one command, one code line, one final result.
+- [ ] `rba pair` is one command, one code line, one final result.
 - [ ] No default `[y/N]` and no `--yes` requirement.
-- [ ] No `Paired`/`Host record saved` text before the phone confirms.
+- [ ] No `Paired`/`Host record saved` text before the device confirms.
 - [ ] Pending records are separate from paired records and are cleaned on
       timeout, rejection, mismatch or disconnect.
 - [ ] Device-to-host `PAIRING_CONFIRMED` is specified, implemented in Rust and
       Kotlin, and covered by vectors.
-- [ ] `phone-authctl devices` prints a stable table; `--json` prints one object.
-- [ ] Permission denied explains `newgrp phone-auth` / re-login, and normal
-      pairing works without `sudo` for a user in the `phone-auth` group.
-- [ ] `phone-authctl unpair <device>` is a first-class command, not only a hidden
+- [ ] `rba devices` prints a stable table.
+- [ ] Permission denied explains `newgrp rba` / re-login, and normal
+      pairing works without `sudo` for a user in the `rba` group.
+- [ ] `rba unpair <device>` is a first-class command, not only a hidden
       daemon operation.
 - [ ] README and `docs/pairing.md` use the real command transcript.
+
+## Proposed refactor: centralized `rba` CLI and host backends
+
+Status: **draft, review pending**. This is broader than the existing adb-like CLI
+item and is not committed scope yet. The drafts are:
+
+- [`rba-cli.md`](rba-cli.md): one `rba` binary, versioned control API, output and
+  exit-code contract.
+- [`adb-transport.md`](adb-transport.md): ADB as a transport and the limits of an
+  app-less Android authenticator.
+- [`host-backends.md`](host-backends.md): portable core plus platform backends
+  for Linux, BSD, macOS and Windows.
+
+The important boundary is that the daemon stays platform-neutral. PAM, polkit,
+launchd, Windows credential providers and service managers are backends, not
+core assumptions. The current Linux implementation remains the reference.
+
+ADB is proposed as an optional transport and provisioning channel, not as the
+trust anchor. A headless APK (no launcher icon) is possible; a literal no-APK
+authenticator is not, because Android Keystore keys and `BiometricPrompt`
+auth tokens are app-scoped. See [`adb-transport.md`](adb-transport.md).
+
+Windows is a feasibility item, not a supported target. The Windows Hello
+Companion Device Framework is deprecated; a Windows backend would need a
+credential-provider or other supported logon integration and its own security
+review.
+
+### State and logs: no JSON
+
+Status: **proposed**. Current runtime JSON: `registry.json`, the audit log, the
+simulator identity files, and the local control socket. None of it needs JSON.
+
+Follow the model of the tools this CLI imitates. ADB stores keys as plain files
+and authorized keys one per line. scrcpy has no persistent config file and uses
+a binary control protocol. Small root-owned state should be inspectable with
+`cat`, `grep` and `awk`, not a JSON parser.
+
+Proposed formats:
+
+- **Device registry:** one file per device, `<state>/devices/<id>`, containing
+  `key=value` lines (`version`, `name`, `public_key`, `status`, `added_at`,
+  `last_seen`, `auth_count`, future policy fields). The filename is the device
+  ID, so there are no nested arrays or record delimiters. Mode `0600`, atomic
+  replace. Values are UTF-8, split at the first `=`; newlines and backslashes
+  are escaped. A version mismatch or unknown key is refused, not guessed.
+- **Policy:** line-oriented files, `/etc/rba/policy` and
+  `$XDG_CONFIG_HOME/rba/policy`, with the same encoding and permission
+  rules.
+- **Audit log:** one `key=value` event per line, not JSON Lines. Quote values
+  that contain spaces; never write secrets.
+- **Local control channel:** length-prefixed canonical CBOR, reusing the
+  existing protocol codec. It stays binary like ADB/scrcpy control protocols and
+  typed like the current client, without a JSON dependency.
+- **Generated conformance vectors:** remain JSON test fixtures. They are
+  generated by `vecgen`, are not runtime state, and no product code parses them.
+
+There is no dual-format or migration period. The daemon writes the new formats
+from scratch, and operators re-pair. That removes the JSON reader, the old
+registry parser and the compatibility branch before they are written.
+
+1. Write the new registry only; do not read `registry.json`.
+2. Do not preserve or back up old runtime state; the new state directory starts
+   empty.
+3. Remove `serde_json` from the daemon, CLI, PAM module, polkit agent and
+   simulator runtime code. `vecgen` and conformance tests may keep it as a
+   development-only dependency.
+
+Acceptance criteria:
+
+- [ ] No JSON files in `/var/lib/rba`, `/etc/rba` or the audit log.
+- [ ] `cat` and `grep` can inspect every state file.
+- [ ] A fresh state directory contains no JSON and no legacy records.
+- [ ] A corrupt record is dropped or quarantined, never treated as trusted.
+- [ ] Local IPC round-trips through the CBOR codec with a versioned envelope.
+- [ ] No production daemon, CLI, PAM or polkit code depends on `serde_json`;
+      only vector generation and tests do.
 
 ## Roadmap phases
 
@@ -1196,7 +1271,17 @@ Do these before expanding the platform surface:
       verified process identity, prompt context and the full test matrix.
 - [ ] Implement the adb-like pairing and device UX described in
       [CLI and pairing UX](#cli-and-pairing-ux): one code line, no default
-      confirmation prompt, truthful completion, `devices --json`, `unpair`.
+      confirmation prompt, truthful completion, `devices`, `unpair`.
+- [ ] Review and, if accepted, implement the centralized `rba` CLI and versioned
+      control API from [`rba-cli.md`](rba-cli.md). Do this as a front-end/API
+      refactor, not as aliases piled on `rba`.
+- [ ] Remove JSON from runtime state, audit and local IPC as described in
+      [State and logs: no JSON](#state-and-logs-no-json). Start with a fresh
+      state directory; do not read old `registry.json` or preserve old pairings.
+- [ ] After the CLI command names, flags, exit codes and output contract freeze,
+      write `rba(1)` and the subcommand man pages. Generate shell completions
+      from the same command definitions; do not hand-maintain a second flag
+      list.
 - [ ] Fix VPN/Tailscale coexistence as described in
       [Known network issue](#known-network-issue-vpn--tailscale): try all resolved
       addresses, bind sockets to the chosen `Network`, reconnect on VPN/Wi-Fi
@@ -1221,14 +1306,14 @@ Do these before expanding the platform surface:
       add other accounts through host policy, and show them in the app.
 - [ ] Do not require re-pairing the same host for each Linux user; keep host
       identity machine-scoped and user identity per request.
-- [ ] Document install/enable/disable/phone-mask/uninstall as distinct states.
-- [ ] Implement the per-account/per-device matrix: `phone_login`,
-      `allowed_phones`, `allow_delegated_login_from`, `allowed_operations`, and
+- [ ] Document install/enable/disable/device-mask/uninstall as distinct states.
+- [ ] Implement the per-account/per-device matrix: `device_login`,
+      `allowed_devices`, `allow_delegated_login_from`, `allowed_operations`, and
       `allow_elevated`.
-- [ ] Show both the approving principal and the target account on the phone;
+- [ ] Show both the approving principal and the target account on the device;
       audit delegated login separately.
 - [ ] Refuse to send `sudo`/elevated requests to a device whose policy cannot
-      approve them, before the phone is prompted.
+      approve them, before the device is prompted.
 
 ### Phase 2 — Capability protocol v1
 
@@ -1239,7 +1324,7 @@ Do these before expanding the platform surface:
 - [ ] Add shared vectors and a conformance run for the new messages.
 - [ ] Keep capabilities separate from authorization; document the distinction.
 - [ ] Add `account_scope`/`accounts`/`allow_root` to pairing or policy exchange,
-      with scope expansion requiring host authorization and phone confirmation.
+      with scope expansion requiring host authorization and device confirmation.
 
 ### Phase 3 — Portability
 
@@ -1271,8 +1356,10 @@ These are separate adapters, not assumptions that the Linux code is portable.
 
 #### Windows
 
-- [ ] Not planned as part of the current roadmap. It needs a Credential
-      Provider/Windows Hello design, not a PAM port.
+- [ ] Feasibility only, not committed: a Credential Provider or another supported
+      logon integration, plus named-pipe peer identity and SCM service management.
+- [ ] Do not design around the Windows Hello Companion Device Framework; it is
+      deprecated. See [`host-backends.md`](host-backends.md).
 
 ### Phase 4 — Release and audit
 
@@ -1286,7 +1373,7 @@ These are separate adapters, not assumptions that the Linux code is portable.
 ## Explicit non-goals
 
 - A permanent pairing mode or "trust anything that connects".
-- A phone capability that grants a Linux user permission the host policy denies.
+- A device capability that grants a Linux user permission the host policy denies.
 - Silent downgrade when attestation, strong biometrics or a required transport
   is unavailable.
 - Claiming macOS/BSD/iOS support by compiling the Rust core without a real
@@ -1308,3 +1395,5 @@ These are separate adapters, not assumptions that the Linux code is portable.
 | 2026-11-18 | Current integration priority is GDM password login, `pkexec` and `systemctl` via polkit, using scoped `/etc/pam.d` overrides. Do not edit `system-auth` or `gdm-fingerprint` first. |
 | 2026-11-18 | Native GNOME/KDE fingerprint UI is a future fprintd-compatible virtual device, not a fake USB sensor. PAM integration comes first; the fprintd adapter waits for SEC-004 and a real packaging/security review. |
 | 2026-11-18 | GDM/lock-screen/PAM integration requires administrator install. There is no supported per-user or no-root path; immutable distros still require an admin transaction. The app cannot bypass the greeter or lock screen. |
+| 2026-11-20 | Proposal for review: portable core plus host backends, one `rba` CLI, optional ADB transport and a headless Android helper. Man pages wait for the CLI surface to freeze. Not committed scope yet. |
+| 2026-11-20 | Runtime state, audit and local IPC will not use JSON. Device records are line-oriented files, the audit log is one event per line, and local IPC reuses the canonical CBOR codec. Generated conformance vectors remain test fixtures. |

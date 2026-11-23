@@ -1,11 +1,13 @@
-# Remote Biometric Authenticator (rba) (v0.0.1)
+# Remote Biometric Authenticator
 
-<img src="media/icons/auto/android-fprint-light.svg" width="128" height="128" alt="Light icon" align="right" />
+`rba` v0.0.1
+
+<img src="media/icons/auto/rba-light.svg" width="128" height="128" alt="Light icon" align="right" />
 
 
 
-A single or multiple phones can act as remote cryptographic authenticators for one or more host machines.
-The phone approves with native biometric interface;
+A single or multiple devices can act as remote cryptographic authenticators for one or more host machines.
+The device approves with native biometric interface;
 The host verifies a signature over a fresh challenge instead of trusting a simple transmitted `YES`.
 
 ㅤ
@@ -23,12 +25,12 @@ The host verifies a signature over a fresh challenge instead of trusting a simpl
 <p align="center"><sub>Fingerprint mark adapted from <a href="https://www.svgrepo.com/svg/246819/fingerprint">SVG Repo's Security 15 collection</a> (CC0), heavily modified.</sub></p>
 
 ```text
-$ phone-authctl authenticate --user alice --purpose sudo
+$ rba auth --user alice --purpose sudo
 
 Waiting for authentication on Pixel 9 for alice…
 
-[phone] Authorize: user=alice host=workstation action=sudo
-[phone] Confirm with your fingerprint.
+[rba] Authorize: user=alice host=workstation action=sudo
+[rba] Confirm with your fingerprint.
 
 Authenticated.
   device    Pixel 9
@@ -43,10 +45,10 @@ Authenticated.
 | Protocol specification | complete, normative |
 | Rust implementation | complete, 200 tests |
 | Kotlin implementation | complete, 124 cross-language conformance checks |
-| `phone-authd` | working end to end: pairing, challenge/response, verification, revocation |
-| `phone-authctl` | working |
-| `phone-auth-sim` | working, including deliberate misbehaviour for tests |
-| `pam_phone_auth` | one line in the PAM stack you choose; scope it to `sudo`, polkit or login deliberately (`make verify-all-auth`) |
+| `rbad` | working end to end: pairing, challenge/response, verification, revocation |
+| `rba` | working |
+| `rba-sim` | working, including deliberate misbehaviour for tests |
+| `pam_rba` | scoped GDM and polkit overrides; password fallback preserved (`make verify`) |
 | Android app | validated on Android 17 LineageOS : Wi-Fi discovery, both pairing code directions, background auto-prompt, biometric-gated signing, auto-close after the decision |
 | polkit agent | **unnecessary** — see below. Kept for headless hosts only |
 | BLE transport | framing and segmentation complete and tested; BlueZ/central wiring not done |
@@ -66,7 +68,7 @@ make android-all  # Android lint, unit tests, debug APK (needs ANDROID_HOME)
 Latest run: 200 Rust tests pass with no clippy warnings; the Kotlin runner agrees
 with Rust on 124 checks; the end-to-end smoke test passes; the Android app lints
 clean, passes 31 unit tests, builds a debug APK, and has been exercised end to end
-on a physical phone in the foreground and in the background.
+on a physical device in the foreground and in the background.
 
 ## Design commitments
 
@@ -80,11 +82,11 @@ on a physical phone in the foreground and in the background.
   sees a key. A failure to sign is a denial, never an approval.
 * **Explicit pairing.** A short-lived session, a six-digit code shown on one
   endpoint and typed on the other (`--code-entry device|host`), reciprocal MACs,
-  and a phone-side human gate. No permanent pairing mode, and discovery alone
+  and a device-side human gate. No permanent pairing mode, and discovery alone
   authorises nothing.
 * **Fail closed.** Every failure mode denies. The PAM *stack* may fall through to a
   password; the module itself never converts a protocol failure into success.
-* **Revocation is immediate, then best-effort.** The phone forgets a host locally
+* **Revocation is immediate, then best-effort.** The device forgets a host locally
   first. If the pinned link is up it sends a host-issued bearer `UNPAIR` token, and
   the host marks that record revoked. If the host is offline the token is carried
   in the next pairing submit and the host cleans the old record before committing
@@ -110,10 +112,10 @@ protocol/
 
 linux/
   protocol/                   Rust: CBOR, framing, crypto, verification, replay guard
-  phone-authd/                the daemon: pairing, engine, registry, transports, IPC
-  phone-authctl/              operator CLI
-  phone-auth-sim/             fake device, can misbehave on demand
-  pam-phone-auth/             thin PAM adapter
+  rbad/                       the daemon: pairing, engine, registry, transports, IPC
+  rba/                        operator CLI
+  rba-sim/                    fake device, can misbehave on demand
+  pam-rba/                    thin PAM adapter
   systemd/                    service and socket units
 
 android/
@@ -134,24 +136,24 @@ tests/
 
 ```bash
 # Linux daemon against a private state directory, no root needed
-linux/target/debug/phone-authd \
-    --state-dir /tmp/alp/state \
-    --socket   /tmp/alp/control.sock \
-    --audit-log /tmp/alp/audit.log \
+linux/target/debug/rbad \
+    --state-dir /tmp/rba/state \
+    --socket   /tmp/rba/control.sock \
+    --audit-log /tmp/rba/audit.log \
     --port 47123 --bind 127.0.0.1:47123 --no-mdns &
 
 # Pair a simulator
-linux/target/debug/phone-authctl --socket /tmp/alp/control.sock pair
+linux/target/debug/rba --socket /tmp/rba/control.sock pair
 # in another terminal, when the code is displayed:
-linux/target/debug/phone-auth-sim pair --host 127.0.0.1:47123 --name "Pixel 9" \
-    --daemon linux/target/debug/phone-authd \
-    --daemon-arg --state-dir --daemon-arg /tmp/alp/state
+linux/target/debug/rba-sim pair --host 127.0.0.1:47123 --name "Pixel 9" \
+    --daemon linux/target/debug/rbad \
+    --daemon-arg --state-dir --daemon-arg /tmp/rba/state
 
 # Authenticate
-linux/target/debug/phone-auth-sim serve --host 127.0.0.1:47123 \
-    --ca /tmp/alp/state/host.crt --timeout 120 &
-linux/target/debug/phone-authctl --socket /tmp/alp/control.sock \
-    authenticate --user "$(id -un)" --purpose sudo
+linux/target/debug/rba-sim serve --host 127.0.0.1:47123 \
+    --ca /tmp/rba/state/host.crt --timeout 120 &
+linux/target/debug/rba --socket /tmp/rba/control.sock \
+    auth --user "$(id -un)" --purpose sudo
 ```
 
 `tests/e2e-smoke.sh` does all of this and asserts the security properties.
@@ -159,8 +161,8 @@ linux/target/debug/phone-authctl --socket /tmp/alp/control.sock \
 ## Testing the Android app over Wi-Fi
 
 Requirements: a **strong biometric** (fingerprint or strong face) is enrolled on
-the phone, the phone and Linux machine are on the same LAN with multicast
-enabled, and the phone has been allowed to show notifications. For the app to
+the device, the device and Linux machine are on the same LAN with multicast
+enabled, and the device has been allowed to show notifications. For the app to
 open itself over another app, allow **display over other apps** (or the
 full-screen-intent fallback) from the app's *Background operation* card. The
 service keeps one idle link open; it does not poll while that link is healthy.
@@ -171,35 +173,35 @@ make android-all
 adb install -r android/app/build/outputs/apk/debug/app-debug.apk
 
 # 2. Start the daemon so it advertises on the LAN (keep this terminal open)
-mkdir -p /tmp/alp
-linux/target/debug/phone-authd \
-    --state-dir /tmp/alp/state \
-    --socket   /tmp/alp/control.sock \
-    --audit-log /tmp/alp/audit.log \
+mkdir -p /tmp/rba
+linux/target/debug/rbad \
+    --state-dir /tmp/rba/state \
+    --socket   /tmp/rba/control.sock \
+    --audit-log /tmp/rba/audit.log \
     --port 47123
 
 # 3. Start pairing in another terminal.
 #    Default (`--code-entry device`): the terminal displays the code; type it on
-#    the phone. Add `--code-entry host` to have the phone display it and type it
+#    the device. Add `--code-entry host` to have the device display it and type it
 #    in the terminal instead.
-linux/target/debug/phone-authctl --socket /tmp/alp/control.sock pair
+linux/target/debug/rba --socket /tmp/rba/control.sock pair
 
 # 4. Complete the code gate. `--yes` skips only the host-side prompt; it never
 #    skips the typed code.
 
 # 5. Background the app, then request authentication
-linux/target/debug/phone-authctl --socket /tmp/alp/control.sock \
-    authenticate --user "$(id -un)" --purpose sudo
+linux/target/debug/rba --socket /tmp/rba/control.sock \
+    auth --user "$(id -un)" --purpose sudo
 ```
 
-What the phone does:
+What the device does:
 
 * **Pairing, default (`--code-entry device`):** names the host and asks you to
   type the six-digit code shown in the Linux terminal. It never displays the code.
   A wrong code is rejected; **Cancel**, back, or a lost connection discards the
   pending host. Only the correct code writes the certificate pin and key.
 * **Pairing with `--code-entry host`:** displays the code for you to type in the
-  Linux terminal, then still requires an explicit **Allow** on the phone.
+  Linux terminal, then still requires an explicit **Allow** on the device.
 * **Authentication:** an auto-opened request uses a transparent host activity, so
   only the system `BIOMETRIC_STRONG` prompt appears over the current app. The
   prompt shows the signed host/user/action context. There is no approve button and
@@ -210,7 +212,7 @@ What the phone does:
   Terminal results auto-dismiss; there is no Done/OK button. The foreground
   service stays alive in the background, holding one idle connection.
 
-The APK is debug-signed and installs as `com.androidfprint.debug`; do not treat it
+The APK is debug-signed and installs as `io.github.burtvadr.rba.debug`; do not treat it
 as a production build. The daemon needs inbound UDP 5353 (mDNS) and TCP 47123
 (the data connection), so a firewall or guest-Wi-Fi client isolation will stop
 discovery. One live host connection is maintained at a time; pair one host per
@@ -221,91 +223,72 @@ permission, the full-screen fallback and battery-optimisation exemption are set.
 None of those changes the security decision; they only affect whether the prompt
 can reach the screen without the app being opened by hand.
 
-The host label shown on the phone is the machine hostname (`archlinux` here). The
+The host label shown on the device is the machine hostname (`archlinux` here). The
 systemd unit passes `--host-name %H`, because the service sandbox replaces
 `/proc/sys/kernel/hostname` with `linux-host`. The label is display-only and is
 never a trust input.
 
-`/tmp/alp` is disposable. For a persistent test installation, keep the state
+`/tmp/rba` is disposable. For a persistent test installation, keep the state
 directory and control socket somewhere under your home directory instead, and
-pass the same paths to `phone-authctl`.
+pass the same paths to `rba`.
 
 ## Installing PAM integration
 
-PAM configuration is distro-specific. Install one line in the stack you actually
-want the phone to satisfy; there is no portable "one file" that is correct
-everywhere.
-
-| Distro | Typical file | Scope |
-|---|---|---|
-| Arch | `/etc/pam.d/sudo` | `sudo` only. polkit uses `system-auth`; GDM uses `gdm-password`. |
-| Debian/Ubuntu | `/etc/pam.d/common-auth` | Included by many services; broad scope. |
-| Fedora | `/etc/pam.d/system-auth` / `password-auth` | Broad scope. |
-
-The Arch example is the recommended starting point because it does not silently
-change polkit or the login screen:
+Use the scoped installers. They write one override for one PAM service, keep a
+rollback record, and leave `system-auth`, `sudo`, `sshd`, `su`, `login` and
+`gdm-fingerprint` untouched:
 
 ```bash
-sudo cp /etc/pam.d/sudo /etc/pam.d/sudo.bak
-sudoedit /etc/pam.d/sudo
+sudo ./packaging/arch/pam-gdm-rba.sh --dry-run
+sudo ./packaging/arch/pam-gdm-rba.sh
+sudo ./packaging/arch/pam-polkit-rba.sh --dry-run
+sudo ./packaging/arch/pam-polkit-rba.sh
 ```
 
-```text
-auth  sufficient  pam_phone_auth.so  purpose=sudo
-```
+The GDM override covers the GNOME login and lock screen. The polkit override
+covers `pkexec` and `systemctl` actions that ask polkit. Both wait 5 seconds by
+default; pass `--timeout SECONDS` to change that. Roll back with the same script
+and `--rollback`.
 
-Put it before the `pam_unix.so`/`system-auth` line that would otherwise ask for a
-password.
+Keep a root TTY open while testing. Do not edit `/etc/pam.d/system-auth` or
+`/etc/pam.d/gdm-fingerprint`, and do not add the module to `sudo`, `su`, `sshd`
+or `login` as part of this integration.
 
-### `sufficient` means password **or** phone
+On another distribution, translate the same one-line scoped override to its PAM
+layout. The module arguments are whitespace-separated `key=value` pairs:
+`purpose`, `service`, `device` and `timeout_ms`. Because libpam splits a
+configuration line on whitespace, a value cannot contain a space — write
+`device=Pixel-9`, not `device=Pixel 9`.
 
-`sufficient` is not MFA. A successful phone check satisfies the stack; if the
-phone is absent, unavailable or declines, `pam_unix` still runs and the password
-works. That is deliberate availability, but it also means the phone is not a
+### `sufficient` means password **or** device
+
+`sufficient` is not MFA. A successful device check satisfies the stack; if the
+device is absent, unavailable or declines, `pam_unix` still runs and the password
+works. That is deliberate availability, but it also means the device is not a
 second factor at that prompt.
 
-If you want password **and** phone, use `required` for both (or a required
-substack) and keep a root TTY open while testing. A lost phone then needs that
+If you want password **and** device, use `required` for both (or a required
+substack) and keep a root TTY open while testing. A lost device then needs that
 recovery path rather than a normal login. Do not add `debug` to an installed
 line: it is a troubleshooting flag and can write operational detail to syslog.
 
-### Scope and prompt fatigue
-
-A `common-auth`/`system-auth` line applies to `sudo`, `su`, `login`, `sshd`,
-`gdm-password`, polkit through the `other` fallback, and more. That is convenient
-and is also a prompt-fatigue surface: anything that can trigger PAM can ask the
-phone. Start with `sudo`, then add polkit and GDM deliberately.
-
-On Arch, polkit uses `system-auth`; GDM has its own `gdm-password` and
-`gdm-fingerprint` stacks. Adding the phone to `system-auth` changes polkit and
-other services, not just `sudo`. Keep a root TTY open and make one change at a
-time.
-
-Arguments are whitespace-separated `key=value` pairs: `purpose`, `service`,
-`device`, and `timeout_ms`. Because libpam splits a configuration line on
-whitespace, a value cannot contain a space — write `device=Pixel-9`, not
-`device=Pixel 9`.
-
 ### Check it and roll it back
 
-```bash
-sudo -k && sudo -k    # forget the cached timestamp, twice
-sudo -v               # should prompt on the phone, with a deliberately wrong password typed
-```
+Test the GDM path from the lock screen or a fresh login, and the polkit path with
+a `pkexec` or `systemctl` action that normally asks for a password. The password
+must still work when the device is off, out of range or declining.
 
-For the sudo-only procedure above, rollback restores the file created by that
-same procedure:
+Each installer records the file it replaced. Roll back with:
 
 ```bash
-sudo cp /etc/pam.d/sudo.bak /etc/pam.d/sudo
+sudo ./packaging/arch/pam-gdm-rba.sh --rollback
+sudo ./packaging/arch/pam-polkit-rba.sh --rollback
 ```
 
-If you edited `common-auth` or `system-auth`, restore that file's own backup
-instead. Do not copy a `sudo.bak` over a different stack.
-
-`tests/common-auth-integration.sh` exercises the Debian layout; `tests/pam-integration.sh`
-loads the real module into a dedicated PAM service. Neither is a substitute for a
-root shell and a tested rollback on your machine.
+`tests/pam-integration.sh` loads the real module into a dedicated PAM service.
+`tests/common-auth-integration.sh` is a broader test harness for distributions
+that use `common-auth`; it is not part of the recommended integration. Neither is
+a substitute for a root shell and a tested rollback on your machine.
 
 ## Why there is no polkit agent
 
@@ -335,7 +318,7 @@ install path.
 ## Relationship to prior art
 
 `alp` and `pam-android-fingerprint` both solve Android-to-Linux authentication. The
-reuse is conceptual: phone as authenticator, PAM integration, Wi-Fi operation.
+reuse is conceptual: device as authenticator, PAM integration, Wi-Fi operation.
 
 The departure is the trust model. `alp` is built around a pre-shared key, so
 compromise of that one value compromises every host it guards. This implementation
@@ -346,6 +329,10 @@ one device and is revocable independently.
 
 * [`protocol/specification/PROTOCOL.md`](protocol/specification/PROTOCOL.md) — the
   normative protocol
+* [`docs/naming.md`](docs/naming.md) — the `rba` / `rbad` naming rules, borrowed from `adb`
+* [`docs/rba-cli.md`](docs/rba-cli.md) — the intended CLI and control-API contract
+* [`docs/host-backends.md`](docs/host-backends.md) — portable core, platform backends
+* [`docs/adb-transport.md`](docs/adb-transport.md) — ADB as a transport, not a trust anchor
 * [`docs/architecture.md`](docs/architecture.md) — layering and component map
 * [`docs/threat-model.md`](docs/threat-model.md) — adversaries, defences, limitations
 * [`docs/pairing.md`](docs/pairing.md) — the pairing flow and its guarantees

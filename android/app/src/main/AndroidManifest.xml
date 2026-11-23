@@ -45,7 +45,7 @@
     <uses-feature android:name="android.hardware.fingerprint" android:required="false" />
 
     <application
-        android:name=".PhoneAuthApplication"
+        android:name=".RbaApplication"
         android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="false"
@@ -53,7 +53,7 @@
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_dark"
         android:supportsRtl="true"
-        android:theme="@style/Theme.PhoneAuth"
+        android:theme="@style/Theme.Rba"
         android:usesCleartextTraffic="false">
 
         <activity
@@ -61,7 +61,7 @@
             android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode"
             android:exported="false"
             android:launchMode="singleTask"
-            android:theme="@style/Theme.PhoneAuth" />
+            android:theme="@style/Theme.Rba" />
 
         <activity
             android:name=".AuthPromptActivity"
@@ -69,7 +69,7 @@
             android:exported="false"
             android:launchMode="singleTop"
             android:taskAffinity=""
-            android:theme="@style/Theme.PhoneAuth.Transparent" />
+            android:theme="@style/Theme.Rba.Transparent" />
 
         <!--
           One launcher entry per icon style. Exactly one is enabled at a time;
@@ -152,7 +152,7 @@
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Keeps a local-network link to a paired Linux host so a fingerprint request can be answered without the app being open." />
+                android:value="Keeps a local-network link to a paired host so a fingerprint request can be answered without the app being open." />
         </service>
 
         <receiver

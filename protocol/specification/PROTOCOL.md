@@ -1,9 +1,9 @@
-# Android Fprint Remote Authenticator — Protocol Specification v1
+# Remote Biometric Authenticator — Protocol Specification v1
 
 Status: **Normative** for `PROTOCOL_VERSION = 1`.
 
 This document defines the wire protocol and the cryptographic transcript for the
-Android remote biometric authenticator. It is deliberately **language-independent**:
+Remote Biometric Authenticator. It is deliberately **language-independent**:
 the Linux daemon (Rust) and the Android application (Kotlin) implement it twice,
 independently, and are validated against the shared test vectors in
 `protocol/test-vectors/`.
@@ -27,7 +27,7 @@ Trust roots:
 | Party | Long-term key | Storage |
 |---|---|---|
 | Android device | `device_auth` key (ECDSA P-256) | Android Keystore, non-exportable, biometric-gated |
-| Linux host | `host_identity` key (ECDSA P-256) | `/etc/phone-auth/host.key`, root-only |
+| Linux host | `host_identity` key (ECDSA P-256) | `/etc/rba/host.key`, root-only |
 
 After pairing, the only secrets exchanged over the wire are ephemeral session
 nonces and the authentication signature itself.
@@ -190,15 +190,15 @@ types it on the other. Discovery alone never authorises anything.
 
 A pairing session selects the entry direction with `code_entry`:
 
-* `device` (the default): the Linux host displays the code and the phone requires
-  the operator to type it. The phone never displays it.
-* `host`: the phone displays the code and the Linux host requires the operator to
-  type it. The host never displays it. The phone still requires an explicit Allow
+* `device` (the default): the Linux host displays the code and the device requires
+  the operator to type it. The device never displays it.
+* `host`: the device displays the code and the Linux host requires the operator to
+  type it. The host never displays it. The device still requires an explicit Allow
   before it stores the host.
 
 A pairing session is single-use and expires (`PAIRING_TTL`, §11). The host MUST
 refuse to begin pairing unless an operator has explicitly started a pairing
-session (`phone-authctl pair`). There MUST NOT be a permanent pairing mode.
+session (`rba pair`). There MUST NOT be a permanent pairing mode.
 
 ```text
 host                                   device
@@ -224,7 +224,7 @@ host                                   device
  │  derive the same p, derive the code   │
  │  device: display the code             │
  │  host: ask the operator for the       │
- │  phone's code and verify it            │
+ │  device's code and verify it            │
  │  verify mac against the session secret│
  │  persist device                       │
  │  PAIRING_RESULT {session_id,           │
@@ -248,7 +248,7 @@ discarded after derivation, an on-path attacker who records the messages cannot
 compute the secret, and cannot make a substituted key produce the same code on
 both endpoints without finding a collision in the six-digit value.
 
-An operator may pre-select a code with `phone-authctl pair --code 123456`. In that
+An operator may pre-select a code with `rba pair --code 123456`. In that
 case the host sends it in `PAIRING_START`, the device checks its own derived code
 against it and fails immediately on a mismatch, and the host verifies the same
 equality before persisting. This turns the human check into one code, entered on
@@ -285,7 +285,7 @@ endpoint's typed code. There is no unattended pairing path.
 | `device_nonce` | bstr | 32 bytes |
 | `device_eph_pubkey` | bstr | 65 bytes; ephemeral P-256 public key for this pairing |
 | `mac` | bstr | 32 bytes, §6.4 |
-| `cleanup_tokens` | array of bstr | Optional; each 32 bytes. Older pairings this phone asks the host to revoke, §6.6 |
+| `cleanup_tokens` | array of bstr | Optional; each 32 bytes. Older pairings this device asks the host to revoke, §6.6 |
 
 ### 6.3 `PAIRING_RESULT`
 
@@ -318,24 +318,24 @@ ecdh_secret = X-coordinate of (host_eph_private * device_eph_pubkey)
 
 pairing_secret = HKDF-SHA-256(
         ikm  = ecdh_secret,
-        salt = "ALP-PAIR-SALT-V1",
-        info = "ALP-PAIR-TRANSCRIPT-V2" || transcript,
+        salt = "RBA-PAIR-SALT-V1",
+        info = "RBA-PAIR-TRANSCRIPT-V2" || transcript,
         len  = 32)
 
 p = HMAC-SHA-256(key = pairing_secret, msg =
-          "ALP-PAIR-V1" || 0x00 || transcript)
+          "RBA-PAIR-V1" || 0x00 || transcript)
 
 code   = decimal, zero-padded to 6 digits, from rejection sampling:
          for each 32-bit big-endian word v in p:
              if v < 4_294_000_000: code = v mod 1_000_000; stop
          if no word qualifies:
              p_1 = HMAC-SHA-256(key = p,
-                     msg = "ALP-PAIR-CODE-V1" || 0x00 || u64_be(1))
+                     msg = "RBA-PAIR-CODE-V1" || 0x00 || u64_be(1))
              repeat with p_1, p_2, ...
 mac_d  = HMAC-SHA-256(key = p, msg =
-          "ALP-DEVICE-CONFIRM-V1" || 0x00 || transcript)
+          "RBA-DEVICE-CONFIRM-V1" || 0x00 || transcript)
 mac_h  = HMAC-SHA-256(key = p, msg =
-          "ALP-HOST-CONFIRM-V1" || 0x00 || transcript)
+          "RBA-HOST-CONFIRM-V1" || 0x00 || transcript)
 ```
 
 Both endpoints MUST reject an ephemeral public key that is not a valid P-256
@@ -355,7 +355,7 @@ Requirements:
   When `code_entry = device`, it MUST display the derived code and MUST obtain
   explicit positive confirmation from its operator before persisting. When
   `code_entry = host`, it MUST NOT display the code, MUST require its operator to
-  type the code shown on the phone, and MUST verify that entry before persisting;
+  type the code shown on the device, and MUST verify that entry before persisting;
   a wrong entry MUST be rejected, MUST NOT be converted into a default or a
   successful pairing, and MUST cancel the session. There is no retry within the
   same exchange.
@@ -373,7 +373,7 @@ Requirements:
 * The host persists its record when it sends `PAIRING_RESULT` with `status = 0`;
   the two sides persist independently. A host-side record alone authenticates
   nothing: the device MUST reject session establishment and authentication from a
-  `host_id` it has not stored. The phone's human gate — a typed code or an
+  `host_id` it has not stored. The device's human gate — a typed code or an
   explicit Allow — is what authorises future authentication.
 * The host MUST generate a fresh 32-byte `revocation_token` for every successful
   pairing, return it only over the pinned TLS channel, and store only its SHA-256
@@ -382,7 +382,7 @@ Requirements:
 * Pending `cleanup_tokens` in `PAIRING_SUBMIT` MUST be processed only after
   `mac_d` verifies and before the new record is persisted. Each token revokes
   exactly the record whose token hash matches. A token MUST NOT be treated as
-  evidence that the new installation is the same phone; it only authorises the
+  evidence that the new installation is the same device; it only authorises the
   old pairing's cleanup.
 * `code`, `mac`, `mac_d`, `host_mac` and `revocation_token` MUST NOT be written
   to logs.
@@ -514,7 +514,7 @@ confused-deputy attempts fail.
 ### 8.2 Signature input (normative)
 
 ```text
-sig_input = "ANDROID_LINUX_AUTH_V1"        // 22 ASCII bytes, no NUL terminator
+sig_input = "RBA_AUTH_V1"        // 11 ASCII bytes, no NUL terminator
           || 0x00                          // single NUL separator
           || 0x01                          // protocol version, u8
           || core_map                      // canonical CBOR map, below
@@ -660,7 +660,7 @@ service, or a different operation.
 | `RATE_PAIRING` | 5 / 5 min | per host address |
 | `RATE_AUTH` | 5 / 60 s | per device per user |
 | `RATE_DEVICE_PROMPT` | 1 open prompt | per device, queue depth 1 |
-| `MIN_PAIRED_DEVICES_PER_HOST` | 8 | several phones; §11.3 |
+| `MIN_PAIRED_DEVICES_PER_HOST` | 8 | several devices; §11.3 |
 | `MIN_PAIRED_HOSTS_PER_DEVICE` | 8 | a laptop, a desktop and a VM; §11.3 |
 
 ### 11.1 Freshness window
@@ -682,13 +682,13 @@ a device key is replaced, the device generates a new `device_id` and MUST re-pai
 
 ### 11.3 Multiplicity and identity scope
 
-This section states what one id identifies, because "how many phones and how many
+This section states what one id identifies, because "how many devices and how many
 PCs" is otherwise left to each implementation and the two sides drift apart.
 
 **Cardinality.** A host MAY hold records for any number of devices, and a device
 MAY hold records for any number of hosts. Neither side imposes a limit of one.
 Both MUST support at least 8 simultaneously, and MUST NOT assume the peer holds
-only one record: a host with four paired phones and a phone paired to three PCs are
+only one record: a host with four paired devices and a device paired to three PCs are
 ordinary configurations, not errors.
 
 **What `device_id` identifies.** One *device*, for the lifetime of its device key.
@@ -722,7 +722,7 @@ an error. Re-pairing an id already known with a **different** key MUST be refuse
 (§11.4 step 3), unless a valid `cleanup_token` in the same submit first revokes the
 old record (§6.6). A token is a bearer cleanup capability, not proof of
 same-installation identity; without one, the old record must be revoked by the host
-operator. A user who replaced their phone's key therefore gets a refusal rather
+operator. A user who replaced their device's key therefore gets a refusal rather
 than a silently new identity, which is the point.
 
 **Rate limiting.** `RATE_PAIRING` and `RATE_AUTH` are counted per
@@ -774,7 +774,7 @@ mDNS/DNS-SD discovery  ->  TCP  ->  TLS 1.3  ->  this protocol
 
 Discovery advertises only non-secret metadata:
 
-Service type: `_android-fprint._tcp.local.`
+Service type: `_rba._tcp.local.`
 
 | TXT key | Value |
 |---|---|
@@ -831,7 +831,7 @@ The daemon exposes a Unix domain socket. Local authorisation decisions:
 2. If the peer is not root, the requested `username` MUST resolve, via the
    local user database, to the same UID as the peer. Mismatch MUST deny with
    `CONTEXT_MISMATCH`.
-3. Only members of the `phone-auth` group MAY open the socket.
+3. Only members of the `rba` group MAY open the socket.
 4. `username` is used for the *signed request context*; the *authenticated
    principal* is always the peer UID.
 

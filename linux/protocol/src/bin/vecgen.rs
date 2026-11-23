@@ -8,7 +8,7 @@
 //! Run with:
 //!
 //! ```text
-//! cargo run -p android-fprint-protocol --bin vecgen -- ../protocol/test-vectors
+//! cargo run -p rba-protocol --bin vecgen -- ../protocol/test-vectors
 //! ```
 //!
 //! Signatures are *not* compared byte-for-byte. ECDSA is randomised on Android,
@@ -20,19 +20,17 @@
 use std::fs;
 use std::path::PathBuf;
 
-use android_fprint_protocol::cbor;
-use android_fprint_protocol::crypto::{self, PrivateKey};
-use android_fprint_protocol::frame::{Frame, HEADER_LEN, MAGIC};
-use android_fprint_protocol::messages::Message;
-use android_fprint_protocol::pairing::{
-    PairingResult, PairingSession, PairingStart, PairingSubmit,
-};
-use android_fprint_protocol::types::{
+use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::SecretKey as P256SecretKey;
+use rba_protocol::cbor;
+use rba_protocol::crypto::{self, PrivateKey};
+use rba_protocol::frame::{Frame, HEADER_LEN, MAGIC};
+use rba_protocol::messages::Message;
+use rba_protocol::pairing::{PairingResult, PairingSession, PairingStart, PairingSubmit};
+use rba_protocol::types::{
     AuthReject, AuthRequest, AuthResponse, Challenge, ErrorMsg, Id, SessionHello, SessionHelloAck,
     AUTH_REQUEST_TTL_DEFAULT,
 };
-use p256::elliptic_curve::sec1::ToEncodedPoint;
-use p256::SecretKey as P256SecretKey;
 use serde_json::{json, Value};
 
 fn hexs(b: &[u8]) -> String {
@@ -496,7 +494,7 @@ fn main() {
                     host_pubkey: host_sk.public_key(),
                     host_key_id: host_sk.public_key().key_id_hex(),
                     code: "".into(),
-                    code_entry: android_fprint_protocol::pairing::CodeEntry::Device,
+                    code_entry: rba_protocol::pairing::CodeEntry::Device,
                     // PairingStart::from_payload checks the window against the
                     // current clock, so this vector is checked as raw CBOR only.
                     expires_at: 1_700_000_120,
@@ -629,7 +627,7 @@ fn main() {
         &json!({
             "spec": "PROTOCOL.md §8.2",
             "description": "The exact bytes signed for an AUTH_REQUEST: domain separator || 0x00 || version || canonical CBOR of the ten signed fields.",
-            "domain_separator": "ANDROID_LINUX_AUTH_V1",
+            "domain_separator": "RBA_AUTH_V1",
             "signed_fields": [
                 "challenge", "device_id", "expires_at", "host_id", "issued_at",
                 "operation", "purpose", "request_id", "service", "username"

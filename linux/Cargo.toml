@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["protocol", "phone-authd", "phone-auth-sim", "phone-authctl", "pam-phone-auth", "polkit-agent"]
+members = ["protocol", "rbad", "rba-sim", "rba", "pam-rba", "polkit-agent"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,7 +9,7 @@ rust-version = "1.75"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-android-fprint-protocol = { path = "protocol" }
+rba-protocol = { path = "protocol" }
 base64 = "0.22"
 
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh", "arithmetic", "std"] }

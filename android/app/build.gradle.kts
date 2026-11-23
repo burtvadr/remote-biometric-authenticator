@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "com.androidfprint"
+    namespace = "io.github.burtvadr.rba"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.androidfprint"
+        applicationId = "io.github.burtvadr.rba"
         // API 28 is the baseline for a security-focused new project: modern
         // Keystore facilities, and StrongBox APIs become available.
         minSdk = 28

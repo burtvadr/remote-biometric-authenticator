@@ -40,7 +40,7 @@ when the finding was first written.
 | SEC-001 | Pairing code is not bound to the public keys; an on-path attacker can substitute keys | Resolved |
 | SEC-002 | Pairing code was truncated to one HMAC byte, leaving only 256 values | Resolved (review retracted) |
 | SEC-003 | Broad `common-auth` deployment plus no per-request context creates an MFA-fatigue surface | Confirmed |
-| SEC-004 | No device-to-Linux-user binding; a paired phone can approve another account's PAM request | Confirmed |
+| SEC-004 | No device-to-Linux-user binding; a paired device can approve another account's PAM request | Confirmed |
 
 ### Medium
 
@@ -60,9 +60,9 @@ when the finding was first written.
 
 | ID | Finding | Status |
 |---|---|---|
-| SEC-010 | Timing can reveal whether an account has a paired phone | Needs verification |
+| SEC-010 | Timing can reveal whether an account has a paired device | Needs verification |
 | SEC-011 | Pairing race: operator sees only a device name, not key fingerprint/source | Confirmed |
-| SEC-012 | `phone-authctl --code` is visible in `argv` | Confirmed |
+| SEC-012 | `rba --code` is visible in `argv` | Confirmed |
 | SEC-013 | Recommended PAM sample includes `debug` | Resolved |
 | SEC-014 | Authentication signature is not bound to the TLS session | Confirmed |
 | SEC-015 | mDNS exposes stable host metadata; linkability/privacy | Needs verification |
@@ -89,7 +89,7 @@ when the finding was first written.
 **Source:** external review, 2026-11-18  
 **Aliases:** pairing MITM, key substitution, code-vs-key binding  
 **Affected:** `protocol/specification/PROTOCOL.md` §6.0/§6.4,
-`linux/protocol/src/pairing.rs`, `linux/phone-authd/src/engine.rs`
+`linux/protocol/src/pairing.rs`, `linux/rbad/src/engine.rs`
 
 **Observation.** The displayed code is derived from `session_id` and the two
 nonces only. It does not include either public key. Both nonces are visible to an
@@ -98,9 +98,9 @@ keyed by the same derived secret, but that secret is known to the attacker once 
 has seen both nonces.
 
 The attacker can therefore relay the exchange while substituting its own host key
-to the phone and its own device key to the host. It can compute
+to the device and its own device key to the host. It can compute
 `device_mac`/`host_mac` for the substituted transcript, while the code on both
-screens still matches. If the operator confirms, the phone stores the attacker's
+screens still matches. If the operator confirms, the device stores the attacker's
 host key and the host stores the attacker's device key. The attacker can then
 authenticate as the requested user.
 
@@ -143,12 +143,12 @@ matched this.
 transcript = session_id || host_id || device_id || host_pubkey || device_pubkey
           || host_nonce || device_nonce || host_eph_pubkey || device_eph_pubkey
           || code_entry_byte
-pairing_secret = HKDF(ECDH_X, "ALP-PAIR-SALT-V1",
-                      "ALP-PAIR-TRANSCRIPT-V2" || transcript)
-p = HMAC(pairing_secret, "ALP-PAIR-V1" || 0x00 || transcript)
+pairing_secret = HKDF(ECDH_X, "RBA-PAIR-SALT-V1",
+                      "RBA-PAIR-TRANSCRIPT-V2" || transcript)
+p = HMAC(pairing_secret, "RBA-PAIR-V1" || 0x00 || transcript)
 ```
 
-The transcript also includes the `code_entry` mode byte (`0` = phone types,
+The transcript also includes the `code_entry` mode byte (`0` = device types,
 `1` = host types). The code, `device_mac` and `host_mac` all cover that transcript. Substituting
 either endpoint's long-term or ephemeral key changes the ECDH result and the
 transcript, so the two endpoints derive different codes and MACs. Both ephemeral
@@ -159,7 +159,7 @@ refuses to MAC a transcript other than the one the secret was bound to.
 
 - `linux/protocol/src/pairing.rs::man_in_the_middle_cannot_make_both_codes_match`
   terminates the exchange on both sides with substituted keys and asserts the
-  host and phone codes differ.
+  host and device codes differ.
 - `::code_is_bound_to_the_public_keys` changes only the device key and asserts the
   code changes.
 - `::host_ephemeral_key_is_fresh_per_session` asserts a new ECDH key per attempt.
@@ -185,7 +185,7 @@ would remove the grinding bound and remains the stronger long-term option.
 **Source:** external review, 2026-11-18  
 **Aliases:** 256-code bug, `000040` sample  
 **Affected:** `linux/protocol/src/pairing.rs`,
-`android/protocol/src/main/kotlin/com/androidfprint/protocol/Messages.kt`,
+`android/protocol/src/main/kotlin/com/rba/protocol/Messages.kt`,
 `protocol/specification/PROTOCOL.md` §6.4
 
 **Observation.** The old implementation reduced `p[0]` (one byte) modulo
@@ -216,14 +216,14 @@ Kotlin `PairingSession.code()` mirrors it; vectors were regenerated.
 **Status:** Confirmed  
 **Source:** external review, 2026-11-18  
 **Aliases:** MFA fatigue, PAM scope, `sufficient` weakness  
-**Affected:** `README.md` PAM section, `linux/pam-phone-auth/src/lib.rs`,
-`linux/phone-authd/src/engine.rs`, `protocol/specification/PROTOCOL.md` §8.1
+**Affected:** `README.md` PAM section, `linux/pam-rba/src/lib.rs`,
+`linux/rbad/src/engine.rs`, `protocol/specification/PROTOCOL.md` §8.1
 
 **Observation.** The recommended line is `auth sufficient
-pam_phone_auth.so purpose=auth debug` in `common-auth`. That file is included by
+pam_rba.so purpose=auth debug` in `common-auth`. That file is included by
 `sudo`, `sudo-i`, `login`, `su`, `sshd`, `gdm-password` and the `other` fallback
 on Debian-style systems. Any service that can trigger PAM can therefore trigger a
-phone prompt.
+device prompt.
 
 The signed request context contains `username`, `purpose`, `service` and
 `operation`, but no TTY, PID, command line, or requesting executable.
@@ -235,8 +235,8 @@ only). The rate limiter is shared per transport, not per target user, and resets
 on daemon restart. An attacker with a way to trigger PAM can produce repeated
 prompts without a per-user budget.
 
-`sufficient` means the phone path can bypass the password. The effective
-authentication strength is therefore the weaker of the password and phone
+`sufficient` means the device path can bypass the password. The effective
+authentication strength is therefore the weaker of the password and device
 factors, not a strict combination.
 
 **Impact.** Prompt fatigue/social engineering can turn one accidental approval into
@@ -246,22 +246,22 @@ prompt-triggering surfaces.
 **Recommendation.**
 
 - Do not recommend a global `common-auth` line by default. Scope the module to
-  `sudo`, `polkit-1` and screen unlock, or document the trade-off explicitly and
-  make the global installation opt-in.
+  `polkit-1` and screen unlock; leave `sudo`, `sshd`, `su`, `login` and
+  `gdm-fingerprint` unchanged.
 - Add number matching for authentication requests, not only pairing.
 - Include service, TTY and, where safe, command/operation context in the signed
   scope or at least in the prompt.
 - Rate-limit per target user and per device; keep the limiter across restarts.
-- For root/high-risk operations, consider `required` password plus phone rather
-  than `sufficient` phone-or-password.
+- For root/high-risk operations, consider `required` password plus device rather
+  than `sufficient` device-or-password.
 
 **Evidence.** README PAM sample; `AuthRequest::signedCore()` and §8.1 field table;
 `Engine::rate_auth` is keyed by transport and is in-memory.
 
 **Partial remediation (docs).** The README no longer recommends a global
-`common-auth` line by default: it starts with a `sudo`-scoped Arch example,
-explains that `sufficient` is password **or** phone rather than MFA, and warns
-about prompt scope. Number matching, per-user/device rate limits and more signed
+`common-auth` or `sudo` line: it uses scoped `gdm-password` and `polkit-1`
+overrides, explains that `sufficient` is password **or** device rather than MFA,
+and warns about prompt scope. Number matching, per-user/device rate limits and more signed
 context are still open; this remains a real fatigue surface wherever a broad
 stack is enabled.
 
@@ -273,8 +273,8 @@ stack is enabled.
 **Status:** Confirmed  
 **Source:** external review, 2026-11-18  
 **Aliases:** authorization scope, `su root`, per-user policy  
-**Affected:** `linux/phone-authd/src/registry.rs`,
-`linux/phone-authd/src/engine.rs`, `linux/phone-authd/src/ipc.rs`,
+**Affected:** `linux/rbad/src/registry.rs`,
+`linux/rbad/src/engine.rs`, `linux/rbad/src/ipc.rs`,
 `protocol/specification/PROTOCOL.md` §11.3
 
 **Observation.** Pairing stores a device identity and public key. It does not store
@@ -283,11 +283,11 @@ which Linux account(s) that device may authenticate. The daemon accepts an
 (PAM) to ask on behalf of any user. The device itself is only checked for a valid
 signature over the requested context.
 
-A paired phone is therefore a host-wide authenticator, not a per-account one. If a
+A paired device is therefore a host-wide authenticator, not a per-account one. If a
 user can cause a PAM request for another account (for example `su victim`), their
-paired phone can approve it. Root is not denied by default.
+paired device can approve it. Root is not denied by default.
 
-**Impact.** On a multi-user host, one phone can become an approval oracle for
+**Impact.** On a multi-user host, one device can become an approval oracle for
 accounts it was never paired to. The signed `username` protects against a relay
 changing the name, not against the device being authorised for the wrong account.
 
@@ -296,7 +296,7 @@ changing the name, not against the device being authorised for the wrong account
 - Bind each device record to an allow-list of Linux usernames or UIDs at pairing
   time; default to the pairing user only.
 - Deny `root` by default unless the host operator explicitly opts in.
-- Expose the binding in `phone-authctl list` and the phone's host details.
+- Expose the binding in `rba devices` and the device's host details.
 - Add a test where device A is paired for user alice and a request for bob is
   refused, even though the signature is valid.
 - If a host-wide device is intentional, document it as a deliberate policy and
@@ -317,8 +317,8 @@ verification, without a per-device policy check.
 **Status:** Confirmed  
 **Source:** external review, 2026-11-18  
 **Aliases:** attestation, hardware-backed key, emulator  
-**Affected:** `linux/phone-authd/src/engine.rs` pairing,
-`android/app/src/main/kotlin/com/androidfprint/keystore/DeviceAuthKey.kt`,
+**Affected:** `linux/rbad/src/engine.rs` pairing,
+`android/app/src/main/kotlin/com/rba/keystore/DeviceAuthKey.kt`,
 `protocol/specification/PROTOCOL.md` §6.2
 
 **Observation.** The host accepts `device_pubkey` after the pairing MAC verifies.
@@ -327,9 +327,9 @@ verified security level, and no proof that the key is hardware-backed or
 biometric-gated. The app inspects its own key location and refuses software keys
 for policy, but that is a local claim.
 
-**Impact.** A rooted phone, a rogue app, an emulator, or a software Keystore can
+**Impact.** A rooted device, a rogue app, an emulator, or a software Keystore can
 present a key that the host treats the same as a StrongBox/TEE key. The
-"biometric-gated" guarantee is only as strong as the phone's software.
+"biometric-gated" guarantee is only as strong as the device's software.
 
 **Recommendation.** Add optional attestation during pairing: a fresh host nonce
 inside the attestation challenge, verify the chain to the expected root, record
@@ -343,17 +343,17 @@ is unavailable, make the downgrade explicit rather than silent.
 **Severity:** Medium  
 **Status:** Confirmed  
 **Source:** external review, 2026-11-18  
-**Aliases:** IPC trust, socket impersonation, `PHONE_AUTH_SOCKET`  
-**Affected:** `linux/phone-authd/src/ipc.rs`,
-`linux/pam-phone-auth/src/lib.rs`, `linux/systemd/phone-authd.service`
+**Aliases:** IPC trust, socket impersonation, `RBA_SOCKET`  
+**Affected:** `linux/rbad/src/ipc.rs`,
+`linux/pam-rba/src/lib.rs`, `linux/systemd/rbad.service`
 
 **Observation.** The server checks `SO_PEERCRED` for incoming clients. The **client**
 side (`ipc::call`) simply connects to a Unix socket and trusts the JSON reply. It
 does not verify the server's UID/GID or that the socket is the expected root-owned
-path. `default_socket()` honours `PHONE_AUTH_SOCKET`, so the PAM stack's
+path. `default_socket()` honours `RBA_SOCKET`, so the PAM stack's
 environment can redirect the module. The quick start uses `/tmp/...` paths.
 
-The systemd socket is mode `0660`, group `phone-auth`, and the runtime directory
+The systemd socket is mode `0660`, group `rba`, and the runtime directory
 is root-owned in the intended deployment, which limits casual impersonation. It
 does not make the client's trust explicit or protect against a same-group
 impersonator or an override.
@@ -364,8 +364,8 @@ This is defence in depth, not the primary authentication check, but it is part o
 the trust boundary.
 
 **Recommendation.** On the client, check `SO_PEERCRED` of the connected server and
-require the expected daemon UID (root or `phone-auth`). Prefer a fixed compiled
-path for production; keep `PHONE_AUTH_SOCKET` strictly for tests. Verify the
+require the expected daemon UID (root or `rba`). Prefer a fixed compiled
+path for production; keep `RBA_SOCKET` strictly for tests. Verify the
 socket file owner/mode before connecting, and add a test with a fake socket.
 
 ---
@@ -376,10 +376,10 @@ socket file owner/mode before connecting, and add a test with a fake socket.
 **Status:** Partly confirmed  
 **Source:** external review, 2026-11-18  
 **Aliases:** mTLS, fuzzing, bind, rate limiter  
-**Affected:** `linux/phone-authd/src/tls.rs`,
-`linux/phone-authd/src/server.rs`, `linux/phone-authd/src/transport/wifi.rs`,
-`linux/phone-authd/src/engine.rs`, `linux/phone-authd/src/config.rs`,
-`linux/systemd/phone-authd.service`
+**Affected:** `linux/rbad/src/tls.rs`,
+`linux/rbad/src/server.rs`, `linux/rbad/src/transport/wifi.rs`,
+`linux/rbad/src/engine.rs`, `linux/rbad/src/config.rs`,
+`linux/systemd/rbad.service`
 
 **Confirmed observations.**
 
@@ -389,7 +389,7 @@ socket file owner/mode before connecting, and add a test with a fake socket.
   device-level signature check; the session/hello and pairing frames are expected
   to arrive first.
 - **Fixed:** the default `Config` now binds `127.0.0.1:47123`. The systemd unit
-  passes `--bind 0.0.0.0:47123` explicitly because a phone on the LAN needs it;
+  passes `--bind 0.0.0.0:47123` explicitly because a device on the LAN needs it;
   that is an operator/deployment choice, not a library default.
 - The auth rate limiter is an in-memory `RateLimiter` per transport, not per
   source address, target user, or device; it resets on restart. The review's
@@ -428,8 +428,8 @@ availability and defence in depth are weaker than the design claims.
 **Status:** Partly confirmed  
 **Source:** external review, 2026-11-18  
 **Aliases:** debug build, attestation, exported components  
-**Affected:** `android/app/src/main/kotlin/com/androidfprint/keystore/DeviceAuthKey.kt`,
-`android/app/src/main/kotlin/com/androidfprint/session/AuthenticatorSession.kt`,
+**Affected:** `android/app/src/main/kotlin/com/rba/keystore/DeviceAuthKey.kt`,
+`android/app/src/main/kotlin/com/rba/session/AuthenticatorSession.kt`,
 `android/app/src/main/AndroidManifest.xml`,
 `android/app/build.gradle.kts`
 
@@ -468,8 +468,8 @@ SEC-005.
 **Status:** Needs verification  
 **Source:** external review, 2026-11-18  
 **Aliases:** panic across FFI, unwind, unsafe, blocking  
-**Affected:** `linux/pam-phone-auth/src/lib.rs`,
-`linux/pam-phone-auth/Cargo.toml`
+**Affected:** `linux/pam-rba/src/lib.rs`,
+`linux/pam-rba/Cargo.toml`
 
 **Observation.** The PAM module is a Rust `cdylib` loaded into `sudo`, `login`,
 `sshd` and greeters. It has several `unsafe` FFI blocks around `pam_get_user`,
@@ -497,16 +497,16 @@ the blocking behaviour.
 
 ## Low
 
-### SEC-010 — Timing can reveal whether an account has a paired phone
+### SEC-010 — Timing can reveal whether an account has a paired device
 
 **Severity:** Low  
 **Status:** Needs verification  
 **Source:** external review, 2026-11-18  
-**Affected:** `linux/pam-phone-auth/src/lib.rs`, daemon timeout path
+**Affected:** `linux/pam-rba/src/lib.rs`, daemon timeout path
 
-A user with a paired phone waits for the phone/daemon timeout; a user without one
+A user with a paired device waits for the device/daemon timeout; a user without one
 falls through immediately. An attacker able to measure PAM response time may
-learn which accounts use the phone. Recommend a uniform minimum decision delay or
+learn which accounts use the device. Recommend a uniform minimum decision delay or
 an immediate "unavailable" response that is indistinguishable, and document the
 trade-off.
 
@@ -515,7 +515,7 @@ trade-off.
 **Severity:** Low  
 **Status:** Confirmed  
 **Source:** external review, 2026-11-18  
-**Affected:** `linux/phone-authctl/src/main.rs`, pairing display
+**Affected:** `linux/rba/src/main.rs`, pairing display
 
 The host CLI shows the submitted `device_name`; it does not show the device key
 fingerprint or source address before the operator confirms. If two devices race
@@ -528,9 +528,9 @@ submission after the first.
 **Severity:** Low  
 **Status:** Confirmed  
 **Source:** external review, 2026-11-18  
-**Affected:** `linux/phone-authctl/src/main.rs`
+**Affected:** `linux/rba/src/main.rs`
 
-`phone-authctl pair --code 123456` places the code in `argv`, visible to local
+`rba pair --code 123456` places the code in `argv`, visible to local
 users via `ps`/proc where permitted. Prefer stdin or a prompt, or treat the code
 as low-value because it is only a pairing confirmation; do not log it.
 
@@ -551,7 +551,7 @@ README documents it as troubleshooting-only.
 **Status:** Confirmed  
 **Source:** external review, 2026-11-18  
 **Affected:** `protocol/specification/PROTOCOL.md` §8.1/§8.2,
-`android/app/src/main/kotlin/com/androidfprint/session/AuthenticatorSession.kt`
+`android/app/src/main/kotlin/com/rba/session/AuthenticatorSession.kt`
 
 The signed core contains the request fields, but not `session_id`. `session_id` is
 unsigned, and there is no TLS exporter binding. A valid signature is bound to the
@@ -564,8 +564,8 @@ signed transcript would be cheap hardening.
 **Severity:** Low  
 **Status:** Needs verification  
 **Source:** external review, 2026-11-18  
-**Affected:** `linux/phone-authd/src/transport/wifi.rs`,
-`android/app/src/main/kotlin/com/androidfprint/transport/WifiTransport.kt`
+**Affected:** `linux/rbad/src/transport/wifi.rs`,
+`android/app/src/main/kotlin/com/rba/transport/WifiTransport.kt`
 
 The host advertises a stable host label and key-id metadata over DNS-SD. The
 review's claim that the **device** advertises a stable `device_id`, key fingerprint
@@ -584,9 +584,10 @@ considering an ephemeral display label or rotating advertisement where practical
 `packaging/arch/install-local.sh`
 
 The recommended `common-auth` change is Debian/Ubuntu-specific. Arch uses
-`system-auth` and `sudo` includes it; this machine required a sudo-scoped line and
-a `--host-name %H` unit change. **Resolved:** the README now has a distro table,
-defaults to the Arch `sudo`-scoped example, and distinguishes polkit/GDM stacks.
+`system-auth` and `sudo` includes it. **Resolved:** the README now documents the
+scoped `gdm-password` and `polkit-1` installers, leaves `sudo`, `system-auth`,
+`sshd`, `su`, `login` and `gdm-fingerprint` untouched, and explains that
+`sufficient` is password **or** device.
 
 ---
 
@@ -598,9 +599,9 @@ defaults to the Arch `sudo`-scoped example, and distinguishes polkit/GDM stacks.
 **Status:** Confirmed  
 **Affected:** `docs/threat-model.md` §table, `PROTOCOL.md` §3 / §29
 
-The threat model lists `/var/lib/phone-authd/host.key`; the specification says
-`/etc/phone-auth/host.key`. The implementation default is
-`/var/lib/phone-authd` (`Config::DEFAULT_STATE_DIR`). Pick the implementation path
+The threat model lists `/var/lib/rba/host.key`; the specification says
+`/etc/rba/host.key`. The implementation default is
+`/var/lib/rba` (`Config::DEFAULT_STATE_DIR`). Pick the implementation path
 as canonical and update the specification, or explicitly document a deployment
 override.
 
@@ -648,7 +649,7 @@ backup created by the same procedure.
 **Resolved in:** `d357f26`  
 **Source:** second source review, 2026-11-18  
 **Aliases:** IPC memory exhaustion, `read_line`, slowloris on the Unix socket  
-**Affected:** `linux/phone-authd/src/ipc.rs`, `linux/phone-authd/src/server.rs`
+**Affected:** `linux/rbad/src/ipc.rs`, `linux/rbad/src/server.rs`
 
 **Observation.** `read_request` called `BufReader::read_line`, which grows a
 `String` until a newline arrives, and only then compared the length with 64 KiB.
@@ -656,7 +657,7 @@ A client with access to the control socket could stream without a newline and
 make the daemon buffer unboundedly before the check ran. The server also spawned
 one task per accepted connection with no cap or deadline.
 
-**Impact.** Local denial of service by a process in the `phone-auth` group or
+**Impact.** Local denial of service by a process in the `rba` group or
 root. The socket is not network-reachable, so this is not an unauthenticated
 remote attack.
 
@@ -678,7 +679,7 @@ slot is dropped rather than queued.
 **Resolved in:** `d357f26`  
 **Source:** second source review, 2026-11-18  
 **Aliases:** pending-slot exhaustion, authenticated local DoS  
-**Affected:** `linux/phone-authd/src/server.rs`, `linux/phone-authd/src/engine.rs`
+**Affected:** `linux/rbad/src/server.rs`, `linux/rbad/src/engine.rs`
 
 **Observation.** The control API accepted `timeout_ms` without a maximum. The
 engine holds one pending authentication slot per device, so a caller could keep
@@ -703,8 +704,8 @@ response is rejected independently of the caller's timeout.
 **Resolved in:** `d357f26`  
 **Source:** second source review, 2026-11-18  
 **Aliases:** consent context, display name spoofing, omitted operation  
-**Affected:** `android/app/src/main/kotlin/com/androidfprint/session/AuthenticatorSession.kt`,
-`android/app/src/main/kotlin/com/androidfprint/ui/AuthenticatorScreen.kt`
+**Affected:** `android/app/src/main/kotlin/com/rba/session/AuthenticatorSession.kt`,
+`android/app/src/main/kotlin/com/rba/ui/AuthenticatorScreen.kt`
 
 **Observation.** The prompt used `AuthRequest.displayHostName`, which the protocol
 defines as unsigned advisory text, as if it were the host's identity. It also
@@ -712,7 +713,7 @@ omitted the signed `operation` in some summaries. A compromised paired host coul
 therefore present a different name while making a valid signed request.
 
 **Impact.** Consent integrity: the operator could approve a request believing it
-came from another machine. It does not forge the phone's signature.
+came from another machine. It does not forge the device's signature.
 
 **Remediation.** The prompt now displays the **locally stored paired-host name**
 plus the signed `host_id` (the authenticated identity), and always shows the
@@ -734,9 +735,9 @@ operation. The success screen repeats the stored name and key id.
 **Resolved in:** `d357f26`  
 **Source:** second source review, 2026-11-18  
 **Aliases:** connection flood, TLS slowloris, stalled frames, wildcard bind  
-**Affected:** `linux/phone-authd/src/transport/wifi.rs`,
-`linux/phone-authd/src/transport/mod.rs`, `linux/phone-authd/src/config.rs`,
-`linux/systemd/phone-authd.service`
+**Affected:** `linux/rbad/src/transport/wifi.rs`,
+`linux/rbad/src/transport/mod.rs`, `linux/rbad/src/config.rs`,
+`linux/systemd/rbad.service`
 
 **Observation.** The listener spawned a task for every accepted TCP connection,
 ran the TLS handshake without a deadline, and waited for frames without an idle
@@ -764,7 +765,7 @@ specific interface address in deployments where the LAN is untrusted.
 
 **Evidence.** `wifi::MAX_WIFI_CONNECTIONS`, `wifi::TLS_HANDSHAKE_TIMEOUT`,
 `transport::SESSION_SETUP_TIMEOUT`, `transport::FRAME_READ_TIMEOUT`,
-`Config::default`, `linux/systemd/phone-authd.service`.
+`Config::default`, `linux/systemd/rbad.service`.
 
 ---
 
