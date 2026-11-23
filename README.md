@@ -9,11 +9,9 @@
 A single or multiple devices can act as remote cryptographic authenticators for one or more host machines.
 The device approves with native biometric interface;
 The host verifies a signature over a fresh challenge instead of trusting a simple transmitted `YES`.
-
-
-
-ㅤ
-
+#
+#
+#
 <p align="center">
   <a href="media/demo/demo-v2.mp4">
     <img src="media/demo/demo-v2.gif" width="720" alt="Demo: pairing and fingerprint approval" />
