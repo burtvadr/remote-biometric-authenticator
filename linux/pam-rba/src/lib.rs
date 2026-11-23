@@ -63,6 +63,7 @@ extern "C" {
 const PAM_SERVICE: c_int = 1; // PAM_SERVICE
 const LOG_ERR: c_int = 3;
 const LOG_WARNING: c_int = 4;
+const LOG_INFO: c_int = 6;
 
 /// Module arguments, parsed from the PAM configuration line.
 #[derive(Debug, Clone)]
@@ -330,12 +331,31 @@ unsafe fn pam_sm_authenticate_inner(
         opts.service = service;
     }
 
+    // Use the production socket path, ignoring RBA_SOCKET (SEC-006 hardening).
+    let socket = ipc::production_socket();
+
+    // Only attempt the device path when a device is actually connected.
+    // Otherwise the prompt ("Check your device") is misleading and the 5 s
+    // wait is pointless — fall straight through to the password.
+    let connected = ipc::call(&socket, &ipc::Request::Status)
+        .ok()
+        .and_then(|r| r.result)
+        .and_then(|r| r.get("connected_devices").and_then(|v| v.as_i64()))
+        .unwrap_or(0);
+    if connected == 0 {
+        syslog(
+            pamh,
+            LOG_INFO,
+            "pam_rba: no device connected; skipping to password",
+        );
+        return pam::PAM_AUTHINFO_UNAVAIL;
+    }
+
     // Best effort: tell the user on the host to look at the device. Some PAM
     // consumers display this; GDM's lock screen may not.
     pam_info(pamh, "Check your device to approve this request.");
 
-    // Use the production socket path, ignoring RBA_SOCKET (SEC-006 hardening).
-    let decision = authenticate(&ipc::production_socket(), &user, &opts);
+    let decision = authenticate(&socket, &user, &opts);
     if debug {
         let detail = match &decision {
             Decision::Authenticated => "authenticated".to_string(),
