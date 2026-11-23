@@ -102,6 +102,8 @@ class MainActivity : androidx.fragment.app.FragmentActivity() {
             AppTheme(themeMode = themeMode, dynamicColor = dynamicColor) {
                 val state by activeSession.state.collectAsStateWithLifecycle()
                 val knownHosts by activeSession.knownHostsFlow.collectAsStateWithLifecycle()
+                val connectedHostId by activeSession.connectedHostId.collectAsStateWithLifecycle()
+                val discoveredKeyIds by activeSession.discoveredKeyIds.collectAsStateWithLifecycle()
                 val backgroundStatus by background
                 AuthenticatorScreen(
                     state = state,
@@ -109,6 +111,8 @@ class MainActivity : androidx.fragment.app.FragmentActivity() {
                     deviceName = AuthenticatorRuntime.deviceName,
                     capabilities = AuthenticatorRuntime.capabilities,
                     hosts = knownHosts,
+                    connectedHostId = connectedHostId,
+                    discoveredKeyIds = discoveredKeyIds,
                     background = backgroundStatus,
                     themeMode = themeMode,
                     iconStyle = iconStyle,

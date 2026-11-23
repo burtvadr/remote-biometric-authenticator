@@ -15,9 +15,6 @@ pub const DEFAULT_TCP_PORT: u16 = 47123;
 /// Default audit log path.
 pub const DEFAULT_AUDIT_LOG: &str = "/var/log/rba/audit.log";
 
-/// Group allowed to open the control socket, in addition to root.
-pub const CONTROL_GROUP: &str = "rba";
-
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Root-only directory holding `host.key`, `host.crt` and `registry.json`.

@@ -133,6 +133,10 @@ class HostLink(
         var backoff = DISCOVERY_RETRY_MIN_MS
         while (isCurrent(token) && scope.isActive) {
             val candidates = discoverHosts()
+            // Publish which paired hosts are currently visible on the network so
+            // the UI can show reachability. This is a last-seen signal, not proof
+            // of liveness.
+            session.setDiscoveredKeyIds(candidates.mapNotNull { it.keyId }.toSet())
             if (candidates.isEmpty()) {
                 delay(backoff)
                 backoff = nextBackoff(backoff)
@@ -276,6 +280,7 @@ class HostLink(
             }
             session.attachTransport { frame -> outbound.trySend(frame) }
             attached = true
+            session.setConnectedHost(hello.hostId)
 
             // Set when a pairing has verified but the operator has not decided yet.
             // The bootstrap link stays open only to hold that context; no
@@ -370,6 +375,7 @@ class HostLink(
         } finally {
             outbound.close()
             writer?.cancel()
+            session.setConnectedHost(null)
             if (attached && isCurrent(token)) {
                 session.detachTransport()
                 session.transportLost("the connection to the host was lost")

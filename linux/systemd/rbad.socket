@@ -2,11 +2,10 @@
 Description=Remote Biometric Authenticator control socket
 
 [Socket]
-# Socket activation is the recommended integration: the socket's group ownership
-# is what authorises a client, and it exists before the daemon does.
+# The socket is a local API: every request is authorised from the peer's kernel
+# credentials and the device's account binding, so any local user may connect.
 ListenStream=/run/rba/control.sock
-SocketGroup=rba
-SocketMode=0660
+SocketMode=0666
 
 [Install]
 WantedBy=sockets.target

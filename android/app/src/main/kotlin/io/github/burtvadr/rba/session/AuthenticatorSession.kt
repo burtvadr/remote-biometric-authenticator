@@ -183,6 +183,29 @@ class AuthenticatorSession(
     val knownHostsFlow: StateFlow<List<KnownHost>> = _hosts
 
     /**
+     * The host the idle link is currently serving, or null when there is no link.
+     * Written by [HostLink]; read by the UI to show which host is connected.
+     */
+    private val _connectedHostId = MutableStateFlow<Id?>(null)
+    val connectedHostId: StateFlow<Id?> = _connectedHostId
+
+    /**
+     * Host key ids seen in the most recent mDNS discovery. This is a "last seen"
+     * signal, not a liveness probe: a host that is up but not advertising (guest
+     * network, multicast filtered) will not appear here. Matching/display only.
+     */
+    private val _discoveredKeyIds = MutableStateFlow<Set<String>>(emptySet())
+    val discoveredKeyIds: StateFlow<Set<String>> = _discoveredKeyIds
+
+    fun setConnectedHost(id: Id?) {
+        _connectedHostId.value = id
+    }
+
+    fun setDiscoveredKeyIds(ids: Set<String>) {
+        _discoveredKeyIds.value = ids
+    }
+
+    /**
      * Hosts this device has paired with, read through to [HostStore].
      *
      * Not a local list: the user pairs a second PC, the app is restarted by the system

@@ -31,6 +31,43 @@ const MAX_WIFI_CONNECTIONS: usize = 64;
 /// Time allowed for the TLS handshake before the connection is dropped.
 const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// TCP keepalive timing. A device that dies without closing the socket (battery
+/// pull, sudden loss of Wi-Fi) leaves a half-open connection that application
+/// traffic cannot detect, because a healthy idle link sends no frames. Keepalive
+/// probes notice the drop in roughly a minute instead of waiting out the full
+/// idle read timeout, so `rba devices` stops claiming the device is available.
+const KEEPALIVE_IDLE_SECS: libc::c_int = 30;
+const KEEPALIVE_INTERVAL_SECS: libc::c_int = 10;
+const KEEPALIVE_PROBES: libc::c_int = 3;
+
+/// Enables TCP keepalive on an accepted device connection.
+fn enable_keepalive(stream: &tokio::net::TcpStream) {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let set = |level: libc::c_int, opt: libc::c_int, val: libc::c_int| unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            opt,
+            &val as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    };
+    set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
+    // The per-probe timing knobs are Linux-specific; elsewhere SO_KEEPALIVE alone
+    // still applies the system default.
+    #[cfg(target_os = "linux")]
+    {
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, KEEPALIVE_IDLE_SECS);
+        set(
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPINTVL,
+            KEEPALIVE_INTERVAL_SECS,
+        );
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, KEEPALIVE_PROBES);
+    }
+}
+
 /// Advertises the host over DNS-SD so devices can find it without a fixed
 /// address. Publication contains only non-secret metadata (`PROTOCOL.md` §13.1).
 pub fn advertise(
@@ -150,6 +187,7 @@ pub async fn serve(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+                enable_keepalive(&stream);
                 let permit = match Arc::clone(&slots).try_acquire_owned() {
                     Ok(permit) => permit,
                     // No slot: drop the socket. This bounds descriptors, memory
@@ -190,6 +228,52 @@ pub async fn serve(
                     let _ = shutdown;
                 });
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+
+    /// A silently-dead device must be detectable: the accepted socket has
+    /// keepalive on, with the short probe timing rather than the system default.
+    #[tokio::test]
+    async fn accepted_device_connections_have_keepalive_enabled() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        enable_keepalive(&server);
+
+        let get = |level: libc::c_int, opt: libc::c_int| -> libc::c_int {
+            let mut val: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            let rc = unsafe {
+                libc::getsockopt(
+                    server.as_raw_fd(),
+                    level,
+                    opt,
+                    &mut val as *mut libc::c_int as *mut libc::c_void,
+                    &mut len,
+                )
+            };
+            assert_eq!(rc, 0, "getsockopt must succeed");
+            val
+        };
+        assert_eq!(get(libc::SOL_SOCKET, libc::SO_KEEPALIVE), 1);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                get(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE),
+                KEEPALIVE_IDLE_SECS
+            );
+            assert_eq!(
+                get(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL),
+                KEEPALIVE_INTERVAL_SECS
+            );
+            assert_eq!(get(libc::IPPROTO_TCP, libc::TCP_KEEPCNT), KEEPALIVE_PROBES);
         }
     }
 }

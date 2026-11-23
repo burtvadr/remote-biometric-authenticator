@@ -32,7 +32,13 @@ class WifiTransport(
     private val pinnedCertificate: java.security.cert.X509Certificate?,
 ) : AutoCloseable {
 
-    data class Discovered(val host: String, val port: Int, val instanceName: String)
+    data class Discovered(
+        val host: String,
+        val port: Int,
+        val instanceName: String,
+        /** Host key id from the TXT `id` record, when present. Display/matching only. */
+        val keyId: String?,
+    )
 
     private var socket: SSLSocket? = null
     private var input: InputStream? = null
@@ -82,7 +88,12 @@ class WifiTransport(
                     onFound(
                         resolved.mapNotNull { info ->
                             val host = info.host?.hostAddress ?: return@mapNotNull null
-                            Discovered(host, info.port, info.serviceName ?: "")
+                            Discovered(
+                                host,
+                                info.port,
+                                info.serviceName ?: "",
+                                info.attributes["id"]?.toString(Charsets.UTF_8),
+                            )
                         },
                     )
                 }
@@ -112,7 +123,12 @@ class WifiTransport(
                 onFound(
                     resolved.mapNotNull { info ->
                         val host = info.host?.hostAddress ?: return@mapNotNull null
-                        Discovered(host, info.port, info.serviceName ?: "")
+                        Discovered(
+                            host,
+                            info.port,
+                            info.serviceName ?: "",
+                            info.attributes["id"]?.toString(Charsets.UTF_8),
+                        )
                     },
                 )
             }

@@ -44,6 +44,47 @@ impl DeviceStatus {
     }
 }
 
+/// Which Linux accounts a device may authenticate.
+///
+/// The default denies everyone. A device is bound to the account that paired it;
+/// root is a separate, explicit opt-in because a root-capable authenticator is a
+/// host-wide credential, not an ordinary per-user one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DevicePolicy {
+    /// Linux usernames this device may authenticate.
+    #[serde(default)]
+    pub users: Vec<String>,
+    /// Whether the operator explicitly allowed this device to authenticate root.
+    #[serde(default)]
+    pub allow_root: bool,
+}
+
+impl DevicePolicy {
+    pub fn for_user(user: impl Into<String>) -> DevicePolicy {
+        DevicePolicy {
+            users: vec![user.into()],
+            allow_root: false,
+        }
+    }
+
+    /// Whether this policy names `user`. Status is checked separately.
+    pub fn is_bound_to(&self, user: &str) -> bool {
+        if user == "root" {
+            self.allow_root
+        } else {
+            self.users.iter().any(|u| u == user)
+        }
+    }
+
+    fn users_display(&self) -> String {
+        if self.users.is_empty() {
+            "(none)".into()
+        } else {
+            self.users.join(", ")
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceRecord {
     pub device_id: String,
@@ -55,6 +96,10 @@ pub struct DeviceRecord {
     #[serde(default)]
     pub last_seen: Option<u64>,
     pub status: DeviceStatus,
+    /// Accounts this device may authenticate. Missing on old records, where the
+    /// deny-all default forces a re-pair instead of silently widening trust.
+    #[serde(default)]
+    pub policy: DevicePolicy,
     /// SHA-256 of the bearer token that authorizes this device to revoke itself.
     #[serde(default)]
     pub revocation_token_hash: Option<String>,
@@ -82,6 +127,16 @@ impl DeviceRecord {
         Ok(self.public_key()?.key_id_hex())
     }
 
+    /// Whether this record is bound to `user`, regardless of lifecycle state.
+    pub fn is_bound_to(&self, user: &str) -> bool {
+        self.policy.is_bound_to(user)
+    }
+
+    /// Whether this device may authenticate `user` right now.
+    pub fn may_authenticate_user(&self, user: &str) -> bool {
+        self.status.may_authenticate() && self.is_bound_to(user)
+    }
+
     /// Rendering for `rba devices`. Contains no secrets.
     pub fn summary(&self) -> String {
         let fp = match self.public_key() {
@@ -89,11 +144,17 @@ impl DeviceRecord {
             Err(_) => "????????????????".into(),
         };
         format!(
-            "  {}\n    id:      {}\n    key:     SHA256:{}...\n    status:  {}\n    paired:  {}\n    seen:    {}\n    auths:   {}",
+            "  {}\n    id:      {}\n    key:     SHA256:{}...\n    status:  {}\n    users:   {}\n    root:    {}\n    paired:  {}\n    seen:    {}\n    auths:   {}",
             self.name,
             self.device_id,
             fp,
             self.status.as_str(),
+            self.policy.users_display(),
+            if self.policy.allow_root {
+                "allowed"
+            } else {
+                "denied"
+            },
             format_epoch(self.added_at),
             match self.last_seen {
                 Some(t) => format_epoch(t),
@@ -220,6 +281,27 @@ impl Registry {
         rec.public_key()
     }
 
+    /// Resolves a device only if its policy names `user` and it is paired.
+    ///
+    /// The caller must already have established that `user` is the account it is
+    /// entitled to ask for; this adds the per-device half of that decision.
+    pub fn resolve_authenticating_for(&self, id: &Id, user: &str) -> Result<PublicKey> {
+        let rec = self.devices.get(id).ok_or(ProtocolError::NotPaired)?;
+        match rec.status {
+            DeviceStatus::Paired => {}
+            DeviceStatus::Revoked => return Err(ProtocolError::Revoked),
+            DeviceStatus::Pairing => return Err(ProtocolError::NotPaired),
+            DeviceStatus::Replaced => return Err(ProtocolError::NotPaired),
+        }
+        if !rec.may_authenticate_user(user) {
+            return Err(ProtocolError::ContextMismatch(format!(
+                "device {} is not authorized for user {user}",
+                rec.name
+            )));
+        }
+        rec.public_key()
+    }
+
     pub fn by_name(&self, name: &str) -> Vec<&DeviceRecord> {
         self.devices
             .values()
@@ -239,7 +321,7 @@ impl Registry {
         pk: &PublicKey,
         now: u64,
     ) -> Result<()> {
-        self.upsert_paired_with_token(device_id, name, pk, now, None)
+        self.upsert_paired_full(device_id, name, pk, now, None, &DevicePolicy::default())
     }
 
     /// Same as [`Registry::upsert_paired`], recording the revocation token hash.
@@ -250,6 +332,49 @@ impl Registry {
         pk: &PublicKey,
         now: u64,
         revocation_token_hash: Option<&str>,
+    ) -> Result<()> {
+        self.upsert_paired_full(
+            device_id,
+            name,
+            pk,
+            now,
+            revocation_token_hash,
+            &DevicePolicy::default(),
+        )
+    }
+
+    /// Pairs a device for exactly one Linux user. Used by tests and simple
+    /// callers that do not need the full policy.
+    pub fn upsert_paired_for_user(
+        &mut self,
+        device_id: Id,
+        name: &str,
+        pk: &PublicKey,
+        now: u64,
+        user: &str,
+    ) -> Result<()> {
+        self.upsert_paired_full(
+            device_id,
+            name,
+            pk,
+            now,
+            None,
+            &DevicePolicy::for_user(user),
+        )
+    }
+
+    /// Full form: records the account binding chosen at pairing time.
+    ///
+    /// Re-pairing an existing device replaces its policy: a fresh physical
+    /// pairing is an explicit operator decision about who the device belongs to.
+    pub fn upsert_paired_full(
+        &mut self,
+        device_id: Id,
+        name: &str,
+        pk: &PublicKey,
+        now: u64,
+        revocation_token_hash: Option<&str>,
+        policy: &DevicePolicy,
     ) -> Result<()> {
         if let Some(existing) = self.devices.get(&device_id) {
             // A revoked record may be replaced by a fresh pairing, including one
@@ -271,6 +396,7 @@ impl Registry {
             added_at: now,
             last_seen: Some(now),
             status: DeviceStatus::Paired,
+            policy: policy.clone(),
             revocation_token_hash: revocation_token_hash.map(str::to_owned),
             auth_count: 0,
         };
@@ -470,6 +596,63 @@ mod tests {
 
         r.revoke(&id).unwrap();
         assert_eq!(r.resolve_authenticating(&id), Err(ProtocolError::Revoked));
+    }
+
+    #[test]
+    fn a_device_is_bound_to_the_user_it_was_paired_for() {
+        let mut r = Registry::in_memory();
+        let id = Id::random().unwrap();
+        r.upsert_paired_for_user(id, "Pixel", &pk(1), 100, "alice")
+            .unwrap();
+
+        let rec = r.get(&id).unwrap();
+        assert!(rec.may_authenticate_user("alice"));
+        assert!(!rec.may_authenticate_user("bob"));
+        assert!(!rec.may_authenticate_user("root"));
+        assert!(r.resolve_authenticating_for(&id, "alice").is_ok());
+        assert_eq!(
+            r.resolve_authenticating_for(&id, "bob"),
+            Err(ProtocolError::ContextMismatch(
+                "device Pixel is not authorized for user bob".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn root_is_denied_by_default_and_allowed_only_explicitly() {
+        let mut r = Registry::in_memory();
+        let id = Id::random().unwrap();
+        r.upsert_paired_for_user(id, "Pixel", &pk(1), 100, "alice")
+            .unwrap();
+        assert!(!r.get(&id).unwrap().may_authenticate_user("root"));
+
+        let policy = DevicePolicy {
+            users: vec!["alice".into()],
+            allow_root: true,
+        };
+        r.upsert_paired_full(id, "Pixel", &pk(1), 200, None, &policy)
+            .unwrap();
+        assert!(r.get(&id).unwrap().may_authenticate_user("alice"));
+        assert!(r.get(&id).unwrap().may_authenticate_user("root"));
+        assert!(!r.get(&id).unwrap().may_authenticate_user("bob"));
+    }
+
+    /// A registry written before per-device policy existed must not become an
+    /// allow-all after an upgrade. The missing field deserialises to deny-all.
+    #[test]
+    fn a_record_without_a_policy_denies_everyone() {
+        let id = Id::random().unwrap();
+        let raw = serde_json::json!({
+            "device_id": id.to_hex(),
+            "name": "Pixel",
+            "public_key": hex::encode(pk(1).as_bytes()),
+            "status": "paired",
+        });
+        let rec: DeviceRecord = serde_json::from_value(raw).unwrap();
+        assert!(!rec.may_authenticate_user("alice"));
+        assert!(!rec.may_authenticate_user("root"));
+        assert_eq!(rec.policy.users.len(), 0);
+        assert!(!rec.policy.allow_root);
     }
 
     #[test]

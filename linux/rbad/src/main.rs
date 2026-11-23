@@ -153,7 +153,7 @@ fn main() {
             daemon.config.socket_path.display(),
             daemon.config.audit_log.display(),
             daemon.engine.host.host_id,
-            daemon.engine.list_devices().len()
+            daemon.engine.list_devices(None).len()
         );
         return;
     }

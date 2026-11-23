@@ -83,6 +83,43 @@ pub fn user_for_uid(uid: u32) -> Option<String> {
     None
 }
 
+/// The account a request is made on behalf of, for filtering and pairing.
+///
+/// Root gets `None`, which means the administrative view. A non-root UID that
+/// does not resolve in the local user database is refused rather than treated as
+/// anonymous.
+pub fn viewer_name(peer: PeerCredentials) -> Result<Option<String>> {
+    if peer.uid == 0 {
+        return Ok(None);
+    }
+    user_for_uid(peer.uid).map(Some).ok_or_else(|| {
+        ProtocolError::Internal(format!("cannot resolve uid {} to a local user", peer.uid))
+    })
+}
+
+/// Whether a local account with this exact name exists.
+///
+/// Used when root chooses the owner of a new pairing. A typo must fail at pairing
+/// time, not silently create a device nobody can use.
+pub fn user_exists(name: &str) -> bool {
+    let Ok(cname) = std::ffi::CString::new(name) else {
+        return false;
+    };
+    let mut buf = vec![0i8; 4096];
+    let mut passwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getpwnam_r(
+            cname.as_ptr(),
+            &mut passwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    rc == 0 && !result.is_null()
+}
+
 /// Decides whether `peer` may request an authentication for `requested_user`.
 ///
 /// The authenticated principal is always the peer UID; `requested_user` is only
@@ -127,6 +164,13 @@ pub enum ControlRequest {
         code_entry: Option<String>,
         #[serde(default)]
         timeout_ms: Option<u64>,
+        /// Account to bind the device to. Non-root may only name itself; root
+        /// must name an existing account explicitly.
+        #[serde(default)]
+        owner: Option<String>,
+        /// Explicitly allow this device to authenticate root. Root-only choice.
+        #[serde(default)]
+        allow_root: bool,
     },
     /// Ask a paired device to authenticate a Linux user.
     Authenticate {
@@ -154,6 +198,9 @@ pub enum ControlRequest {
         #[serde(default)]
         code: Option<String>,
     },
+    /// Abort the open pairing session and discard any pending record. Used by
+    /// the CLI on Ctrl-C so an aborted pair does not linger until it expires.
+    CancelPairing,
 }
 
 fn default_purpose() -> String {

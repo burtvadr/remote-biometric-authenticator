@@ -32,6 +32,8 @@ fn usage_text() -> String {
          \x20   rba pair --code NNNNNN       pair using an operator-chosen code\n\
          \x20   rba pair --code-entry device  host shows the code; type it on the device (default)\n\
          \x20   rba pair --code-entry host    device shows the code; type it in this terminal\n\
+         \x20   --owner USER                  account the device may authenticate (default: you)\n\
+         \x20   --allow-root                  also allow this device to authenticate root (explicit)\n\
          \n\
          OPTIONS:\n\
          \x20   --socket PATH    control socket (default {DEFAULT_SOCKET})\n\
@@ -41,16 +43,16 @@ fn usage_text() -> String {
          \x20   --operation O    authenticate or authorize         (default authenticate)\n\
          \x20   -s, --device D   device name or id (default: any connected authenticator)\n\
          \x20   --timeout MS     how long to wait                     (default 90000)\n\
-         \x20   --yes            skip the host confirmation prompt (never the code entry)\n\
          \x20   -h, --help       show this help\n\
          \x20   -V, --version    print the product and protocol version\n\
          \n\
          ENVIRONMENT:\n\
          \x20   RBA_SOCKET       control socket (default {DEFAULT_SOCKET})\n\
          \n\
-         The 'auth' command performs no cryptography here: it asks the daemon,\n\
-         which verifies a signature over a fresh challenge against the registered\n\
-         device public key.\n",
+         A device authenticates only the account it was paired for. Root is denied\n\
+         unless pairing used --allow-root. The 'auth' command performs no\n\
+         cryptography here: it asks the daemon, which verifies a signature over a\n\
+         fresh challenge against the registered device public key.\n",
         rba_protocol::VERSION
     )
 }
@@ -83,8 +85,9 @@ struct Args {
     device: Option<String>,
     code: Option<String>,
     code_entry: CodeEntry,
+    owner: Option<String>,
+    allow_root: bool,
     timeout_ms: u64,
-    assume_yes: bool,
 }
 
 fn parse() -> Args {
@@ -100,8 +103,9 @@ fn parse() -> Args {
         device: None,
         code: None,
         code_entry: CodeEntry::Device,
+        owner: None,
+        allow_root: false,
         timeout_ms: rbad::server::DEFAULT_AUTH_TIMEOUT_MS,
-        assume_yes: false,
     };
     let mut it = std::env::args().skip(1).peekable();
     if it.peek().is_none() {
@@ -143,8 +147,9 @@ fn parse() -> Args {
                     }
                 };
             }
+            "--owner" => args.owner = Some(v("--owner")),
+            "--allow-root" => args.allow_root = true,
             "--timeout" => args.timeout_ms = v("--timeout").parse().unwrap_or(90_000),
-            "--yes" | "-y" => args.assume_yes = true,
             "-h" | "--help" => help(),
             "-V" | "--version" => version(),
             other => {
@@ -159,8 +164,18 @@ fn parse() -> Args {
 /// Sends one control request and returns the response.
 fn request(args: &Args, req: &ControlRequest) -> Result<ControlResponse, String> {
     let stream = std::os::unix::net::UnixStream::connect(&args.socket).map_err(|e| {
+        let hint = match e.kind() {
+            std::io::ErrorKind::PermissionDenied => {
+                "hint: the control socket is not accessible; check `systemctl status rbad`."
+            }
+            std::io::ErrorKind::NotFound => "hint: is the service running? (systemctl status rbad)",
+            std::io::ErrorKind::ConnectionRefused => {
+                "hint: rbad is not accepting connections; check `systemctl status rbad`"
+            }
+            _ => "hint: check `systemctl status rbad`",
+        };
         format!(
-            "cannot reach rbad at {}: {e}\nhint: is the service running? (systemctl status rbad)",
+            "cannot reach rbad at {}: {e}\n{hint}",
             args.socket.display()
         )
     })?;
@@ -177,6 +192,36 @@ fn request(args: &Args, req: &ControlRequest) -> Result<ControlResponse, String>
         return Err("the daemon closed the connection without replying".into());
     }
     serde_json::from_str(reply.trim()).map_err(|e| format!("malformed reply: {e}"))
+}
+
+/// Best-effort cancel of the open pairing session, used on Ctrl-C.
+fn send_cancel(socket: &std::path::Path) {
+    if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket) {
+        if let Ok(line) = serde_json::to_string(&ControlRequest::CancelPairing) {
+            let _ = stream.write_all(format!("{line}\n").as_bytes());
+            let _ = stream.flush();
+        }
+    }
+}
+
+/// On Ctrl-C, cancel the pairing session so it does not linger until it expires,
+/// then exit with the conventional SIGINT status.
+fn install_pairing_cancel(socket: PathBuf) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        rt.block_on(async {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                send_cancel(&socket);
+                eprintln!("\nrba: pairing cancelled");
+                std::process::exit(130);
+            }
+        });
+    });
 }
 
 fn fail(resp: &ControlResponse) -> ! {
@@ -208,13 +253,12 @@ fn cmd_devices(args: &Args) {
         .and_then(|d| d.as_array())
         .cloned()
         .unwrap_or_default();
+    // adb-style: a constant header, then the rows. An empty list is just the
+    // header, not prose telling the user what to do next.
+    println!("List of authenticators paired");
     if devices.is_empty() {
-        println!("No authenticators are paired.");
-        println!();
-        println!("Pair one with:  rba pair");
         return;
     }
-    println!("Paired authenticators:");
     println!();
     for d in &devices {
         let status = d.get("status").and_then(|v| v.as_str()).unwrap_or("?");
@@ -243,6 +287,29 @@ fn cmd_devices(args: &Args) {
             key.chars().take(16).collect::<String>()
         );
         println!("    status:  {status}");
+        let users = d
+            .get("users")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "(none)".into());
+        println!("    users:   {users}");
+        println!(
+            "    root:    {}",
+            if d.get("allow_root")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                "allowed"
+            } else {
+                "denied"
+            }
+        );
         println!("    link:    {avail}");
         println!(
             "    paired:  {}",
@@ -315,6 +382,8 @@ fn cmd_pair(args: &Args) {
             code: args.code.clone(),
             code_entry: Some(args.code_entry.as_str().to_string()),
             timeout_ms: Some(args.timeout_ms.max(1000)),
+            owner: args.owner.clone(),
+            allow_root: args.allow_root,
         },
     )
     .unwrap_or_else(|e| {
@@ -324,39 +393,16 @@ fn cmd_pair(args: &Args) {
     if !resp.ok {
         fail(&resp);
     }
-    let chosen = resp
-        .result
-        .as_ref()
-        .and_then(|r| r.get("chosen_code"))
-        .and_then(|c| c.as_str())
-        .map(|s| s.to_string());
+    install_pairing_cancel(args.socket.clone());
     let remaining = resp
         .result
         .as_ref()
         .and_then(|r| r.get("seconds_remaining"))
         .and_then(|v| v.as_i64())
         .unwrap_or(120);
-    println!("Pairing open for {remaining}s.");
-    match args.code_entry {
-        CodeEntry::Device => {
-            if chosen.is_some() {
-                println!(
-                    "You chose a code; it will be shown here and must be typed on the device."
-                );
-            } else {
-                println!("Start pairing on the device now.");
-            }
-        }
-        CodeEntry::Host => {
-            println!(
-                "Start pairing on the device now. The device displays the code; this terminal will not."
-            );
-            if chosen.is_some() {
-                println!("You chose the code, but still type it from the device when asked.");
-            }
-        }
-    }
-    println!();
+    // adb-like: one progress line, then the code. No box art and no host [y/N] —
+    // running `pair` is already the operator's decision.
+    eprintln!("Waiting for device... ({remaining}s)");
 
     // Wait until the device has submitted and both sides can derive the code.
     let code = loop {
@@ -391,74 +437,43 @@ fn cmd_pair(args: &Args) {
 
     let confirmation = match args.code_entry {
         CodeEntry::Device => {
-            println!("Pairing code (shown only here; enter it on the device):");
-            println!();
-            println!("      ┌────────────────┐");
-            println!("      │  {code}  │");
-            println!("      └────────────────┘");
-            println!();
-            if args.assume_yes {
-                println!(
-                    "--yes given: skipping the host confirmation prompt. The device still requires the code."
-                );
-            } else {
-                print!("Send this pairing to the device? [y/N] ");
-                let _ = std::io::stdout().flush();
-                let mut answer = String::new();
-                if std::io::stdin().read_line(&mut answer).is_err() {
-                    println!("\nno confirmation read; aborting pairing");
-                    std::process::exit(1);
-                }
-                if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
-                    println!("Pairing not confirmed; nothing was stored.");
-                    std::process::exit(1);
-                }
-            }
+            // The host shows the code; the device operator types it. There is no
+            // host [y/N]: the device's typed code is the human gate, so the
+            // confirmation is sent automatically.
+            println!("Code: {code}  type this on the device");
             None
         }
         CodeEntry::Host => {
-            println!("The device is displaying the pairing code. Type it here:");
+            // The device shows the code; the host operator types it, like
+            // `adb pair`.
             let entered = loop {
-                print!("Code: ");
+                print!("Enter pairing code: ");
                 let _ = std::io::stdout().flush();
                 let mut answer = String::new();
                 match std::io::stdin().read_line(&mut answer) {
-                    Ok(0) => {
-                        println!("\nno code read; aborting pairing");
+                    Ok(0) | Err(_) => {
+                        eprintln!("\nrba: no code read; pairing cancelled");
                         std::process::exit(1);
                     }
                     Ok(_) => {}
-                    Err(_) => {
-                        println!("\nno code read; aborting pairing");
-                        std::process::exit(1);
-                    }
                 }
                 let entered: String = answer.chars().filter(|c| c.is_ascii_digit()).collect();
                 if entered == code {
                     break entered;
                 }
-                println!("That code does not match the device. Try again.");
+                println!("Code mismatch; try again.");
             };
             Some(entered)
         }
     };
 
+    // Send the confirmation automatically; there is no host prompt.
     match request(args, &ControlRequest::ConfirmPairing { code: confirmation }) {
         Ok(r) if r.ok => {}
         Ok(r) => fail(&r),
         Err(e) => {
             eprintln!("rba: {e}");
             std::process::exit(1)
-        }
-    }
-    println!("Confirming pairing…");
-
-    match args.code_entry {
-        CodeEntry::Device => {
-            println!("Host record saved. Enter the code on the device to finish pairing.")
-        }
-        CodeEntry::Host => {
-            println!("Host record saved. Approve the pairing on the device to finish.")
         }
     }
 
@@ -475,11 +490,17 @@ fn cmd_pair(args: &Args) {
             .and_then(|p| p.get("seconds_remaining"))
             .is_some();
         if !still_open {
-            println!("Host side pairing finished.");
+            // The host persisted its side. The device persists only after its own
+            // human gate, and there is no device acknowledgement yet, so do not
+            // claim the pairing is complete. `rba devices` shows the final state.
+            match args.code_entry {
+                CodeEntry::Device => println!("Host side complete; finish on the device."),
+                CodeEntry::Host => println!("Host side complete; approve on the device."),
+            }
             return;
         }
     }
-    println!("Host did not finish pairing; check `rba status`.");
+    eprintln!("rba: pairing timed out");
     std::process::exit(1);
 }
 

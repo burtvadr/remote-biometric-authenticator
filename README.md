@@ -186,8 +186,8 @@ linux/target/debug/rbad \
 #    in the terminal instead.
 linux/target/debug/rba --socket /tmp/rba/control.sock pair
 
-# 4. Complete the code gate. `--yes` skips only the host-side prompt; it never
-#    skips the typed code.
+# 4. Complete the code gate on the device: type the code shown in the terminal.
+#    There is no host-side prompt; the device's typed code is the confirmation.
 
 # 5. Background the app, then request authentication
 linux/target/debug/rba --socket /tmp/rba/control.sock \
@@ -338,6 +338,7 @@ one device and is revocable independently.
 * [`docs/pairing.md`](docs/pairing.md) — the pairing flow and its guarantees
 * [`docs/security-audit.md`](docs/security-audit.md) — audit tracker and current findings
 * [`docs/roadmap.md`](docs/roadmap.md) — support matrix, capability protocol and platform roadmap
+* [`docs/versioning.md`](docs/versioning.md) — version bumps, the 1.0.0 gate and the no-re-pair migration guarantee
 
 ## Credits
 

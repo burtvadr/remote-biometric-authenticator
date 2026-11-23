@@ -35,7 +35,12 @@ const MAX_CONTROL_CONNECTIONS: usize = 32;
 /// Time allowed to send one request or receive one response.
 const CONTROL_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Binds the control socket with restricted permissions.
+/// Binds the local control socket.
+///
+/// The socket is reachable by any local user; the daemon authorises every
+/// request from `SO_PEERCRED` and the per-device account binding. Filesystem
+/// permissions are therefore not the user boundary, and there is no group for an
+/// operator to join before `rba` works.
 ///
 /// Must be called from inside the Tokio runtime: converting a std listener into a
 /// reactor-aware one requires a live reactor.
@@ -51,9 +56,9 @@ pub fn bind_control_socket(path: &std::path::Path) -> Result<UnixListener> {
     }
     let listener = std::os::unix::net::UnixListener::bind(path)
         .map_err(|e| ProtocolError::Internal(format!("bind {}: {e}", path.display())))?;
-    // Set restrictive permissions before the socket is reachable, so there is no
-    // window in which an unprivileged process could connect.
-    restrict_socket(path);
+    // Publish the socket before it accepts connections. Every request is still
+    // authenticated from the peer's kernel credentials.
+    publish_socket(path);
     listener
         .set_nonblocking(true)
         .map_err(|e| ProtocolError::Internal(format!("set nonblocking: {e}")))?;
@@ -61,15 +66,14 @@ pub fn bind_control_socket(path: &std::path::Path) -> Result<UnixListener> {
         .map_err(|e| ProtocolError::Internal(format!("register listener: {e}")))
 }
 
-/// Makes the socket reachable by root and the service group only.
+/// Makes the socket reachable by every local user.
 ///
-/// The daemon's primary group is `rba` under systemd, so the socket is
-/// already created with the right group. Do not spawn `chgrp`: the sandbox
-/// forbids the extra privilege transition, and the attempt produces a coredump
-/// on every start while changing nothing.
-fn restrict_socket(path: &std::path::Path) {
+/// This is deliberate: the socket is a local API, not an administrative one.
+/// Pairing, listing, status and authentication are each authorised from the
+/// caller's UID and the device policy; `revoke` remains root-only.
+fn publish_socket(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660));
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
 }
 
 /// Serves the control socket until `shutdown` fires.
@@ -168,28 +172,47 @@ async fn dispatch(
     peer: ipc::PeerCredentials,
     request: ControlRequest,
 ) -> ControlResponse {
+    let peer_key = format!("uid:{}", peer.uid);
+    let viewer = match ipc::viewer_name(peer) {
+        Ok(viewer) => viewer,
+        Err(e) => return ControlResponse::from_protocol_error(&e),
+    };
+
     match request {
         ControlRequest::List => ControlResponse::ok(serde_json::json!({
-            "devices": engine.list_devices(),
+            "devices": engine.list_devices(viewer.as_deref()),
         })),
 
-        ControlRequest::Status => ControlResponse::ok(engine.status()),
+        ControlRequest::Status => ControlResponse::ok(engine.status(viewer.as_deref(), &peer_key)),
 
-        ControlRequest::PairingCode => match engine.pairing_code() {
-            Some((code, expires_at)) => ControlResponse::ok(serde_json::json!({
-                "active": true,
-                "code": code,
-                "expires_at": expires_at,
-                "phase": format!("{:?}", engine.pairing_phase()).to_lowercase(),
-                "code_entry": engine.pairing_code_entry().map(|m| m.as_str()),
-            })),
-            None => ControlResponse::ok(serde_json::json!({ "active": false })),
-        },
+        ControlRequest::PairingCode => {
+            if !engine.pairing_active() {
+                return ControlResponse::ok(serde_json::json!({ "active": false }));
+            }
+            if !engine.pairing_opened_by(&peer_key) {
+                return ControlResponse::err(
+                    "PERMISSION_DENIED",
+                    "this pairing session was opened by another user",
+                );
+            }
+            match engine.pairing_code() {
+                Some((code, expires_at)) => ControlResponse::ok(serde_json::json!({
+                    "active": true,
+                    "code": code,
+                    "expires_at": expires_at,
+                    "phase": format!("{:?}", engine.pairing_phase()).to_lowercase(),
+                    "code_entry": engine.pairing_code_entry().map(|m| m.as_str()),
+                })),
+                None => ControlResponse::ok(serde_json::json!({ "active": false })),
+            }
+        }
 
         ControlRequest::Pair {
             code,
             code_entry,
             timeout_ms: _,
+            owner,
+            allow_root,
         } => {
             let mode = match code_entry.as_deref() {
                 None | Some("device") => CodeEntry::Device,
@@ -200,8 +223,49 @@ async fn dispatch(
                     ))
                 }
             };
-            let peer_key = format!("uid:{}", peer.uid);
-            match engine.begin_pairing_with_mode(code, mode, peer_key) {
+            // The device is bound to the local principal that opened pairing.
+            // Root must name an existing account explicitly; it is never an
+            // implicit owner, and root authentication needs a second opt-in.
+            let owner = match (viewer.as_deref(), owner) {
+                (None, Some(owner)) if !owner.is_empty() => {
+                    if !ipc::user_exists(&owner) {
+                        return ControlResponse::err(
+                            "BAD_REQUEST",
+                            format!("no such local user: {owner}"),
+                        );
+                    }
+                    if owner == "root" && !allow_root {
+                        return ControlResponse::err(
+                            "BAD_REQUEST",
+                            "refusing to bind a device to root without --allow-root",
+                        );
+                    }
+                    owner
+                }
+                (None, _) => {
+                    return ControlResponse::err(
+                        "BAD_REQUEST",
+                        "root must pass --owner USER; root is not an implicit owner",
+                    )
+                }
+                (Some(me), Some(owner)) if owner == me => owner,
+                (Some(me), Some(_)) => {
+                    return ControlResponse::err(
+                        "CONTEXT_MISMATCH",
+                        format!(
+                            "caller is {me}; a device can only be paired for the invoking user"
+                        ),
+                    )
+                }
+                (Some(me), None) => me.to_owned(),
+            };
+            if allow_root && viewer.is_some() {
+                return ControlResponse::err(
+                    "CONTEXT_MISMATCH",
+                    "only root may allow a device to authenticate root",
+                );
+            }
+            match engine.begin_pairing_with_mode(code, mode, owner, allow_root, peer_key) {
                 Ok((chosen, expires_at)) => ControlResponse::ok(serde_json::json!({
                     "chosen_code": chosen,
                     "expires_at": expires_at,
@@ -218,10 +282,27 @@ async fn dispatch(
         }
 
         ControlRequest::ConfirmPairing { code } => {
+            if engine.pairing_active() && !engine.pairing_opened_by(&peer_key) {
+                return ControlResponse::err(
+                    "PERMISSION_DENIED",
+                    "this pairing session was opened by another user",
+                );
+            }
             match engine.confirm_pairing_with_code(code.as_deref()) {
                 Ok(()) => ControlResponse::ok(serde_json::json!({ "confirmed": true })),
                 Err(e) => ControlResponse::from_protocol_error(&e),
             }
+        }
+
+        ControlRequest::CancelPairing => {
+            if engine.pairing_active() && peer.uid != 0 && !engine.pairing_opened_by(&peer_key) {
+                return ControlResponse::err(
+                    "PERMISSION_DENIED",
+                    "this pairing session was opened by another user",
+                );
+            }
+            engine.cancel_pairing();
+            ControlResponse::ok(serde_json::json!({ "cancelled": true }))
         }
 
         ControlRequest::Authenticate {

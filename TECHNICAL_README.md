@@ -611,7 +611,7 @@ Linux should be able to list, revoke, and rename paired devices.
 Example:
 
 ```text
-Paired authenticators:
+List of authenticators paired
 
 Pixel 9
   ID: 7e8f...
@@ -1024,7 +1024,7 @@ $ rba devices
 Output:
 
 ```text
-Paired authenticators:
+List of authenticators paired
 
   Pixel 9
   id: 7e8f...

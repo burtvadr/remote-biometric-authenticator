@@ -39,7 +39,8 @@ rba doctor
 
 rba devices [<device>] [-l|--long]
 rba devices rename <device> <name>
-rba pair [--transport wifi|adb] [--code-entry device|host] [--timeout SECONDS]
+rba pair [--transport wifi|adb] [--code-entry device|host] [--owner USER]
+         [--allow-root] [--timeout SECONDS]
 rba connect [<device>] [--transport wifi|adb]
 rba disconnect [<device>]
 rba unpair <device> [--yes]
@@ -161,23 +162,27 @@ are separate until the protocol confirms both.
 
 ```text
 $ rba pair
-Pairing open for 120s.
-Start pairing on the device.
-
-Code: 123456   (type this on the device)
-
-Paired. Pixel 8
+Waiting for device... (120s)
+Code: 123456  type this on the device
+Host side complete; finish on the device.
 ```
 
-- One bounded session, one code, one result.
+- One bounded session, one progress line, one code line, one result. No box art
+  and no host `[y/N]`: running `pair` is the operator's decision, and the device's
+  typed code (or Allow) is the human gate. Ctrl-C cancels the session.
 - Default code entry is `device`: the host shows the code, the device types it.
-- `--code-entry host` reverses the direction; the device shows it and the terminal
-  asks for it.
-- The CLI must not print `Paired.` until the device has confirmed the pairing.
-  Until a `PAIRING_CONFIRMED` message exists, it must say "host side complete;
-  waiting for the device" rather than overclaim.
+- `--code-entry host` reverses the direction, like `adb pair`: the device shows
+  the code and the terminal prompts `Enter pairing code:`.
+- The CLI does not print `Paired` until the device has confirmed. Until a
+  `PAIRING_CONFIRMED` message exists it says `Host side complete; finish on the
+  device` and leaves the final state to `rba devices`.
 - `--transport adb` uses ADB only as a pipe. ADB's own pairing code is never used
   as the rba trust code.
+- The device is bound to the account that pairs it. `--owner` defaults to the
+  invoking user; a normal user may only name themselves. Root must pass
+  `--owner USER` explicitly, and `--allow-root` is a separate opt-in that lets the
+  device authenticate `root`. Without it, root is denied. No group membership or
+  re-login is needed to run any of this.
 
 ## Authentication
 
@@ -197,6 +202,9 @@ not unlock the screen and does not authorize `sudo`.
 - Default user is the current user.
 - A normal user may only request their own account. Root may request another
   account; the daemon enforces this, not the CLI.
+- Independently, the selected device must be bound to the requested account.
+  A device paired for alice is refused for bob or root even when root is the
+  caller; root needs a device paired with `--allow-root`.
 - Default purpose is `cli`, so direct CLI use is distinguishable from PAM's
   `sudo`, `gdm` or `polkit` requests. `--purpose` exists for integration tests and
   advanced use.

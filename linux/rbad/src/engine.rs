@@ -27,7 +27,7 @@ use rba_protocol::verifier;
 use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::audit::{AuditLog, Event};
-use crate::registry::{DeviceStatus, HostIdentity, Registry};
+use crate::registry::{DevicePolicy, DeviceStatus, HostIdentity, Registry};
 
 /// A currently connected device.
 #[derive(Clone, Debug)]
@@ -137,6 +137,10 @@ struct ActivePairing {
     expires_at: u64,
     /// Rate-limit key this session was opened against.
     peer_key: String,
+    /// Linux account the new device will be bound to.
+    owner: String,
+    /// Whether the operator explicitly allowed this device to authenticate root.
+    allow_root: bool,
 }
 
 impl ActivePairing {
@@ -296,6 +300,19 @@ impl Engine {
             .unwrap_or(false)
     }
 
+    /// True when `peer_key` is the caller that opened the live pairing session.
+    ///
+    /// Pairing codes and confirmation belong to one local principal. Another
+    /// local user must not be able to read the code, confirm the session, or
+    /// cancel it by entering a wrong value.
+    pub fn pairing_opened_by(&self, peer_key: &str) -> bool {
+        self.pairing
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|a| a.peer_key == peer_key))
+            .unwrap_or(false)
+    }
+
     /// Removes a device, but only if `conn_id` is still the live connection.
     ///
     /// Returns whether anything was removed. A disconnect that arrives after the
@@ -400,16 +417,19 @@ impl Engine {
     pub fn begin_pairing(
         self: &Arc<Self>,
         code: Option<String>,
+        owner: String,
         peer_key: String,
     ) -> Result<(Option<String>, u64)> {
-        self.begin_pairing_with_mode(code, CodeEntry::Device, peer_key)
+        self.begin_pairing_with_mode(code, CodeEntry::Device, owner, false, peer_key)
     }
 
-    /// Opens a pairing session with an explicit code-entry direction.
+    /// Opens a pairing session with an explicit code-entry direction and owner.
     pub fn begin_pairing_with_mode(
         self: &Arc<Self>,
         code: Option<String>,
         code_entry: CodeEntry,
+        owner: String,
+        allow_root: bool,
         peer_key: String,
     ) -> Result<(Option<String>, u64)> {
         let now = rba_protocol::unix_now();
@@ -464,6 +484,8 @@ impl Engine {
                 started_at: now,
                 expires_at,
                 peer_key,
+                owner,
+                allow_root,
             });
             self.audit.write(&Event::new("pairing_started"));
             Ok((chosen, expires_at))
@@ -734,6 +756,11 @@ impl Engine {
             ));
         }
 
+        // The owner was fixed when the local operator opened the session. The
+        // device cannot influence it, and a different local caller cannot take
+        // the session over.
+        let owner = active.owner.clone();
+        let allow_root = active.allow_root;
         let mut session = active.session;
         session.derive_with_device_ephemeral(
             &self.host.host_id,
@@ -797,12 +824,17 @@ impl Engine {
             }
         }
         // Only now is anything persisted.
-        reg.upsert_paired_with_token(
+        let policy = DevicePolicy {
+            users: vec![owner.clone()],
+            allow_root,
+        };
+        reg.upsert_paired_full(
             submit.device_id,
             &submit.device_name,
             &submit.device_pubkey,
             now,
             Some(&revocation_token_hash),
+            &policy,
         )
         .map_err(|e| {
             self.audit
@@ -816,6 +848,11 @@ impl Engine {
                 kind: "paired",
                 device_id: Some(submit.device_id.to_hex()),
                 device_name: Some(submit.device_name.clone()),
+                username: Some(owner),
+                detail: Some(format!(
+                    "root={}",
+                    if allow_root { "allowed" } else { "denied" }
+                )),
                 ..Event::new("paired")
             }
             .success(),
@@ -899,13 +936,26 @@ impl Engine {
         let device_selector = device_selector.map(|s| s.to_owned());
         let now = rba_protocol::unix_now();
 
-        // Resolve and authorise the device *before* consuming a challenge.
-        let (device_id, device_name, _key_id) = self.resolve_device(device_selector.as_deref())?;
+        // Resolve and authorise the device *before* consuming a challenge. The
+        // account binding is part of resolution: a device paired for alice must
+        // never be asked to approve bob, even when root is the caller.
+        let (device_id, device_name, _key_id) = self
+            .resolve_device(device_selector.as_deref(), Some(&username))
+            .map_err(|e| {
+                self.audit.write(
+                    &Event::new("auth")
+                        .denied(e.code().as_str())
+                        .username(&username)
+                        .purpose(&purpose)
+                        .detail(e.to_string()),
+                );
+                e
+            })?;
         let public_key: PublicKey = self
             .registry
             .lock()
             .expect("registry mutex")
-            .resolve_authenticating(&device_id)?;
+            .resolve_authenticating_for(&device_id, &username)?;
         let handle = {
             let devs = self.devices.lock().expect("devices mutex");
             devs.get(&device_id).cloned()
@@ -1244,8 +1294,20 @@ impl Engine {
     }
 
     /// Finds a device by id or name and returns `(id, name, key_id)`.
-    pub fn resolve_device(&self, selector: Option<&str>) -> Result<(Id, String, String)> {
+    ///
+    /// `for_user` is the account the caller is entitled to authenticate. When it
+    /// is `Some`, devices not bound to that account are invisible to selection;
+    /// `None` is the root/administrative view.
+    pub fn resolve_device(
+        &self,
+        selector: Option<&str>,
+        for_user: Option<&str>,
+    ) -> Result<(Id, String, String)> {
         let reg = self.registry.lock().expect("registry mutex");
+        let allowed = |rec: &crate::registry::DeviceRecord| {
+            rec.status.may_authenticate()
+                && for_user.map_or(true, |user| rec.may_authenticate_user(user))
+        };
         match selector {
             None => {
                 // Prefer a connected, paired device; otherwise report that none
@@ -1255,7 +1317,7 @@ impl Engine {
                 candidates.sort();
                 for id in candidates {
                     if let Some(rec) = reg.get(id) {
-                        if rec.status.may_authenticate() {
+                        if allowed(rec) {
                             return Ok((*id, rec.name.clone(), rec.key_id()?));
                         }
                     }
@@ -1264,14 +1326,34 @@ impl Engine {
             }
             Some(sel) => {
                 if let Ok(id) = Id::from_hex(sel) {
-                    if let Some(rec) = reg.get(&id) {
-                        return Ok((id, rec.name.clone(), rec.key_id()?));
+                    let rec = reg.get(&id).ok_or(ProtocolError::NotPaired)?;
+                    // Report lifecycle state precisely before the account filter,
+                    // so a revoked device is `Revoked`, not a policy mismatch.
+                    match rec.status {
+                        DeviceStatus::Revoked => return Err(ProtocolError::Revoked),
+                        DeviceStatus::Pairing | DeviceStatus::Replaced => {
+                            return Err(ProtocolError::NotPaired)
+                        }
+                        DeviceStatus::Paired => {}
                     }
-                    return Err(ProtocolError::NotPaired);
+                    if !allowed(rec) {
+                        return Err(ProtocolError::ContextMismatch(format!(
+                            "device {} is not authorized for this user",
+                            rec.name
+                        )));
+                    }
+                    return Ok((id, rec.name.clone(), rec.key_id()?));
                 }
-                let matches = reg.by_name(sel);
+                let mut matches = Vec::new();
+                for rec in reg.by_name(sel) {
+                    if allowed(rec) {
+                        matches.push(rec);
+                    }
+                }
                 match matches.len() {
-                    0 => Err(ProtocolError::NotPaired),
+                    0 => Err(ProtocolError::ContextMismatch(format!(
+                        "device {sel:?} is not authorized for this user"
+                    ))),
                     1 => {
                         let rec = matches[0];
                         Ok((rec.id()?, rec.name.clone(), rec.key_id()?))
@@ -1284,7 +1366,7 @@ impl Engine {
         }
     }
 
-    pub fn list_devices(&self) -> Vec<serde_json::Value> {
+    pub fn list_devices(&self, viewer: Option<&str>) -> Vec<serde_json::Value> {
         let connected: Vec<Id> = self
             .connected_devices()
             .iter()
@@ -1295,6 +1377,7 @@ impl Engine {
             .expect("registry mutex")
             .all()
             .into_iter()
+            .filter(|rec| viewer.map_or(true, |user| rec.is_bound_to(user)))
             .map(|rec| {
                 let id = rec.id().unwrap_or_default();
                 serde_json::json!({
@@ -1302,6 +1385,8 @@ impl Engine {
                     "name": rec.name,
                     "key_id": rec.key_id().unwrap_or_default(),
                     "status": rec.status.as_str(),
+                    "users": rec.policy.users,
+                    "allow_root": rec.policy.allow_root,
                     "available": connected.contains(&id),
                     "added_at": rec.added_at,
                     "last_seen": rec.last_seen,
@@ -1313,7 +1398,7 @@ impl Engine {
     }
 
     pub fn revoke_device(&self, selector: &str) -> Result<String> {
-        let (id, name, _) = self.resolve_device(Some(selector))?;
+        let (id, name, _) = self.resolve_device(Some(selector), None)?;
         self.registry.lock().expect("registry mutex").revoke(&id)?;
         // Drop the live connection too: revocation must take effect immediately,
         // not at the next reconnect. Unconditional on purpose: revocation targets the
@@ -1329,14 +1414,45 @@ impl Engine {
         Ok(name)
     }
 
-    pub fn status(&self) -> serde_json::Value {
-        let pairing = self.pairing_code();
+    /// Status filtered to the caller's own devices.
+    ///
+    /// `viewer` is `None` for root. `peer_key` decides whether the open pairing
+    /// session belongs to this caller, so another local user cannot use status
+    /// to watch a pairing they did not start.
+    pub fn status(&self, viewer: Option<&str>, peer_key: &str) -> serde_json::Value {
+        let connected = self.connected_devices();
+        let (paired_devices, connected_devices) = {
+            let reg = self.registry.lock().expect("registry mutex");
+            let paired = reg
+                .all()
+                .iter()
+                .filter(|r| {
+                    r.status.may_authenticate() && viewer.map_or(true, |user| r.is_bound_to(user))
+                })
+                .count();
+            let connected = connected
+                .iter()
+                .filter(|h| {
+                    viewer.map_or(true, |user| {
+                        reg.get(&h.device_id)
+                            .map(|r| r.is_bound_to(user))
+                            .unwrap_or(false)
+                    })
+                })
+                .count();
+            (paired, connected)
+        };
+        let pairing = if viewer.is_none() || self.pairing_opened_by(peer_key) {
+            self.pairing_code()
+        } else {
+            None
+        };
         serde_json::json!({
             "host_id": self.host.host_id.to_hex(),
             "host_key_id": self.host.public_key().key_id_hex(),
             "host_name": self.host_name,
-            "paired_devices": self.registry.lock().map(|r| r.paired_count()).unwrap_or(0),
-            "connected_devices": self.connected_devices().len(),
+            "paired_devices": paired_devices,
+            "connected_devices": connected_devices,
             // The code itself is only obtainable via the pairing_code command, so a
             // status dump never puts it into a log or a terminal scrollback.
             "pairing": pairing.map(|(_code, expires)| serde_json::json!({
@@ -1415,7 +1531,7 @@ mod tests {
         let device_id = Id::random().expect("random");
         let mut registry = Registry::in_memory();
         registry
-            .upsert_paired(device_id, "Pixel", &device_key.public_key(), 100)
+            .upsert_paired_for_user(device_id, "Pixel", &device_key.public_key(), 100, "alice")
             .expect("pair");
         let engine = Engine::new(host, registry, AuditLog::null(), "test-host".into());
         (

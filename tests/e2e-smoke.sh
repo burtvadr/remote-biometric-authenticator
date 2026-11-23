@@ -33,10 +33,10 @@ echo "daemon pid $DAEMON_PID on port $PORT"
 CTL_SOCK="--socket $SOCK"
 
 step "no authenticators paired yet"
-"$CTL" $CTL_SOCK devices | grep -q "No authenticators" || fail "expected an empty list"
+"$CTL" $CTL_SOCK devices | grep -q "List of authenticators paired" || fail "expected an empty list"
 
 step "pair"
-"$CTL" $CTL_SOCK pair --yes >"$WORK/pair.log" 2>&1 &
+"$CTL" $CTL_SOCK pair >"$WORK/pair.log" 2>&1 &
 PAIR_PID=$!
 sleep 1
 timeout 60 "$SIM" pair --host "127.0.0.1:$PORT" --name "Pixel 9" \

@@ -40,7 +40,7 @@ when the finding was first written.
 | SEC-001 | Pairing code is not bound to the public keys; an on-path attacker can substitute keys | Resolved |
 | SEC-002 | Pairing code was truncated to one HMAC byte, leaving only 256 values | Resolved (review retracted) |
 | SEC-003 | Broad `common-auth` deployment plus no per-request context creates an MFA-fatigue surface | Confirmed |
-| SEC-004 | No device-to-Linux-user binding; a paired device can approve another account's PAM request | Confirmed |
+| SEC-004 | No device-to-Linux-user binding; a paired device can approve another account's PAM request | Resolved |
 
 ### Medium
 
@@ -270,7 +270,7 @@ stack is enabled.
 ### SEC-004 — No device-to-Linux-user binding
 
 **Severity:** High  
-**Status:** Confirmed  
+**Status:** Resolved  
 **Source:** external review, 2026-11-18  
 **Aliases:** authorization scope, `su root`, per-user policy  
 **Affected:** `linux/rbad/src/registry.rs`,
@@ -306,6 +306,20 @@ changing the name, not against the device being authorised for the wrong account
 status; no username/UID field. `authorize_caller` allows peer UID 0 to request any
 username. The engine dispatches the requested username after signature
 verification, without a per-device policy check.
+
+**Remediation.** Every `DeviceRecord` now carries a `DevicePolicy`: an allow-list
+of Linux usernames plus an explicit `allow_root` flag. Pairing binds the device to
+the local principal that opened the session (`rba pair` defaults to the invoking
+user; root must pass `--owner USER`, and root authentication additionally requires
+`--allow-root`). `Engine::resolve_device` and `resolve_authenticating_for` enforce
+the binding before any challenge is issued, so a device paired for alice is
+refused for bob or root even when root is the caller and the signature would be
+valid. A record written before the policy existed deserialises to deny-all, so an
+upgrade forces a re-pair rather than silently widening trust. The binding is shown
+by `rba devices` (`users:` / `root:`). Tests:
+`a_device_paired_for_alice_cannot_authenticate_bob`,
+`a_device_paired_for_alice_cannot_authenticate_root_by_default`,
+`a_device_explicitly_allowed_can_authenticate_root`, and the registry policy tests.
 
 ---
 
@@ -353,10 +367,11 @@ does not verify the server's UID/GID or that the socket is the expected root-own
 path. `default_socket()` honours `RBA_SOCKET`, so the PAM stack's
 environment can redirect the module. The quick start uses `/tmp/...` paths.
 
-The systemd socket is mode `0660`, group `rba`, and the runtime directory
-is root-owned in the intended deployment, which limits casual impersonation. It
-does not make the client's trust explicit or protect against a same-group
-impersonator or an override.
+The control socket is mode `0666` (any local user may connect; each request is
+authorised from `SO_PEERCRED` and the device policy). Impersonation is limited by
+the runtime directory `/run/rba`, which systemd creates owned by the `rba` service
+account, so an unprivileged process cannot replace the socket file. That does not
+make the client's trust explicit or protect against an `RBA_SOCKET` override.
 
 **Impact.** A process able to place a socket at the configured path (or influence
 the PAM environment) could answer "authenticated" and bypass the real daemon.
@@ -657,9 +672,9 @@ A client with access to the control socket could stream without a newline and
 make the daemon buffer unboundedly before the check ran. The server also spawned
 one task per accepted connection with no cap or deadline.
 
-**Impact.** Local denial of service by a process in the `rba` group or
-root. The socket is not network-reachable, so this is not an unauthenticated
-remote attack.
+**Impact.** Local denial of service by any local process (the socket is
+world-connectable) or root. The socket is not network-reachable, so this is not an
+unauthenticated remote attack.
 
 **Remediation.** `read_request` now uses `fill_buf`/`consume`, rejects as soon as
 `MAX_REQUEST_BYTES` would be exceeded, and never allocates the complete body

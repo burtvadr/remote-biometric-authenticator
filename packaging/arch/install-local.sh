@@ -114,17 +114,9 @@ if [ ! -S /run/rba/control.sock ]; then
     exit 1
 fi
 
-echo "==> allowing the invoking user to use the control socket"
-install_user="${SUDO_USER:-}"
-if [ -n "$install_user" ] && [ "$install_user" != root ]; then
-    if ! id -nG "$install_user" | tr ' ' '\n' | grep -qx rba; then
-        usermod -aG rba "$install_user"
-        echo "added $install_user to the rba group; a new login is needed for"
-        echo "unprivileged rba access. Root/PAM can already connect."
-    fi
-else
-    echo "run this through sudo as the user who should use rba to add that account to the rba group"
-fi
+# No group setup: the control socket authorises each request from the caller's
+# kernel credentials and the device's account binding, so `rba` works for the
+# invoking user immediately, with no newgrp or re-login.
 
 echo
 echo "==> installed"

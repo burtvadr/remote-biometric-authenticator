@@ -824,19 +824,30 @@ relied upon.
 
 ## 14. Host-side local IPC contract
 
-The daemon exposes a Unix domain socket. Local authorisation decisions:
+The daemon exposes a Unix domain socket. It is connectable by **any local user**;
+filesystem permissions are not the user boundary. Every request is authorised from
+the caller's kernel credentials and the device's account binding. Local
+authorisation decisions:
 
 1. A request MUST be bound to the **verified peer credentials** (`SO_PEERCRED`),
    never to a username supplied in the request body.
 2. If the peer is not root, the requested `username` MUST resolve, via the
    local user database, to the same UID as the peer. Mismatch MUST deny with
    `CONTEXT_MISMATCH`.
-3. Only members of the `rba` group MAY open the socket.
-4. `username` is used for the *signed request context*; the *authenticated
+3. `username` is used for the *signed request context*; the *authenticated
    principal* is always the peer UID.
+4. A device MAY authenticate only the accounts in its host-side policy. Pairing
+   binds the device to the local principal that opened the session; `root` is
+   denied unless the operator explicitly opted in at pairing time. A request for
+   an account outside the policy MUST deny with `CONTEXT_MISMATCH` before any
+   challenge is issued, even when the peer is root.
+5. Pairing codes and confirmation belong to the principal that opened the
+   session; another local caller MUST NOT read, confirm or cancel it. Revocation
+   is root-only.
 
-This is what stops an unprivileged process from asking the daemon to
-authenticate as another user.
+Rules 1–3 stop an unprivileged process from asking the daemon to authenticate as
+another user. Rule 4 stops a paired device from becoming a host-wide approval
+oracle for accounts it was never paired to.
 
 ---
 

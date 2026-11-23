@@ -114,6 +114,8 @@ fun AuthenticatorScreen(
     deviceName: String,
     capabilities: DeviceAuthKey.Capabilities?,
     hosts: List<KnownHost>,
+    connectedHostId: io.github.burtvadr.rba.protocol.Id?,
+    discoveredKeyIds: Set<String>,
     background: BackgroundStatus,
     themeMode: ThemeMode,
     iconStyle: AppIconStyle,
@@ -162,6 +164,8 @@ fun AuthenticatorScreen(
                     deviceName = deviceName,
                     capabilities = capabilities,
                     hosts = hosts,
+                    connectedHostId = connectedHostId,
+                    discoveredKeyIds = discoveredKeyIds,
                     background = background,
                     iconStyle = iconStyle,
                     onForgetHost = onForgetHost,
@@ -242,6 +246,8 @@ private fun OverviewScreen(
     deviceName: String,
     capabilities: DeviceAuthKey.Capabilities?,
     hosts: List<KnownHost>,
+    connectedHostId: io.github.burtvadr.rba.protocol.Id?,
+    discoveredKeyIds: Set<String>,
     background: BackgroundStatus,
     iconStyle: AppIconStyle,
     onForgetHost: (io.github.burtvadr.rba.protocol.Id) -> Boolean,
@@ -278,6 +284,8 @@ private fun OverviewScreen(
         item {
             PairedHostsCard(
                 hosts = hosts,
+                connectedHostId = connectedHostId,
+                discoveredKeyIds = discoveredKeyIds,
                 onHostClick = { selectedHost = it },
                 onHowPairing = { showPairHelp = true },
             )
@@ -309,6 +317,7 @@ private fun OverviewScreen(
         HostDetailsDialog(
             host = host,
             authenticatorDeviceId = deviceId,
+            reachability = reachabilityOf(host, connectedHostId, discoveredKeyIds),
             onUnpair = onForgetHost,
             onDismiss = { selectedHost = null },
         )
@@ -447,9 +456,42 @@ private fun StatusPill(hostCount: Int, background: BackgroundStatus) {
     }
 }
 
+/**
+ * Per-host reachability, derived from the idle link and the last mDNS discovery.
+ * "Not seen" is deliberately not "offline": a host that is up but not advertising
+ * (guest network, multicast filtered) is also not seen.
+ */
+private enum class HostReachability { CONNECTED, AVAILABLE, NOT_SEEN }
+
+private fun reachabilityOf(
+    host: KnownHost,
+    connectedHostId: io.github.burtvadr.rba.protocol.Id?,
+    discoveredKeyIds: Set<String>,
+): HostReachability = when {
+    connectedHostId != null && host.hostId == connectedHostId -> HostReachability.CONNECTED
+    host.keyId in discoveredKeyIds -> HostReachability.AVAILABLE
+    else -> HostReachability.NOT_SEEN
+}
+
+@Composable
+private fun HostStatusBadge(reachability: HostReachability) {
+    val (label, color) = when (reachability) {
+        HostReachability.CONNECTED -> "Connected" to MaterialTheme.colorScheme.primary
+        HostReachability.AVAILABLE -> "Available" to MaterialTheme.colorScheme.secondary
+        HostReachability.NOT_SEEN -> "Not seen" to MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.size(7.dp).background(color, CircleShape))
+        Spacer(Modifier.width(5.dp))
+        Text(label, style = MaterialTheme.typography.labelSmall, color = color)
+    }
+}
+
 @Composable
 private fun PairedHostsCard(
     hosts: List<KnownHost>,
+    connectedHostId: io.github.burtvadr.rba.protocol.Id?,
+    discoveredKeyIds: Set<String>,
     onHostClick: (KnownHost) -> Unit,
     onHowPairing: () -> Unit,
 ) {
@@ -507,7 +549,13 @@ private fun PairedHostsCard(
                             )
                         },
                         trailingContent = {
-                            Icon(Icons.Outlined.ChevronRight, contentDescription = null)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                HostStatusBadge(
+                                    reachabilityOf(host, connectedHostId, discoveredKeyIds)
+                                )
+                                Spacer(Modifier.width(4.dp))
+                                Icon(Icons.Outlined.ChevronRight, contentDescription = null)
+                            }
                         },
                         colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                         modifier = Modifier.clickable { onHostClick(host) },
@@ -1007,6 +1055,7 @@ private fun PairingHelpDialog(onDismiss: () -> Unit) {
 private fun HostDetailsDialog(
     host: KnownHost,
     authenticatorDeviceId: String,
+    reachability: HostReachability,
     onUnpair: (io.github.burtvadr.rba.protocol.Id) -> Boolean,
     onDismiss: () -> Unit,
 ) {
@@ -1017,6 +1066,14 @@ private fun HostDetailsDialog(
             title = { Text(host.hostName) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    DialogField(
+                        "Status",
+                        when (reachability) {
+                            HostReachability.CONNECTED -> "Connected"
+                            HostReachability.AVAILABLE -> "Available on the network"
+                            HostReachability.NOT_SEEN -> "Not seen recently"
+                        },
+                    )
                     DialogField("Host ID", host.hostId.toHex(), monospace = true)
                     DialogField("Key ID", host.keyId, monospace = true)
                     DialogField(

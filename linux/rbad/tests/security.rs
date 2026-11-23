@@ -76,10 +76,29 @@ impl Fixture {
     }
 
     async fn paired_with(tag: &str, engine: Arc<Engine>) -> Fixture {
+        Fixture::paired_with_options(tag, engine, false).await
+    }
+
+    /// Pairs for alice with an explicit root opt-in. Used to prove that the
+    /// default denial is a policy decision, not a missing code path.
+    async fn paired_allowing_root(tag: &str) -> Fixture {
+        let (engine, audit) = recording_engine(tag);
+        let mut f = Fixture::paired_with_options(tag, engine, true).await;
+        f.audit = Some(audit);
+        f
+    }
+
+    async fn paired_with_options(tag: &str, engine: Arc<Engine>, allow_root: bool) -> Fixture {
         let device = Arc::new(DeviceKey::generate(tag).expect("keygen"));
 
         engine
-            .begin_pairing(None, "test".into())
+            .begin_pairing_with_mode(
+                None,
+                CodeEntry::Device,
+                "alice".into(),
+                allow_root,
+                "test".into(),
+            )
             .expect("pairing opens");
 
         let (host_side, device_side) = tokio::io::duplex(64 * 1024);
@@ -119,7 +138,7 @@ impl Fixture {
             .expect("connection closed cleanly");
 
         assert_eq!(
-            engine.list_devices().len(),
+            engine.list_devices(None).len(),
             1,
             "exactly one device must be paired"
         );
@@ -236,24 +255,29 @@ async fn authenticate_once(
     behaviour: Behaviour,
     timeout_ms: u64,
 ) -> Result<AuthOutcome, ProtocolError> {
+    authenticate_as(f, "alice", behaviour, timeout_ms).await
+}
+
+/// Runs one authentication for an arbitrary account. `local_uid: 0` models a
+/// root PAM caller, which is allowed to *ask* for any account; the device policy
+/// is the second, independent decision.
+async fn authenticate_as(
+    f: &Fixture,
+    username: &str,
+    behaviour: Behaviour,
+    timeout_ms: u64,
+) -> Result<AuthOutcome, ProtocolError> {
     let pair = connect(f, behaviour).await;
     let result = tokio::time::timeout(
         TEST_TIMEOUT,
         f.engine.authenticate(AuthContext {
             local_uid: 0,
-
-            username: "alice",
-
+            username,
             purpose: "sudo",
-
             service: "sudo",
-
             operation: "authenticate",
-
             device_selector: Some(&f.device_selector()),
-
             timeout_ms,
-
             transport_pref: Transport::Wifi,
         }),
     )
@@ -313,6 +337,49 @@ async fn a_paired_device_authenticates() {
         .expect("a genuine approval must authenticate");
     assert!(out.ok);
     assert_eq!(out.device_id, f.device.device_id);
+}
+
+/// SEC-004: a device is an authenticator for the account that paired it, not a
+/// host-wide approval oracle. Root asking for another user must still be refused.
+#[tokio::test]
+async fn a_device_paired_for_alice_cannot_authenticate_bob() {
+    let f = Fixture::paired("user-binding").await;
+    let err = authenticate_as(&f, "bob", Behaviour::Approve, 5000)
+        .await
+        .expect_err("a device bound to alice must never approve bob");
+    assert_eq!(err.code(), ErrorCode::ContextMismatch);
+    assert_eq!(
+        f.engine.pending_count(),
+        0,
+        "the request must be refused before it reaches the device"
+    );
+    assert!(
+        f.engine.list_devices(Some("bob")).is_empty(),
+        "bob must not see a device that is not his"
+    );
+    assert_eq!(f.engine.list_devices(Some("alice")).len(), 1);
+    assert_eq!(f.engine.list_devices(None).len(), 1);
+}
+
+/// Root is not implicit. The same valid device that approves alice must be
+/// refused for root until the operator pairs it with `--allow-root`.
+#[tokio::test]
+async fn a_device_paired_for_alice_cannot_authenticate_root_by_default() {
+    let f = Fixture::paired("root-default-deny").await;
+    let err = authenticate_as(&f, "root", Behaviour::Approve, 5000)
+        .await
+        .expect_err("root must be denied unless the device explicitly allows it");
+    assert_eq!(err.code(), ErrorCode::ContextMismatch);
+    assert_eq!(f.engine.pending_count(), 0);
+}
+
+#[tokio::test]
+async fn a_device_explicitly_allowed_can_authenticate_root() {
+    let f = Fixture::paired_allowing_root("root-explicit").await;
+    let out = authenticate_as(&f, "root", Behaviour::Approve, 5000)
+        .await
+        .expect("an explicitly root-capable device must work");
+    assert!(out.ok);
 }
 
 #[tokio::test]
@@ -588,16 +655,16 @@ async fn an_unprivileged_caller_cannot_authenticate_as_another_user() {
 async fn pairing_cannot_be_started_by_a_second_caller_while_one_is_open() {
     let engine = new_engine();
     engine
-        .begin_pairing(None, "caller-a".into())
+        .begin_pairing(None, "alice".into(), "caller-a".into())
         .expect("first opens");
     let err = engine
-        .begin_pairing(None, "caller-b".into())
+        .begin_pairing(None, "alice".into(), "caller-b".into())
         .expect_err("pairing must never be permanent or doubled up");
     assert_eq!(err.code(), ErrorCode::BadRequest);
     // Once expired or cancelled, a new session is allowed.
     engine.cancel_pairing();
     engine
-        .begin_pairing(None, "caller-b".into())
+        .begin_pairing(None, "alice".into(), "caller-b".into())
         .expect("new session");
 }
 
@@ -606,7 +673,10 @@ async fn pairing_is_rate_limited() {
     let engine = new_engine();
     let mut ok = 0;
     for _ in 0..12 {
-        if engine.begin_pairing(None, "same-peer".into()).is_ok() {
+        if engine
+            .begin_pairing(None, "alice".into(), "same-peer".into())
+            .is_ok()
+        {
             ok += 1;
         }
         engine.cancel_pairing();
@@ -644,7 +714,7 @@ async fn host_entry_mode_requires_the_correct_code_before_persisting() {
     let engine = new_engine();
     let device = Arc::new(DeviceKey::generate("host-entry").unwrap());
     engine
-        .begin_pairing_with_mode(None, CodeEntry::Host, "test".into())
+        .begin_pairing_with_mode(None, CodeEntry::Host, "alice".into(), false, "test".into())
         .expect("pairing opens");
     assert_eq!(engine.pairing_code_entry(), Some(CodeEntry::Host));
 
@@ -686,7 +756,7 @@ async fn host_entry_mode_requires_the_correct_code_before_persisting() {
         .expect_err("a wrong host-entered code must be refused");
     assert_eq!(err.code(), ErrorCode::ContextMismatch);
     assert!(
-        engine.list_devices().is_empty(),
+        engine.list_devices(None).is_empty(),
         "a wrong code must not create a device record"
     );
     assert!(
@@ -710,7 +780,7 @@ async fn pairing_without_operator_confirmation_never_persists_anything() {
     let engine = new_engine();
     let device = Arc::new(DeviceKey::generate("unconfirmed").unwrap());
     engine
-        .begin_pairing(None, "test".into())
+        .begin_pairing(None, "alice".into(), "test".into())
         .expect("pairing opens");
 
     let (host_side, device_side) = tokio::io::duplex(64 * 1024);
@@ -744,7 +814,7 @@ async fn pairing_without_operator_confirmation_never_persists_anything() {
     wait_for_phase(&engine, PairingPhase::AwaitingConfirmation).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
-        engine.list_devices().is_empty(),
+        engine.list_devices(None).is_empty(),
         "an unconfirmed pairing must not create a device record"
     );
 

@@ -3,7 +3,8 @@
 This is a living roadmap. It records what is supported **today**, what is
 explicitly not promised, and the order in which new platform and protocol work
 should happen. Security findings from [`security-audit.md`](security-audit.md)
-take precedence over feature work.
+take precedence over feature work. Version bumps and what each may break are
+governed by [`versioning.md`](versioning.md).
 
 ## Current support
 
@@ -16,6 +17,7 @@ take precedence over feature work.
 | Service manager | systemd unit + Unix control socket. |
 | Build | Debug-signed APK; no release-signed/non-debuggable build. |
 | Protocol | Canonical CBOR, P-256 signatures, pinned TLS, pairing code, revocation tokens. |
+| Connection visibility | `rba devices` shows `link: available / not connected`; TCP keepalive notices a silently-dead device in ~1 min. The app shows each paired host as **Connected / Available / Not seen**. |
 
 The real fingerprint reader works at GDM because `gdm-fingerprint` uses
 `pam_fprintd`; it is not using this project. `pkexec` and `systemctl` use
@@ -96,7 +98,8 @@ Installing this integration is an **administrator action**, not a user action:
   (overlay, package layering, rpm-ostree, transactional update). The mechanism
   changes; the privilege requirement does not.
 - An admin can install it once; daily pairing and use do not require root. The
-  user only needs access to the control socket (the `rba` group).
+  control socket authorises each request from the caller's kernel credentials and
+  the device's account binding, so no group membership or re-login is needed.
 
 At the **GDM login screen there is no active user session**. The greeter runs as
 `gdm`; the user selects an account, and the system PAM stack authenticates that
@@ -750,7 +753,7 @@ casual tampering; it cannot protect against a rooted or compromised OS.
 The PC does not need `sudo` to change a user's own policy if the daemon enforces
 peer identity:
 
-- A local client connects to the root/`rba` control socket.
+- A local client connects to the control socket (world-connectable; no group).
 - The daemon reads `SO_PEERCRED` and only permits that UID to change its own
   policy.
 - Per-user policy is stored atomically with mode `0600` and audited.
@@ -1080,10 +1083,9 @@ Problems:
 - The boxed code is noisy, and the important value is buried in prose.
 - The command exits as soon as the host side is done, without saying whether the
   device stored the host. A user has to guess from the app.
-- `sudo` or a fresh group login is needed for the control socket, and the error
-  does not explain the stale-group case. `rba pair` should work as the
-  desktop user, and a permission failure should print the exact `newgrp`/re-login
-  hint.
+- ~~`sudo` or a fresh group login is needed for the control socket.~~ Resolved:
+  the socket authorises each request from `SO_PEERCRED` and the device policy, so
+  `rba pair` works as the desktop user with no group membership or re-login.
 - `list` is a prose dump, not a stable table, and there is no single place to see
   `paired / connected / pending / revoked`.
 - `--yes` is a footgun that exists only to skip a redundant prompt.
@@ -1149,19 +1151,23 @@ Until that exists, the CLI must not claim the pairing is complete; it should say
 
 ### Acceptance criteria
 
-- [ ] `rba pair` is one command, one code line, one final result.
-- [ ] No default `[y/N]` and no `--yes` requirement.
-- [ ] No `Paired`/`Host record saved` text before the device confirms.
+- [x] `rba pair` is one command, one progress line, one code line, one result.
+- [x] No default `[y/N]` and no `--yes` requirement; the confirmation is sent
+      automatically and the device's typed code / Allow is the human gate.
+- [x] No `Paired`/`Host record saved` text before the device confirms; the CLI
+      says `Host side complete; finish on the device`.
+- [x] Ctrl-C cancels the session (`CancelPairing`), exit `130`, no record left.
 - [ ] Pending records are separate from paired records and are cleaned on
       timeout, rejection, mismatch or disconnect.
 - [ ] Device-to-host `PAIRING_CONFIRMED` is specified, implemented in Rust and
-      Kotlin, and covered by vectors.
-- [ ] `rba devices` prints a stable table.
-- [ ] Permission denied explains `newgrp rba` / re-login, and normal
-      pairing works without `sudo` for a user in the `rba` group.
+      Kotlin, and covered by vectors. This is what lets the CLI print `Paired`.
+- [ ] `rba devices` prints a stable column table (header is in place; rows are
+      still a per-device block).
+- [x] Normal pairing works without `sudo`, group membership or re-login; the
+      socket authorises each request from the caller's credentials.
 - [ ] `rba unpair <device>` is a first-class command, not only a hidden
       daemon operation.
-- [ ] README and `docs/pairing.md` use the real command transcript.
+- [x] README uses the real command transcript.
 
 ## Proposed refactor: centralized `rba` CLI and host backends
 
