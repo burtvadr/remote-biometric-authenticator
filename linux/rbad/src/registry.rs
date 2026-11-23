@@ -412,6 +412,16 @@ impl Registry {
         self.save()
     }
 
+    /// Marks a device `Replaced`: retained for audit, no longer usable.
+    /// Used by `rba unpair`, where the operator removes trust but the record
+    /// stays visible for forensics.
+    pub fn unpair(&mut self, id: &Id) -> Result<()> {
+        let rec = self.devices.get_mut(id).ok_or(ProtocolError::NotPaired)?;
+        rec.status = DeviceStatus::Replaced;
+        self.dirty = true;
+        self.save()
+    }
+
     /// Revokes the device whose revocation-token hash matches, if any.
     ///
     /// The token is a bearer capability; no device identity or signature is

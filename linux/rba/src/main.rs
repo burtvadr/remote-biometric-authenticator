@@ -24,6 +24,7 @@ fn usage_text() -> String {
          \x20   status                    daemon status\n\
          \x20   pair                      pair a device; one side shows the code, the other types it\n\
          \x20   auth --user U             ask a device to authenticate a Linux user\n\
+         \x20   unpair --device D         remove trust for a device (owner or root)\n\
          \x20   revoke --device D         revoke an authenticator immediately (root only)\n\
          \x20   version                   print the product and protocol version\n\
          \x20   help                      show this help\n\
@@ -253,16 +254,45 @@ fn cmd_devices(args: &Args) {
         .and_then(|d| d.as_array())
         .cloned()
         .unwrap_or_default();
-    // adb-style: a constant header, then the rows. An empty list is just the
-    // header, not prose telling the user what to do next.
+    // adb-style: a constant header, then fixed-width rows. An empty list is just
+    // the header.
     println!("List of authenticators paired");
     if devices.is_empty() {
         return;
     }
     println!();
+    println!(
+        "{:<22} {:<12} {:<10} {:<12} {:<14} LINK",
+        "DEVICE", "ID", "STATE", "USERS", "ROOT"
+    );
     for d in &devices {
+        let name = d
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(unnamed)");
+        let id = d.get("device_id").and_then(|v| v.as_str()).unwrap_or("-");
         let status = d.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-        let avail = if d
+        let users = d
+            .get("users")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "-".into());
+        let root = if d
+            .get("allow_root")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            "allowed"
+        } else {
+            "denied"
+        };
+        let link = if d
             .get("available")
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
@@ -272,54 +302,14 @@ fn cmd_devices(args: &Args) {
             "not connected"
         };
         println!(
-            "  {}",
-            d.get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("(unnamed)")
+            "{:<22} {:<12} {:<10} {:<12} {:<14} {}",
+            name.chars().take(22).collect::<String>(),
+            id.chars().take(12).collect::<String>(),
+            status,
+            users.chars().take(12).collect::<String>(),
+            root,
+            link
         );
-        println!(
-            "    id:      {}",
-            d.get("device_id").and_then(|v| v.as_str()).unwrap_or("-")
-        );
-        let key = d.get("key_id").and_then(|v| v.as_str()).unwrap_or("");
-        println!(
-            "    key:     SHA256:{}...",
-            key.chars().take(16).collect::<String>()
-        );
-        println!("    status:  {status}");
-        let users = d
-            .get("users")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "(none)".into());
-        println!("    users:   {users}");
-        println!(
-            "    root:    {}",
-            if d.get("allow_root")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
-                "allowed"
-            } else {
-                "denied"
-            }
-        );
-        println!("    link:    {avail}");
-        println!(
-            "    paired:  {}",
-            d.get("summary")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.lines().find(|l| l.contains("paired:")))
-                .map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string())
-                .unwrap_or_default()
-        );
-        println!();
     }
 }
 
@@ -367,6 +357,23 @@ fn cmd_status(args: &Args) {
             }
             _ => println!("pairing       closed"),
         }
+    }
+    // Local integration state: which PAM stacks reference pam_rba.
+    println!();
+    println!("integrations:");
+    for (name, path) in [
+        ("gdm", "/etc/pam.d/gdm-password"),
+        ("polkit", "/etc/pam.d/polkit-1"),
+        ("sudo", "/etc/pam.d/sudo"),
+    ] {
+        let enabled = std::fs::read_to_string(path)
+            .map(|s| s.contains("pam_rba.so"))
+            .unwrap_or(false);
+        println!(
+            "  {:<8} {}",
+            name,
+            if enabled { "enabled" } else { "disabled" }
+        );
     }
 }
 
@@ -561,6 +568,21 @@ fn cmd_revoke(args: &Args) {
     }
 }
 
+fn cmd_unpair(args: &Args) {
+    let Some(device) = args.device.clone() else {
+        eprintln!("rba: --device is required");
+        std::process::exit(2);
+    };
+    match request(args, &ControlRequest::Unpair { device }) {
+        Ok(r) if r.ok => println!("Unpaired."),
+        Ok(r) => fail(&r),
+        Err(e) => {
+            eprintln!("rba: {e}");
+            std::process::exit(1)
+        }
+    }
+}
+
 fn cmd_version() {
     println!(
         "Remote Biometric Authenticator (rba) {}",
@@ -588,6 +610,7 @@ fn main() {
         "pair" => cmd_pair(&args),
         "auth" => cmd_auth(&args),
         "revoke" => cmd_revoke(&args),
+        "unpair" => cmd_unpair(&args),
         "version" => cmd_version(),
         "help" => help(),
         other => {

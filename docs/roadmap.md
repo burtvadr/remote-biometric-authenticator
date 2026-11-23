@@ -1276,14 +1276,14 @@ Until that exists, the CLI must not claim the pairing is complete; it should say
       timeout, rejection, mismatch or disconnect.
 - [ ] Device-to-host `PAIRING_CONFIRMED` is specified, implemented in Rust and
       Kotlin, and covered by vectors. This is what lets the CLI print `Paired`.
-- [ ] `rba devices` prints a stable column table (header is in place; rows are
-      still a per-device block).
+- [x] `rba devices` prints a stable column table (DEVICE, ID, STATE, USERS,
+      ROOT, LINK).
 - [x] Normal pairing works without `sudo`, group membership or re-login; the
       socket authorises each request from the caller's credentials.
-- [ ] `rba unpair <device>` is a first-class command, not only a hidden
-      daemon operation.
-- [ ] `rba status` shows enabled PAM backends (gdm, polkit, sudo) and their
-      installed/enabled state, so an operator can confirm what is active.
+- [x] `rba unpair <device>` is a first-class command (marks Replaced, audit
+      trail, owner or root may invoke).
+- [x] `rba status` shows enabled PAM backends (gdm, polkit, sudo) and their
+      installed/enabled state.
 - [ ] `rba doctor` checks daemon reachability, socket permissions, device
       connection, PAM file correctness, stale `pam_phone_auth` lines and
       faillock state. One command that answers "why isn't this working".

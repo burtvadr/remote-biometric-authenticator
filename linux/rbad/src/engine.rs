@@ -1414,6 +1414,41 @@ impl Engine {
         Ok(name)
     }
 
+    /// Unpairs a device: marks it `Replaced` (retained for audit), drops the
+    /// live connection, and audits the decision. Unlike `revoke`, the owner of
+    /// the device may do this without being root.
+    pub fn unpair_device(&self, selector: &str) -> Result<String> {
+        let (id, name, _) = self.resolve_device(Some(selector), None)?;
+        self.registry.lock().expect("registry mutex").unpair(&id)?;
+        self.force_disconnect_device(&id);
+        self.audit.write(
+            &Event::new("unpaired")
+                .success()
+                .device_id(device_id_hex(&id))
+                .device_name(name.clone()),
+        );
+        Ok(name)
+    }
+
+    /// Whether the caller may unpair `selector`. Root may unpair anything; a
+    /// non-root caller may only unpair a device bound to their own account.
+    pub fn may_unpair(&self, selector: &str, caller_user: Option<&str>) -> bool {
+        if caller_user.is_none() {
+            return true; // root
+        }
+        let Some(user) = caller_user else { return true };
+        let reg = self.registry.lock().expect("registry mutex");
+        if let Ok(id) = Id::from_hex(selector) {
+            if let Some(rec) = reg.get(&id) {
+                return rec.is_bound_to(user);
+            }
+        }
+        // by name: any matching device bound to the caller
+        reg.by_name(selector)
+            .iter()
+            .any(|rec| rec.is_bound_to(user))
+    }
+
     /// Status filtered to the caller's own devices.
     ///
     /// `viewer` is `None` for root. `peer_key` decides whether the open pairing

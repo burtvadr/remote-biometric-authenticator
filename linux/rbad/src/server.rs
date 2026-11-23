@@ -360,6 +360,21 @@ async fn dispatch(
                 Err(e) => ControlResponse::from_protocol_error(&e),
             }
         }
+
+        ControlRequest::Unpair { device } => {
+            // The owner may unpair their own device; root may unpair any.
+            let viewer = ipc::viewer_name(peer).ok().flatten();
+            if !engine.may_unpair(&device, viewer.as_deref()) {
+                return ControlResponse::err(
+                    "PERMISSION_DENIED",
+                    "only the device owner or root may unpair it",
+                );
+            }
+            match engine.unpair_device(&device) {
+                Ok(name) => ControlResponse::ok(serde_json::json!({ "unpaired": name })),
+                Err(e) => ControlResponse::from_protocol_error(&e),
+            }
+        }
     }
 }
 

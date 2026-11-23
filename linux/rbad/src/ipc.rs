@@ -190,6 +190,8 @@ pub enum ControlRequest {
     },
     /// Revoke a device's authorisation immediately.
     Revoke { device: String },
+    /// Remove trust for a device (marks it Replaced, retained for audit).
+    Unpair { device: String },
     /// Fetch the pairing code for an in-progress pairing session.
     PairingCode,
     /// Record the operator's confirmation. In `host` mode this carries the code
