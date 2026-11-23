@@ -261,6 +261,29 @@ pub unsafe extern "C" fn pam_sm_authenticate(
     argc: c_int,
     argv: *const *const c_char,
 ) -> c_int {
+    // Panic containment (SEC-009): a panic in this module must never unwind
+    // into the host process (PAM, polkit, sudo). Fail closed instead.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pam_sm_authenticate_inner(pamh, argc, argv)
+    }));
+    match result {
+        Ok(rc) => rc,
+        Err(_) => {
+            // Log through a fresh call; pamh may be stale but pam_syslog handles
+            // null handles.
+            syslog(pamh, LOG_ERR, "pam_rba: panicked; failing closed");
+            pam::PAM_AUTHINFO_UNAVAIL
+        }
+    }
+}
+
+/// Inner implementation of `pam_sm_authenticate`, separated so the outer
+/// function can wrap it in `catch_unwind`.
+unsafe fn pam_sm_authenticate_inner(
+    pamh: *const PamHandle,
+    argc: c_int,
+    argv: *const *const c_char,
+) -> c_int {
     // Parse arguments first: a misconfigured module must not silently authenticate
     // with defaults.
     let args: Vec<String> = if argc > 0 && !argv.is_null() {
@@ -311,7 +334,8 @@ pub unsafe extern "C" fn pam_sm_authenticate(
     // consumers display this; GDM's lock screen may not.
     pam_info(pamh, "Check your device to approve this request.");
 
-    let decision = authenticate(&ipc::default_socket(), &user, &opts);
+    // Use the production socket path, ignoring RBA_SOCKET (SEC-006 hardening).
+    let decision = authenticate(&ipc::production_socket(), &user, &opts);
     if debug {
         let detail = match &decision {
             Decision::Authenticated => "authenticated".to_string(),

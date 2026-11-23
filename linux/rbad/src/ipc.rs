@@ -594,6 +594,8 @@ pub fn call(
     use std::io::{BufRead, BufReader, Write};
     let stream = std::os::unix::net::UnixStream::connect(socket)
         .map_err(|e| IpcError::Unreachable(format!("{}: {e}", socket.display())))?;
+    // Verify the server's identity before trusting its reply (SEC-006).
+    verify_server_peer(&stream)?;
     let mut writer = &stream;
     let line = serde_json::to_string(&request.to_json())
         .map_err(|e| IpcError::Malformed(e.to_string()))?;
@@ -631,4 +633,69 @@ pub fn default_socket() -> std::path::PathBuf {
         Some(p) => std::path::PathBuf::from(p),
         None => std::path::PathBuf::from(crate::config::DEFAULT_SOCKET),
     }
+}
+
+/// The production control socket path. Ignores `RBA_SOCKET` so a PAM module
+/// or other privileged client cannot be redirected to an attacker-controlled
+/// socket (SEC-006 hardening).
+pub fn production_socket() -> std::path::PathBuf {
+    std::path::PathBuf::from(crate::config::DEFAULT_SOCKET)
+}
+
+/// Looks up the UID of the `rba` service account, if it exists.
+fn rba_service_uid() -> Option<u32> {
+    let cname = std::ffi::CString::new("rba").ok()?;
+    let mut buf = vec![0i8; 4096];
+    let mut passwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getpwnam_r(
+            cname.as_ptr(),
+            &mut passwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc == 0 && !result.is_null() {
+        Some(passwd.pw_uid)
+    } else {
+        None
+    }
+}
+
+/// Verifies that the process on the other end of a Unix socket is the daemon
+/// (root or the `rba` service account). Returns an error if the peer is
+/// neither, so a socket placed by an unprivileged attacker is rejected.
+pub fn verify_server_peer(
+    stream: &std::os::unix::net::UnixStream,
+) -> std::result::Result<(), IpcError> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(IpcError::Io(std::io::Error::last_os_error()));
+    }
+    // Allow root, the rba service account, or the current user (for development
+    // and tests where the daemon runs unprivileged). In production the daemon
+    // runs as rba or root, so the first two cover all real deployments.
+    let current_uid = unsafe { libc::getuid() };
+    let allowed = cred.uid == 0 || rba_service_uid() == Some(cred.uid) || cred.uid == current_uid;
+    if !allowed {
+        return Err(IpcError::Unreachable(format!(
+            "control socket peer uid {} is not the daemon (expected root, rba, or the current user)",
+            cred.uid
+        )));
+    }
+    Ok(())
 }

@@ -26,6 +26,7 @@ fn usage_text() -> String {
          \x20   auth --user U             ask a device to authenticate a Linux user\n\
          \x20   unpair --device D         remove trust for a device (owner or root)\n\
          \x20   revoke --device D         revoke an authenticator immediately (root only)\n\
+         \x20   doctor                    check that everything is wired correctly\n\
          \x20   version                   print the product and protocol version\n\
          \x20   help                      show this help\n\
          \n\
@@ -583,6 +584,156 @@ fn cmd_unpair(args: &Args) {
     }
 }
 
+/// Diagnostics: is everything wired correctly?
+fn cmd_doctor(args: &Args) {
+    let mut failures = 0usize;
+
+    // 1. Daemon reachable
+    let daemon_ok = request(args, &ControlRequest::Status).is_ok();
+    let mark = if daemon_ok { "OK" } else { "FAIL" };
+    println!(
+        "{:<28} {}  {}",
+        "daemon reachable:",
+        mark,
+        if daemon_ok {
+            ""
+        } else {
+            "check systemctl status rbad"
+        }
+    );
+    if !daemon_ok {
+        failures += 1;
+    }
+
+    // 2. Socket permissions
+    let sock_meta = std::fs::metadata(&args.socket);
+    let sock_mode = sock_meta
+        .as_ref()
+        .map(|m| {
+            use std::os::unix::fs::PermissionsExt;
+            m.permissions().mode() & 0o777
+        })
+        .unwrap_or(0);
+    let sock_ok = sock_mode == 0o666 || sock_mode == 0o660;
+    let mark = if sock_ok { "OK" } else { "FAIL" };
+    println!("{:<28} {}  mode {:o}", "socket perms:", mark, sock_mode);
+    if !sock_ok {
+        failures += 1;
+    }
+
+    // 3. Device connected
+    let devices_resp = request(args, &ControlRequest::List);
+    let (paired, connected) = devices_resp
+        .as_ref()
+        .map(|r| {
+            let devs = r
+                .result
+                .as_ref()
+                .and_then(|v| v.get("devices"))
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            (
+                devs.len(),
+                devs.iter()
+                    .filter(|d| {
+                        d.get("available")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                    })
+                    .count(),
+            )
+        })
+        .unwrap_or((0, 0));
+    let dev_ok = connected > 0;
+    let mark = if dev_ok { "OK" } else { "WARN" };
+    println!(
+        "{:<28} {}  {} paired, {} connected",
+        "devices:", mark, paired, connected
+    );
+    if paired == 0 {
+        failures += 1;
+    }
+
+    // 4. PAM files: no stale pam_phone_auth
+    let stale_files: Vec<&str> = [
+        "/etc/pam.d/gdm-password",
+        "/etc/pam.d/sudo",
+        "/etc/pam.d/polkit-1",
+        "/etc/pam.d/system-auth",
+        "/etc/pam.d/common-auth",
+    ]
+    .iter()
+    .filter(|f| {
+        std::fs::read_to_string(f)
+            .map(|s| s.contains("pam_phone_auth"))
+            .unwrap_or(false)
+    })
+    .copied()
+    .collect();
+    let stale_ok = stale_files.is_empty();
+    let stale_detail = if stale_ok {
+        "none".to_string()
+    } else {
+        stale_files.join(", ")
+    };
+    let mark = if stale_ok { "OK" } else { "FAIL" };
+    println!(
+        "{:<28} {}  {}",
+        "stale phone-auth lines:", mark, stale_detail
+    );
+    if !stale_ok {
+        failures += 1;
+    }
+
+    // 5. PAM files reference pam_rba where expected
+    let gdm_has_rba = std::fs::read_to_string("/etc/pam.d/gdm-password")
+        .map(|s| s.contains("pam_rba.so"))
+        .unwrap_or(false);
+    let polkit_has_rba = std::fs::read_to_string("/etc/pam.d/polkit-1")
+        .map(|s| s.contains("pam_rba.so"))
+        .unwrap_or(false);
+    println!(
+        "{:<28} {}  gdm={}, polkit={}",
+        "pam_rba installed:",
+        if gdm_has_rba || polkit_has_rba {
+            "OK"
+        } else {
+            "WARN"
+        },
+        gdm_has_rba,
+        polkit_has_rba
+    );
+
+    // 6. faillock
+    let faillock_out = std::process::Command::new("faillock")
+        .arg("--user")
+        .arg(std::env::var("USER").unwrap_or_default())
+        .output();
+    let locked = faillock_out
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("Valid"))
+        .unwrap_or(false);
+    let mark = if !locked { "OK" } else { "WARN" };
+    println!(
+        "{:<28} {}  {}",
+        "faillock:",
+        mark,
+        if locked {
+            "account locked"
+        } else {
+            "not locked"
+        }
+    );
+
+    println!();
+    if failures == 0 {
+        println!("All checks passed.");
+    } else {
+        println!("{failures} issue(s) found.");
+        std::process::exit(1);
+    }
+}
+
 fn cmd_version() {
     println!(
         "Remote Biometric Authenticator (rba) {}",
@@ -611,6 +762,7 @@ fn main() {
         "auth" => cmd_auth(&args),
         "revoke" => cmd_revoke(&args),
         "unpair" => cmd_unpair(&args),
+        "doctor" => cmd_doctor(&args),
         "version" => cmd_version(),
         "help" => help(),
         other => {

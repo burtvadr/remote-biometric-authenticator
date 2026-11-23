@@ -4,5 +4,6 @@
 //! integration speak the protocol through exactly one piece of code.
 
 pub use rbad::ipc::{
-    call, default_socket, ClientRequest as Request, ClientResponse as Response, IpcError,
+    call, default_socket, production_socket, ClientRequest as Request, ClientResponse as Response,
+    IpcError,
 };
