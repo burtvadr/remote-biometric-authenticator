@@ -1282,6 +1282,14 @@ Until that exists, the CLI must not claim the pairing is complete; it should say
       socket authorises each request from the caller's credentials.
 - [ ] `rba unpair <device>` is a first-class command, not only a hidden
       daemon operation.
+- [ ] `rba status` shows enabled PAM backends (gdm, polkit, sudo) and their
+      installed/enabled state, so an operator can confirm what is active.
+- [ ] `rba doctor` checks daemon reachability, socket permissions, device
+      connection, PAM file correctness, stale `pam_phone_auth` lines and
+      faillock state. One command that answers "why isn't this working".
+- [ ] Rate-limit tuning: per-user or per-device limits (not just per device
+      transport), and a clearer "rate limited, retry in Ns" message. The current
+      5-per-60s default is too aggressive for polkit hammering.
 - [x] README uses the real command transcript.
 
 ## Proposed refactor: centralized `rba` CLI and host backends
