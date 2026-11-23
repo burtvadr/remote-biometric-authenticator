@@ -428,6 +428,10 @@ resources; a production bind exposes the port on every interface; a restart
 clears rate-limit state. Protocol authentication still fails closed, but
 availability and defence in depth are weaker than the design claims.
 
+**Remediation (partial).** Rate limiter state is now persisted to disk
+(`/var/lib/rba/ratelimits/`) and reloaded on daemon start, so limits survive
+restarts. State is saved on graceful shutdown and every 60 seconds.
+
 **Recommendation.**
 
 - Keep the default bind on loopback or a specific interface; require an explicit
