@@ -47,10 +47,10 @@ when the finding was first written.
 | ID | Finding | Status |
 |---|---|---|
 | SEC-005 | No Android Key Attestation; the host cannot distinguish hardware-backed from software keys | Confirmed |
-| SEC-006 | PAM client does not verify the control-socket server; socket path can be overridden | Confirmed |
+| SEC-006 | PAM client does not verify the control-socket server; socket path can be overridden | Resolved |
 | SEC-007 | Network-exposed daemon: no mTLS, no parser fuzzing; connection/deadline/bind gaps now fixed | Partly confirmed |
 | SEC-008 | Android assurance gaps: no release-signed build; validation is one debug device | Partly confirmed |
-| SEC-009 | PAM module robustness: no `catch_unwind`, FFI `unsafe`, blocking I/O | Needs verification |
+| SEC-009 | PAM module robustness: no `catch_unwind`, FFI `unsafe`, blocking I/O | Resolved (catch_unwind) |
 | SEC-021 | Control-socket size limit is checked after an unbounded `read_line` | Resolved |
 | SEC-022 | Caller-controlled authentication timeout is unbounded | Resolved |
 | SEC-023 | Biometric prompt shows unsigned host name and hides signed operation context | Resolved |
@@ -355,7 +355,7 @@ is unavailable, make the downgrade explicit rather than silent.
 ### SEC-006 — PAM client does not verify the control-socket server
 
 **Severity:** Medium  
-**Status:** Confirmed  
+**Status:** Resolved  
 **Source:** external review, 2026-11-18  
 **Aliases:** IPC trust, socket impersonation, `RBA_SOCKET`  
 **Affected:** `linux/rbad/src/ipc.rs`,
@@ -382,6 +382,12 @@ the trust boundary.
 require the expected daemon UID (root or `rba`). Prefer a fixed compiled
 path for production; keep `RBA_SOCKET` strictly for tests. Verify the
 socket file owner/mode before connecting, and add a test with a fake socket.
+
+**Remediation.** `ipc::call` now calls `verify_server_peer` after connecting,
+which checks `SO_PEERCRED` against root, the `rba` service account, or the
+current user (for dev/test). The PAM module uses `production_socket()`, which
+ignores `RBA_SOCKET` entirely and always returns the compiled default path.
+`rba` CLI and polkit-agent still honour `RBA_SOCKET` for testing.
 
 ---
 
@@ -480,7 +486,7 @@ SEC-005.
 ### SEC-009 — PAM module robustness
 
 **Severity:** Medium  
-**Status:** Needs verification  
+**Status:** Resolved (catch_unwind)  
 **Source:** external review, 2026-11-18  
 **Aliases:** panic across FFI, unwind, unsafe, blocking  
 **Affected:** `linux/pam-rba/src/lib.rs`,
@@ -507,6 +513,12 @@ strategy is explicit and compatible with the PAM module. Audit every `unsafe`
 block for null pointers, non-UTF-8 input, and lifetimes. Add a test that drives the
 module with invalid PAM handles/arguments. Keep the timeout bounded and document
 the blocking behaviour.
+
+**Remediation.** `pam_sm_authenticate` now wraps its body in
+`std::panic::catch_unwind(AssertUnwindSafe(...))` and returns
+`PAM_AUTHINFO_UNAVAIL` on panic, so a bug or malformed input fails closed
+instead of unwinding into the host process. The blocking I/O timeout remains
+bounded by the module's `timeout_ms` argument.
 
 ---
 

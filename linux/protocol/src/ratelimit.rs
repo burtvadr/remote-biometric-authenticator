@@ -69,6 +69,33 @@ impl RateLimiter {
         allowed
     }
 
+    /// Seconds until the next event for `key` would be permitted. Returns 0
+    /// when the key is not currently limited.
+    pub fn retry_after(&self, key: &str, now: u64) -> u64 {
+        let cutoff = now.checked_sub(self.limit.window_secs);
+        match self.events.get(key) {
+            None => 0,
+            Some(q) => {
+                let live_count = match cutoff {
+                    None => q.len(),
+                    Some(c) => q.iter().filter(|t| **t > c).count(),
+                };
+                if (live_count as u32) < self.limit.max_events {
+                    return 0;
+                }
+                // The oldest live event must age out before a new one fits.
+                let oldest_live = match cutoff {
+                    None => q.front().copied(),
+                    Some(c) => q.iter().copied().find(|t| *t > c),
+                };
+                match oldest_live {
+                    Some(t) => (t + self.limit.window_secs).saturating_sub(now),
+                    None => 0,
+                }
+            }
+        }
+    }
+
     /// Reports whether an event would be permitted without recording it.
     pub fn peek(&self, key: &str, now: u64) -> bool {
         let cutoff = now.checked_sub(self.limit.window_secs);

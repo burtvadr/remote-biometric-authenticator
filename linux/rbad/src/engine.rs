@@ -436,9 +436,10 @@ impl Engine {
         {
             let mut rp = self.rate_pairing.lock().expect("rate mutex");
             if !rp.check_and_record(&peer_key, now) {
+                let retry = rp.retry_after(&peer_key, now);
                 self.audit
                     .write(&Event::new("pairing_rate_limited").denied("RATE_LIMITED"));
-                return Err(ProtocolError::RateLimited);
+                return Err(ProtocolError::RateLimited(retry));
             }
         }
         if let Ok(mut guard) = self.pairing.lock() {
@@ -971,6 +972,7 @@ impl Engine {
                 .entry(actual_transport)
                 .or_insert_with(|| RateLimiter::for_auth_transport(actual_transport));
             if !limiter.check_and_record(&device_id.to_hex(), now) {
+                let retry = limiter.retry_after(&device_id.to_hex(), now);
                 self.audit.write(
                     &Event::new("auth_rate_limited")
                         .denied("RATE_LIMITED")
@@ -978,7 +980,7 @@ impl Engine {
                         .username(username)
                         .purpose(purpose),
                 );
-                return Err(ProtocolError::RateLimited);
+                return Err(ProtocolError::RateLimited(retry));
             }
         }
 
