@@ -998,6 +998,56 @@ allowed to log in as another account is one compromise domain; separate devices
 remain the stronger model.
 
 Do not implement this by reusing an admin session or by silently switching the
+
+## App logs and developer mode
+
+The app's overview and settings tabs cover the common case. A third tab,
+**Logs**, is hidden until the operator opts in, so it does not clutter the normal
+UI or expose audit detail to casual users.
+
+### Unlocking
+
+Tapping the version number in Settings seven times enables **advanced options**.
+This is the only unlock gesture. Once enabled it persists across restarts and
+adds:
+
+- the **Logs** tab, placed between Overview and Settings;
+- any other advanced-only controls that accumulate later (export, diagnostics).
+
+The unlock is reversible from the same place. It is a UI convenience, not a
+security boundary: the data shown is already filtered by the daemon.
+
+### What the Logs tab shows
+
+A central, chronological view of what the host and device did, mirroring the
+host's audit log but scoped to the device's own view:
+
+- which host was contacted and over which transport (`wifi`, `ble`, `adb`, …);
+- which device authenticated, as which Linux account, for which purpose and
+  service;
+- pairing, revocation and unpair events;
+- connection and disconnect events;
+- timestamps and outcomes (`success`, `denied`, `error`).
+
+It is read-only. No secrets, challenges, signatures, pairing codes or MACs are
+ever logged, on either side.
+
+### Permission scoping
+
+Logs are **not** global. A device sees only what its own policy and the host
+allow, so a secondary authenticator does not become an audit viewer for the whole
+host:
+
+- a device paired for `alice` sees events for `alice` and its own connection
+  history, not events for `desktop` or `root`;
+- a device with `allow_root` sees root-targeted events too;
+- an `all`/delegated device sees the union of its bound accounts;
+- the host administrator sees everything via `rba` / the daemon audit log; the
+  app is a filtered view, never the authoritative record.
+
+Filtering happens in the daemon (`integration.logs` / a scoped control method),
+not in the app. The app only renders what it is handed, so a modified client
+cannot widen its view.
 signed username. The target account is always in the signed request; the host
 policy decides whether that device is permitted to name it.
 
