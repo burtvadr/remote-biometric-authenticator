@@ -48,7 +48,7 @@ when the finding was first written.
 |---|---|---|
 | SEC-005 | No Android Key Attestation; the host cannot distinguish hardware-backed from software keys | Confirmed |
 | SEC-006 | PAM client does not verify the control-socket server; socket path can be overridden | Resolved |
-| SEC-007 | Network-exposed daemon: no mTLS, no parser fuzzing; connection/deadline/bind gaps now fixed | Partly confirmed |
+| SEC-007 | Network-exposed daemon: no mTLS, no parser fuzzing; connection/deadline/bind gaps now fixed | Partly resolved (persistent rate limits) |
 | SEC-008 | Android assurance gaps: no release-signed build; validation is one debug device | Partly confirmed |
 | SEC-009 | PAM module robustness: no `catch_unwind`, FFI `unsafe`, blocking I/O | Resolved (catch_unwind) |
 | SEC-021 | Control-socket size limit is checked after an unbounded `read_line` | Resolved |

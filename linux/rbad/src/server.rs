@@ -402,15 +402,37 @@ pub async fn run(
     };
 
     let wifi = transport::wifi::serve(engine.clone(), config.clone(), shutdown.clone());
-    let ctl = serve_control(engine.clone(), config, shutdown);
+    let ctl = serve_control(engine.clone(), config, shutdown.clone());
 
-    tokio::select! {
+    // Periodically persist rate-limit state so it survives a crash, not just
+    // a graceful shutdown.
+    let saver_engine = engine.clone();
+    let mut saver_shutdown = shutdown;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => saver_engine.save_rate_limits(),
+                _ = saver_shutdown.changed() => {
+                    if *saver_shutdown.borrow() {
+                        saver_engine.save_rate_limits();
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    let result = tokio::select! {
         r = wifi => {
             let _ = &mdns;
             r
         }
         r = ctl => r,
-    }
+    };
+    // Persist rate-limit state on shutdown so limits survive restarts.
+    engine.save_rate_limits();
+    result
 }
 
 /// The transports this build supports, for `status` output.

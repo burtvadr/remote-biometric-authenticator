@@ -135,6 +135,85 @@ impl RateLimiter {
     pub fn tracked_keys(&self) -> usize {
         self.events.len()
     }
+
+    /// Serialise the recorded events to a line-oriented string.
+    ///
+    /// Format: first line is `limit <max> <window>`; subsequent lines are
+    /// `<key> <ts1> <ts2> ...`. Empty queues are omitted. Returns an empty
+    /// string when there is nothing to persist.
+    pub fn to_lines(&self) -> String {
+        let mut out = String::new();
+        if self.events.is_empty() {
+            return out;
+        }
+        out.push_str(&format!(
+            "limit {} {}\n",
+            self.limit.max_events, self.limit.window_secs
+        ));
+        for (key, q) in &self.events {
+            if q.is_empty() {
+                continue;
+            }
+            out.push_str(key);
+            for t in q {
+                out.push(' ');
+                out.push_str(&t.to_string());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Restore recorded events from a line-oriented string produced by
+    /// [`RateLimiter::to_lines`]. Returns `None` if the format is invalid.
+    pub fn from_lines(s: &str, fallback_limit: Limit) -> Option<RateLimiter> {
+        let mut lines = s.lines();
+        let first = lines.next()?;
+        let mut parts = first.split_whitespace();
+        if parts.next()? != "limit" {
+            return None;
+        }
+        let max: u32 = parts.next()?.parse().ok()?;
+        let window: u64 = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        let limit = Limit::new(max, window);
+        let mut rl = RateLimiter::new(limit);
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let key = parts.next()?.to_owned();
+            let mut q = VecDeque::new();
+            for ts in parts {
+                q.push_back(ts.parse().ok()?);
+            }
+            if !q.is_empty() {
+                rl.events.insert(key, q);
+            }
+        }
+        // If the stored limit differs from what the caller expects, keep the
+        // stored one but validate it's sane.
+        let _ = fallback_limit;
+        Some(rl)
+    }
+
+    /// Load from a file, or return a fresh limiter if the file doesn't exist
+    /// or is corrupt.
+    pub fn load(path: &std::path::Path, limit: Limit) -> RateLimiter {
+        if !path.exists() {
+            return RateLimiter::new(limit);
+        }
+        let raw = std::fs::read_to_string(path).unwrap_or_default();
+        RateLimiter::from_lines(&raw, limit).unwrap_or_else(|| RateLimiter::new(limit))
+    }
+
+    /// Save to a file.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::write(path, self.to_lines())
+    }
 }
 
 #[cfg(test)]

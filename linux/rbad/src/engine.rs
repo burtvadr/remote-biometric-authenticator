@@ -20,8 +20,8 @@ use rba_protocol::pairing::{
 };
 use rba_protocol::ratelimit::{Limit, RateLimiter};
 use rba_protocol::types::{
-    AuthRequest, AuthResponse, Challenge, Id, Transport, AUTH_REQUEST_TTL_DEFAULT, RATE_PAIRING,
-    RATE_PAIRING_WINDOW,
+    AuthRequest, AuthResponse, Challenge, Id, Transport, AUTH_REQUEST_TTL_DEFAULT, RATE_AUTH,
+    RATE_AUTH_WINDOW, RATE_PAIRING, RATE_PAIRING_WINDOW,
 };
 use rba_protocol::verifier;
 use tokio::sync::{mpsc, oneshot, Notify};
@@ -104,6 +104,8 @@ pub struct Engine {
     /// One limiter per transport, because the limits differ (§11). Keyed by
     /// `Transport` so a request cannot dodge the limit by switching transport.
     rate_auth: Mutex<HashMap<Transport, RateLimiter>>,
+    /// Optional path for persistent rate-limit state.
+    rate_limit_path: Option<std::path::PathBuf>,
     /// Advertised host label, shown on the device.
     pub host_name: String,
     /// Hands out a unique id per connection, so a stale teardown can be told apart
@@ -160,6 +162,47 @@ impl Engine {
         audit: AuditLog,
         host_name: String,
     ) -> Arc<Engine> {
+        Self::with_rate_limit_path(host, registry, audit, host_name, None)
+    }
+
+    pub fn with_rate_limit_path(
+        host: HostIdentity,
+        registry: Registry,
+        audit: AuditLog,
+        host_name: String,
+        rate_limit_path: Option<std::path::PathBuf>,
+    ) -> Arc<Engine> {
+        // Load persisted rate limits if available.
+        let (rate_pairing, rate_auth) = if let Some(ref path) = rate_limit_path {
+            let pairing_path = path.join("pairing.ratelimit");
+            let auth_path = path.join("auth.ratelimit");
+            let rp =
+                RateLimiter::load(&pairing_path, Limit::new(RATE_PAIRING, RATE_PAIRING_WINDOW));
+            let mut ra = HashMap::new();
+            ra.insert(
+                Transport::Wifi,
+                RateLimiter::load(&auth_path, Limit::new(RATE_AUTH, RATE_AUTH_WINDOW)),
+            );
+            ra.insert(
+                Transport::Ble,
+                RateLimiter::for_auth_transport(Transport::Ble),
+            );
+            (rp, ra)
+        } else {
+            (
+                RateLimiter::new(Limit::new(RATE_PAIRING, RATE_PAIRING_WINDOW)),
+                HashMap::from([
+                    (
+                        Transport::Wifi,
+                        RateLimiter::for_auth_transport(Transport::Wifi),
+                    ),
+                    (
+                        Transport::Ble,
+                        RateLimiter::for_auth_transport(Transport::Ble),
+                    ),
+                ]),
+            )
+        };
         Arc::new(Engine {
             host,
             next_conn: std::sync::atomic::AtomicU64::new(1),
@@ -170,22 +213,27 @@ impl Engine {
             pending_auth: Mutex::new(HashMap::new()),
             pending_pairing: Mutex::new(None),
             pairing: Mutex::new(None),
-            rate_pairing: Mutex::new(RateLimiter::new(Limit::new(
-                RATE_PAIRING,
-                RATE_PAIRING_WINDOW,
-            ))),
-            rate_auth: Mutex::new(HashMap::from([
-                (
-                    Transport::Wifi,
-                    RateLimiter::for_auth_transport(Transport::Wifi),
-                ),
-                (
-                    Transport::Ble,
-                    RateLimiter::for_auth_transport(Transport::Ble),
-                ),
-            ])),
+            rate_pairing: Mutex::new(rate_pairing),
+            rate_auth: Mutex::new(rate_auth),
+            rate_limit_path,
             host_name,
         })
+    }
+
+    /// Persist rate-limit state to disk so it survives daemon restarts.
+    pub fn save_rate_limits(&self) {
+        if let Some(ref path) = self.rate_limit_path {
+            let _ = std::fs::create_dir_all(path);
+            if let Ok(rp) = self.rate_pairing.lock() {
+                let _ = rp.save(&path.join("pairing.ratelimit"));
+            }
+            // Save wifi limiter (the primary transport).
+            if let Ok(map) = self.rate_auth.lock() {
+                if let Some(rl) = map.get(&Transport::Wifi) {
+                    let _ = rl.save(&path.join("auth.ratelimit"));
+                }
+            }
+        }
     }
 
     pub fn audit(&self) -> &AuditLog {
@@ -1570,7 +1618,13 @@ mod tests {
         registry
             .upsert_paired_for_user(device_id, "Pixel", &device_key.public_key(), 100, "alice")
             .expect("pair");
-        let engine = Engine::new(host, registry, AuditLog::null(), "test-host".into());
+        let engine = Engine::with_rate_limit_path(
+            host,
+            registry,
+            AuditLog::null(),
+            "test-host".into(),
+            None,
+        );
         (
             engine,
             host_id,

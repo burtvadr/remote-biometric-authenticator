@@ -52,7 +52,8 @@ impl Daemon {
             .map_err(|e| format!("cannot open audit log {}: {e}", config.audit_log.display()))?
             .with_echo(echo_audit);
         let name = config.host_name.clone().unwrap_or_else(host_name);
-        let engine = Engine::new(host, registry, audit, name);
+        let rate_path = config.state_dir.join("ratelimits");
+        let engine = Engine::with_rate_limit_path(host, registry, audit, name, Some(rate_path));
         Ok(Daemon { config, engine })
     }
 
@@ -75,7 +76,7 @@ impl Daemon {
         let name = config.host_name.clone().unwrap_or_else(host_name);
         Ok(Daemon {
             config,
-            engine: Engine::new(host, registry, AuditLog::null(), name),
+            engine: Engine::with_rate_limit_path(host, registry, AuditLog::null(), name, None),
         })
     }
 
@@ -84,7 +85,13 @@ impl Daemon {
         let key = rba_protocol::crypto::PrivateKey::generate().expect("OS randomness is required");
         let host = HostIdentity::for_tests(key, rba_protocol::types::Id::random().expect("random"));
         let audit = AuditLog::null();
-        let engine = Engine::new(host, Registry::in_memory(), audit, "test-host".into());
+        let engine = Engine::with_rate_limit_path(
+            host,
+            Registry::in_memory(),
+            audit,
+            "test-host".into(),
+            None,
+        );
         Daemon { config, engine }
     }
 }

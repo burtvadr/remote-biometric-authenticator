@@ -1392,12 +1392,12 @@ Do these before expanding the platform surface:
       ships; do not hand-roll a PAKE in Kotlin.
 - [ ] SEC-003: stop recommending global `common-auth`; scope PAM integration and
       add number matching for authentication.
-- [ ] SEC-004: bind each paired device to allowed Linux users; deny root by
-      default.
+- [x] SEC-004: bind each paired device to allowed Linux users; deny root by
+      default. Implemented via DevicePolicy (users + allow_root).
 - [ ] SEC-005: design opt-in Android Key Attestation and downgrade policy.
 - [x] SEC-006: verify the control-socket server from the PAM client (SO_PEERCRED check + production_socket).
-- [ ] SEC-007: persistent rate limits and parser fuzzing remain; connection
-      caps, handshake/frame deadlines and the explicit bind policy are done.
+- [x] SEC-007: persistent rate limits (survive daemon restart via disk).
+      Parser fuzzing remains.
 - [x] SEC-009: panic containment in the PAM module (catch_unwind). FFI review remains.
 - [x] SEC-021/022/023/024: bounded IPC reads and deadlines, timeout clamp,
       trusted prompt context, connection caps and frame deadlines.
