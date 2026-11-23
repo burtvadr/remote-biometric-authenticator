@@ -1,6 +1,6 @@
-# Remote Biometric Authenticator
+# Remote Biometric Authenticator `rba` (v0.0.1)
 
-`rba` v0.0.1
+
 
 <img src="media/icons/auto/rba-light.svg" width="128" height="128" alt="Light icon" align="right" />
 
@@ -9,6 +9,8 @@
 A single or multiple devices can act as remote cryptographic authenticators for one or more host machines.
 The device approves with native biometric interface;
 The host verifies a signature over a fresh challenge instead of trusting a simple transmitted `YES`.
+
+
 
 ㅤ
 
