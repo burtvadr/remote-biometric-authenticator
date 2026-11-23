@@ -48,8 +48,12 @@ rba unpair <device> [--yes]
 rba auth [--user USER] [--purpose PURPOSE] [--service SERVICE] [--timeout SECONDS]
 
 rba service start|stop|restart|status|logs [--follow] [--since TIME]
-rba integrations
-rba integration status|verify|enable|disable <backend> [--target TARGET] [--dry-run] [--yes]
+
+rba status
+rba enable gdm [--dry-run] [--yes]
+rba disable gdm
+rba enable polkit [--dry-run] [--yes]
+rba disable polkit
 
 rba policy show [--device DEVICE]
 rba policy set [--device DEVICE] [options]
@@ -231,24 +235,22 @@ rba service restart
 PAM is a Linux/BSD backend, not a top-level `rba` concept. The generic commands are:
 
 ```text
-rba integrations
-rba integration status linux-pam
-rba integration verify linux-pam
-rba integration enable linux-pam --target gdm-password
-rba integration enable linux-pam --target polkit-1
-rba integration disable linux-pam --target gdm-password
-rba integration enable macos-pam --target sudo
+rba status                # what is enabled
+rba enable gdm            # scoped gdm-password override (login + lock screen)
+rba disable gdm           # rollback
+rba enable polkit         # scoped polkit-1 override
+rba disable polkit        # rollback
 ```
 
-- `integrations` is read-only and lists the detected backends, targets,
-  installed/enabled state and whether a rollback record exists.
 - `enable` and `disable` require administrator rights and are scoped to one
-  backend target.
+  backend at a time.
 - `enable` shows the exact diff and asks for confirmation. `--dry-run` is
   available without root.
 - `--yes` is allowed only for non-interactive admin use; it never skips the diff.
 - Never edit `/etc/pam.d/system-auth` or `gdm-fingerprint` as part of a generic
-  enable.
+  enable. `sudo`, `sshd`, `su` and `login` are left untouched.
+- `polkit` covers both `pkexec` and `systemctl` actions that ask polkit: they
+  share the `polkit-1` PAM stack, so one override enables the device for both.
 - The implementation delegates to the audited per-platform installer scripts
   (`packaging/arch/pam-gdm-rba.sh`, `pam-polkit-rba.sh`). The CLI does not
   become a second PAM editor.
