@@ -13,6 +13,7 @@ VENDOR="/usr/lib/pam.d/gdm-password"
 TARGET="/etc/pam.d/gdm-password"
 RECORD="/etc/pam.d/.gdm-password.device.rollback"
 TIMEOUT_SECONDS=5
+VERBOSE=0
 LINE=""
 TMP_FILE=""
 
@@ -21,6 +22,7 @@ usage() {
 Usage: sudo $0 [--dry-run] [--timeout SECONDS] [--rollback]
 
   --dry-run           show the proposed change and exit
+  --verbose           show the diff and test instructions
   --timeout SECONDS   device wait before the password fallback (default: 5)
   --rollback          restore the file saved by the last install
 
@@ -79,6 +81,9 @@ main() {
             --dry-run)
                 dry_run=1
                 ;;
+            --verbose)
+                VERBOSE=1
+                ;;
             --timeout)
                 if [ "$#" -lt 2 ]; then
                     echo "--timeout needs a value" >&2
@@ -124,8 +129,10 @@ main() {
             exit 0
         fi
 
-        echo "==> proposed change"
-        diff -u "$TARGET" "$TMP_FILE" || true
+        if [ "$VERBOSE" -eq 1 ] || [ "$dry_run" -eq 1 ]; then
+            echo "==> proposed change"
+            diff -u "$TARGET" "$TMP_FILE" || true
+        fi
 
         if [ "$dry_run" -eq 1 ]; then
             echo
@@ -137,10 +144,11 @@ main() {
         cp -a "$TARGET" "$backup"
         install -m 0644 -o root -g root "$TMP_FILE" "$TARGET"
 
-        echo
-        echo "Updated the device line in $TARGET to timeout_ms=$((TIMEOUT_SECONDS * 1000))."
-        echo "Backup: $backup"
-        echo "Existing rollback record left unchanged: $RECORD"
+        echo "Updated $TARGET (timeout_ms=$((TIMEOUT_SECONDS * 1000)))."
+        if [ "$VERBOSE" -eq 1 ]; then
+            echo "Backup: $backup"
+            echo "Existing rollback record left unchanged: $RECORD"
+        fi
         return
     fi
 
@@ -166,8 +174,10 @@ main() {
         exit 1
     fi
 
-    echo "==> proposed change"
-    diff -u "$base" "$TMP_FILE" || true
+    if [ "$VERBOSE" -eq 1 ] || [ "$dry_run" -eq 1 ]; then
+        echo "==> proposed change"
+        diff -u "$base" "$TMP_FILE" || true
+    fi
 
     if [ "$dry_run" -eq 1 ]; then
         echo
@@ -187,20 +197,13 @@ main() {
     } > "$RECORD"
     chmod 0600 "$RECORD"
 
-    echo
-    echo "Installed the device line in $TARGET with timeout_ms=$((TIMEOUT_SECONDS * 1000))."
+    echo "Installed $TARGET (timeout_ms=$((TIMEOUT_SECONDS * 1000)))."
     if [ "$backup" != "absent" ]; then
-        echo "Backup: $backup"
+        [ "$VERBOSE" -eq 1 ] && echo "Backup: $backup"
     else
-        echo "There was no local override before; rollback will remove $TARGET."
+        [ "$VERBOSE" -eq 1 ] && echo "There was no local override before; rollback will remove $TARGET."
     fi
     echo "Rollback: sudo $0 --rollback"
-    echo
-    echo "Keep a root TTY open. Then test:"
-    echo "  1. Lock the screen with Super+L."
-    echo "  2. Press Enter or submit the password form."
-    echo "  3. Approve the device prompt."
-    echo "  4. If it fails, switch to a TTY and run: sudo $0 --rollback"
 }
 
 main "$@"

@@ -12,6 +12,7 @@ VENDOR="/usr/lib/pam.d/polkit-1"
 TARGET="/etc/pam.d/polkit-1"
 RECORD="/etc/pam.d/.polkit-1.device.rollback"
 TIMEOUT_SECONDS=5
+VERBOSE=0
 LINE=""
 TMP_FILE=""
 
@@ -20,6 +21,7 @@ usage() {
 Usage: sudo $0 [--dry-run] [--timeout SECONDS] [--rollback]
 
   --dry-run           show the proposed change and exit
+  --verbose           show the diff and test instructions
   --timeout SECONDS   device wait before the password fallback (default: 5)
   --rollback          restore the file saved by the last install
 
@@ -78,6 +80,9 @@ main() {
             --dry-run)
                 dry_run=1
                 ;;
+            --verbose)
+                VERBOSE=1
+                ;;
             --timeout)
                 if [ "$#" -lt 2 ]; then
                     echo "--timeout needs a value" >&2
@@ -121,8 +126,10 @@ main() {
             exit 0
         fi
 
-        echo "==> proposed change"
-        diff -u "$TARGET" "$TMP_FILE" || true
+        if [ "$VERBOSE" -eq 1 ] || [ "$dry_run" -eq 1 ]; then
+            echo "==> proposed change"
+            diff -u -u "$TARGET" "$TMP_FILE" || true
+        fi
 
         if [ "$dry_run" -eq 1 ]; then
             echo
@@ -163,8 +170,10 @@ main() {
         exit 1
     fi
 
-    echo "==> proposed change"
-    diff -u "$base" "$TMP_FILE" || true
+    if [ "$VERBOSE" -eq 1 ] || [ "$dry_run" -eq 1 ]; then
+        echo "==> proposed change"
+        diff -u -u "$base" "$TMP_FILE" || true
+    fi
 
     if [ "$dry_run" -eq 1 ]; then
         echo
@@ -184,20 +193,13 @@ main() {
     } > "$RECORD"
     chmod 0600 "$RECORD"
 
-    echo
-    echo "Installed the device line in $TARGET with timeout_ms=$((TIMEOUT_SECONDS * 1000))."
+    echo "Installed $TARGET (timeout_ms=$((TIMEOUT_SECONDS * 1000)))."
     if [ "$backup" != "absent" ]; then
-        echo "Backup: $backup"
+        [ "$VERBOSE" -eq 1 ] && echo "Backup: $backup"
     else
-        echo "There was no local override before; rollback will remove $TARGET."
+        [ "$VERBOSE" -eq 1 ] && echo "There was no local override before; rollback will remove $TARGET."
     fi
     echo "Rollback: sudo $0 --rollback"
-    echo
-    echo "Keep a root TTY open. Then test:"
-    echo "  1. pkexec id -u   (approve on the device; output should be 0)"
-    echo "  2. a systemctl action that asks polkit, for example restarting a test unit"
-    echo "  3. cancel the device prompt and confirm the password dialog returns"
-    echo "  4. If it fails, switch to a TTY and run: sudo $0 --rollback"
 }
 
 main "$@"
