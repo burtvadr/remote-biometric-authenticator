@@ -999,7 +999,7 @@ remain the stronger model.
 
 Do not implement this by reusing an admin session or by silently switching the
 
-## App logs and developer mode
+## App logs and advanced options
 
 The app's overview and settings tabs cover the common case. A third tab,
 **Logs**, is hidden until the operator opts in, so it does not clutter the normal
