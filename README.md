@@ -1,4 +1,4 @@
-# Remote Biometric Authenticator `rba` (v0.0.1)
+# Remote Biometric Authenticator `rba` (v0.1.0)
 
 
 

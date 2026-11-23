@@ -7,6 +7,10 @@ invalidate existing pairings ships with a migration.
 
 Current state: product `0.1.0`, protocol `1`.
 
+The product version's source of truth is the workspace `version` in
+`linux/Cargo.toml`. The Android `versionName` and the README header are kept in
+sync with it; `rba version` prints it.
+
 ## Two numbers, not one
 
 | Number | Where | What it versions |
