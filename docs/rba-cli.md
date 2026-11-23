@@ -35,8 +35,6 @@ rba                              help, exit 1 (same as adb)
 rba help [command]
 rba version
 rba status
-rba doctor
-
 rba devices [<device>] [-l|--long]
 rba devices rename <device> <name>
 rba pair [--transport wifi|adb] [--code-entry device|host] [--owner USER]
@@ -393,7 +391,7 @@ order:
 2. **Versioned API.** Introduce the `v:1` envelope and typed methods, and update
    the PAM module and simulator in the same change. Do not keep a dual stack.
    Define the text output and exit codes here, not later.
-3. **Host commands.** Add `service`, `integrations` and `doctor` as wrappers
+3. **Host commands.** Add `service` as a wrapper
    around the existing audited backends. No new PAM editing logic in Rust.
 4. **Policy.** Implement SEC-004 and the admin API first, then expose `rba
    policy`. Do not ship policy commands that the daemon cannot enforce.

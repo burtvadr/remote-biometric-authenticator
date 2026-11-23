@@ -1295,9 +1295,6 @@ Until that exists, the CLI must not claim the pairing is complete; it should say
       trail, owner or root may invoke).
 - [x] `rba status` shows enabled PAM backends (gdm, polkit, sudo) and their
       installed/enabled state.
-- [ ] `rba doctor` checks daemon reachability, socket permissions, device
-      connection, PAM file correctness, stale `pam_phone_auth` lines and
-      faillock state. One command that answers "why isn't this working".
 - [ ] Rate-limit tuning: per-user or per-device limits (not just per device
       transport), and a clearer "rate limited, retry in Ns" message. The current
       5-per-60s default is too aggressive for polkit hammering.
