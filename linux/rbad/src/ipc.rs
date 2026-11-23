@@ -200,6 +200,8 @@ pub enum ControlRequest {
         #[serde(default)]
         code: Option<String>,
     },
+    /// Device has persisted its pairing record and sent an acknowledgement.
+    PairingConfirmed,
     /// Abort the open pairing session and discard any pending record. Used by
     /// the CLI on Ctrl-C so an aborted pair does not linger until it expires.
     CancelPairing,

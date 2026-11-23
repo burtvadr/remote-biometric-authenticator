@@ -294,6 +294,25 @@ async fn dispatch(
             }
         }
 
+        ControlRequest::PairingConfirmed => {
+            if !engine.pairing_active() {
+                return ControlResponse::err(
+                    "NOT_PAIRED",
+                    "no active pairing session",
+                );
+            }
+            if !engine.pairing_opened_by(&peer_key) {
+                return ControlResponse::err(
+                    "PERMISSION_DENIED",
+                    "this pairing session was opened by another user",
+                );
+            }
+            match engine.mark_pairing_confirmed() {
+                Ok(()) => ControlResponse::ok(serde_json::json!({ "confirmed": true })),
+                Err(e) => ControlResponse::from_protocol_error(&e),
+            }
+        }
+
         ControlRequest::CancelPairing => {
             if engine.pairing_active() && peer.uid != 0 && !engine.pairing_opened_by(&peer_key) {
                 return ControlResponse::err(

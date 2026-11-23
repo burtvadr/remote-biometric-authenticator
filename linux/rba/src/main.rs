@@ -10,6 +10,9 @@ use std::path::PathBuf;
 use rba_protocol::pairing::CodeEntry;
 use rbad::ipc::{ControlRequest, ControlResponse};
 
+#[cfg(target_os = "linux")]
+mod pam;
+
 const DEFAULT_SOCKET: &str = rbad::config::DEFAULT_SOCKET;
 
 fn usage_text() -> String {
@@ -26,6 +29,8 @@ fn usage_text() -> String {
          \x20   auth --user U             ask a device to authenticate a Linux user\n\
          \x20   unpair --device D         remove trust for a device (owner or root)\n\
          \x20   revoke --device D         revoke an authenticator immediately (root only)\n\
+         \x20   enable <backend>          enable a host integration (gdm, polkit, sudo) [linux]\n\
+         \x20   disable <backend>         roll back a host integration [linux]\n\
          \x20   version                   print the product and protocol version\n\
          \x20   help                      show this help\n\
          \n\
@@ -79,6 +84,7 @@ fn no_args() -> ! {
 struct Args {
     socket: PathBuf,
     command: String,
+    backend: Option<String>,
     user: Option<String>,
     purpose: String,
     service: String,
@@ -88,6 +94,8 @@ struct Args {
     code_entry: CodeEntry,
     owner: Option<String>,
     allow_root: bool,
+    dry_run: bool,
+    verbose: bool,
     timeout_ms: u64,
 }
 
@@ -97,6 +105,7 @@ fn parse() -> Args {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET)),
         command: String::new(),
+        backend: None,
         user: None,
         purpose: "authenticate".into(),
         service: "rba".into(),
@@ -106,6 +115,8 @@ fn parse() -> Args {
         code_entry: CodeEntry::Device,
         owner: None,
         allow_root: false,
+        dry_run: false,
+        verbose: false,
         timeout_ms: rbad::server::DEFAULT_AUTH_TIMEOUT_MS,
     };
     let mut it = std::env::args().skip(1).peekable();
@@ -118,6 +129,10 @@ fn parse() -> Args {
         if !a.starts_with('-') {
             if args.command.is_empty() {
                 args.command = a;
+                continue;
+            }
+            if args.backend.is_none() && (args.command == "enable" || args.command == "disable") {
+                args.backend = Some(a);
                 continue;
             }
             eprintln!("rba: unexpected argument {a:?}");
@@ -150,6 +165,8 @@ fn parse() -> Args {
             }
             "--owner" => args.owner = Some(v("--owner")),
             "--allow-root" => args.allow_root = true,
+            "--dry-run" => args.dry_run = true,
+            "--verbose" => args.verbose = true,
             "--timeout" => args.timeout_ms = v("--timeout").parse().unwrap_or(90_000),
             "-h" | "--help" => help(),
             "-V" | "--version" => version(),
@@ -358,22 +375,25 @@ fn cmd_status(args: &Args) {
             _ => println!("pairing       closed"),
         }
     }
-    // Local integration state: which PAM stacks reference pam_rba.
-    println!();
-    println!("integrations:");
-    for (name, path) in [
-        ("gdm", "/etc/pam.d/gdm-password"),
-        ("polkit", "/etc/pam.d/polkit-1"),
-        ("sudo", "/etc/pam.d/sudo"),
-    ] {
-        let enabled = std::fs::read_to_string(path)
-            .map(|s| s.contains("pam_rba.so"))
-            .unwrap_or(false);
-        println!(
-            "  {:<8} {}",
-            name,
-            if enabled { "enabled" } else { "disabled" }
-        );
+    #[cfg(target_os = "linux")]
+    {
+        // Local integration state: which PAM stacks reference pam_rba.
+        println!();
+        println!("integrations:");
+        for (name, path) in [
+            ("gdm", "/etc/pam.d/gdm-password"),
+            ("polkit", "/etc/pam.d/polkit-1"),
+            ("sudo", "/etc/pam.d/sudo"),
+        ] {
+            let enabled = std::fs::read_to_string(path)
+                .map(|s| s.contains("pam_rba.so"))
+                .unwrap_or(false);
+            println!(
+                "  {:<8} {}",
+                name,
+                if enabled { "enabled" } else { "disabled" }
+            );
+        }
     }
 }
 
@@ -484,31 +504,41 @@ fn cmd_pair(args: &Args) {
         }
     }
 
-    // Wait for the daemon to finish the host side. The device may still be asking
-    // for its own confirmation; that is deliberately independent.
-    for _ in 0..150 {
+    // Wait for the daemon to finish the host side and the device to confirm.
+    // The device sends PAIRING_CONFIRMED after it persists its record; only then
+    // is the pairing fully complete and safe to claim as "Paired".
+    let confirmed = loop {
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let Ok(r) = request(args, &ControlRequest::Status) else {
+        let Ok(r) = request(args, &ControlRequest::PairingConfirmed) else {
             continue;
         };
+        if r.ok {
+            let Some(val) = r.result else { break false };
+            break val.as_bool().unwrap_or(false);
+        }
+        // If the pairing session has expired, give up.
         let Some(res) = &r.result else { continue };
         let still_open = res
             .get("pairing")
             .and_then(|p| p.get("seconds_remaining"))
             .is_some();
         if !still_open {
-            // The host persisted its side. The device persists only after its own
-            // human gate, and there is no device acknowledgement yet, so do not
-            // claim the pairing is complete. `rba devices` shows the final state.
-            match args.code_entry {
-                CodeEntry::Device => println!("Host side complete; finish on the device."),
-                CodeEntry::Host => println!("Host side complete; approve on the device."),
-            }
-            return;
+            break false;
         }
+    };
+
+    if confirmed {
+        // Device has confirmed its side; now safe to print the final result.
+        let model = args.device.as_deref().unwrap_or("");
+        if !model.is_empty() {
+            println!("Paired {} model.", model);
+        } else {
+            println!("Paired.");
+        }
+    } else {
+        eprintln!("rba: pairing timed out or cancelled");
+        std::process::exit(1);
     }
-    eprintln!("rba: pairing timed out");
-    std::process::exit(1);
 }
 
 fn cmd_auth(args: &Args) {
@@ -583,6 +613,89 @@ fn cmd_unpair(args: &Args) {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn cmd_enable(args: &Args) {
+    // Require root
+    if unsafe { libc::getuid() } != 0 {
+        eprintln!("rba: enable requires root (run with sudo or pkexec)");
+        std::process::exit(1);
+    }
+    let backend_name = match &args.backend {
+        Some(b) => b.as_str(),
+        None => {
+            eprintln!("rba: missing backend (gdm, polkit, sudo)");
+            std::process::exit(2);
+        }
+    };
+    let backend = match pam::find_backend(backend_name) {
+        Some(b) => b,
+        None => {
+            eprintln!("rba: unknown backend {backend_name:?} (gdm, polkit, sudo)");
+            std::process::exit(2);
+        }
+    };
+    let timeout_ms = (args.timeout_ms.min(60000).max(1000)) as u32;
+    let (old, new) = match pam::plan_enable(backend, timeout_ms) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("rba: {e}");
+            std::process::exit(1);
+        }
+    };
+    if args.dry_run {
+        print!("{}", pam::diff(backend, &old, &new));
+        println!("\nDry run only; no files changed.");
+        return;
+    }
+    print!("{}", pam::diff(backend, &old, &new));
+    print!("\nApply? [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err()
+        || !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
+    {
+        println!("Aborted; no files changed.");
+        std::process::exit(1);
+    }
+    if let Err(e) = pam::apply_enable(backend, timeout_ms, &old, &new) {
+        eprintln!("rba: {e}");
+        std::process::exit(1);
+    }
+    println!("Enabled {} (timeout {}ms).", backend.name, timeout_ms);
+    println!("Rollback: rba disable {}", backend.name);
+}
+
+#[cfg(target_os = "linux")]
+fn cmd_disable(args: &Args) {
+    if unsafe { libc::getuid() } != 0 {
+        eprintln!("rba: disable requires root (run with sudo or pkexec)");
+        std::process::exit(1);
+    }
+    let backend_name = match &args.backend {
+        Some(b) => b.as_str(),
+        None => {
+            eprintln!("rba: missing backend (gdm, polkit, sudo)");
+            std::process::exit(2);
+        }
+    };
+    let backend = match pam::find_backend(backend_name) {
+        Some(b) => b,
+        None => {
+            eprintln!("rba: unknown backend {backend_name:?} (gdm, polkit, sudo)");
+            std::process::exit(2);
+        }
+    };
+    if args.dry_run {
+        println!("Would roll back {}.", backend.target);
+        return;
+    }
+    if let Err(e) = pam::apply_rollback(backend) {
+        eprintln!("rba: {e}");
+        std::process::exit(1);
+    }
+    println!("Disabled {}.", backend.name);
+}
+
 fn cmd_version() {
     println!(
         "Remote Biometric Authenticator (rba) {}",
@@ -611,6 +724,10 @@ fn main() {
         "auth" => cmd_auth(&args),
         "revoke" => cmd_revoke(&args),
         "unpair" => cmd_unpair(&args),
+        #[cfg(target_os = "linux")]
+        "enable" => cmd_enable(&args),
+        #[cfg(target_os = "linux")]
+        "disable" => cmd_disable(&args),
         "version" => cmd_version(),
         "help" => help(),
         other => {

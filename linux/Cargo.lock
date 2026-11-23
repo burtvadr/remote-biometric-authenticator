@@ -732,6 +732,7 @@ dependencies = [
 name = "rba"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rba-protocol",
  "rbad",
  "serde",

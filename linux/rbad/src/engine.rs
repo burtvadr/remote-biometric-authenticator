@@ -132,7 +132,9 @@ struct ActivePairing {
     /// Code both sides derived, available once the device has submitted.
     derived: Option<String>,
     phase: PairingPhase,
-    /// Flipped by `confirm_pairing`; observed by the waiting connection task.
+    /// Flipped by `confirm_pairing`; flipped by `mark_pairing_confirmed` when the
+    /// device acknowledges its persistent state; observed by the waiting
+    /// connection task.
     confirmed: Arc<AtomicBool>,
     notify: Arc<Notify>,
     started_at: u64,
@@ -670,6 +672,18 @@ impl Engine {
         if let Ok(mut g) = self.pairing.lock() {
             *g = None;
         }
+    }
+
+    /// The device has persisted its pairing record and sent an acknowledgement.
+    ///
+    /// Flips the `confirmed` flag so that callers waiting on the host side
+    /// (e.g. `rba pair`) may consider the pairing fully complete.
+    pub fn mark_pairing_confirmed(&self) -> Result<()> {
+        if let Ok(mut g) = self.pairing.lock() {
+            let a = g.as_mut().ok_or(ProtocolError::NotPaired)?;
+            a.confirmed.store(true, Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     /// Drives the connection half of a pairing exchange.

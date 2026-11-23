@@ -2,7 +2,7 @@
 
 use crate::errors::{ProtocolError, Result};
 use crate::frame::Frame;
-use crate::pairing::{PairingResult, PairingStart, PairingSubmit, Unpair};
+use crate::pairing::{PairingConfirmed, PairingResult, PairingStart, PairingSubmit, Unpair};
 use crate::types::{
     AuthReject, AuthRequest, AuthResponse, ErrorMsg, SessionHello, SessionHelloAck,
 };
@@ -10,6 +10,7 @@ use crate::types::{
 pub const MSG_PAIRING_START: u16 = 1;
 pub const MSG_PAIRING_SUBMIT: u16 = 2;
 pub const MSG_PAIRING_RESULT: u16 = 3;
+pub const MSG_PAIRING_CONFIRMED: u16 = 4;
 pub const MSG_SESSION_HELLO: u16 = 10;
 pub const MSG_SESSION_HELLO_ACK: u16 = 11;
 pub const MSG_AUTH_REQUEST: u16 = 12;
@@ -18,10 +19,11 @@ pub const MSG_AUTH_REJECT: u16 = 14;
 pub const MSG_UNPAIR: u16 = 15;
 pub const MSG_ERROR: u16 = 20;
 
-pub const MESSAGE_NAMES: [(u16, &str); 10] = [
+pub const MESSAGE_NAMES: [(u16, &str); 11] = [
     (MSG_PAIRING_START, "PAIRING_START"),
     (MSG_PAIRING_SUBMIT, "PAIRING_SUBMIT"),
     (MSG_PAIRING_RESULT, "PAIRING_RESULT"),
+    (MSG_PAIRING_CONFIRMED, "PAIRING_CONFIRMED"),
     (MSG_SESSION_HELLO, "SESSION_HELLO"),
     (MSG_SESSION_HELLO_ACK, "SESSION_HELLO_ACK"),
     (MSG_AUTH_REQUEST, "AUTH_REQUEST"),
@@ -44,6 +46,7 @@ pub enum Message {
     PairingStart(PairingStart),
     PairingSubmit(PairingSubmit),
     PairingResult(PairingResult),
+    PairingConfirmed(PairingConfirmed),
     SessionHello(SessionHello),
     SessionHelloAck(SessionHelloAck),
     AuthRequest(AuthRequest),
@@ -59,6 +62,7 @@ impl Message {
             Message::PairingStart(_) => MSG_PAIRING_START,
             Message::PairingSubmit(_) => MSG_PAIRING_SUBMIT,
             Message::PairingResult(_) => MSG_PAIRING_RESULT,
+            Message::PairingConfirmed(_) => MSG_PAIRING_CONFIRMED,
             Message::SessionHello(_) => MSG_SESSION_HELLO,
             Message::SessionHelloAck(_) => MSG_SESSION_HELLO_ACK,
             Message::AuthRequest(_) => MSG_AUTH_REQUEST,
@@ -78,6 +82,7 @@ impl Message {
             Message::PairingStart(m) => m.to_payload(),
             Message::PairingSubmit(m) => m.to_payload(),
             Message::PairingResult(m) => m.to_payload(),
+            Message::PairingConfirmed(m) => m.to_payload(),
             Message::SessionHello(m) => m.to_payload(),
             Message::SessionHelloAck(m) => m.to_payload(),
             Message::AuthRequest(m) => m.to_payload(),
@@ -106,6 +111,9 @@ impl Message {
             MSG_PAIRING_START => Message::PairingStart(PairingStart::from_payload(&f.payload)?),
             MSG_PAIRING_SUBMIT => Message::PairingSubmit(PairingSubmit::from_payload(&f.payload)?),
             MSG_PAIRING_RESULT => Message::PairingResult(PairingResult::from_payload(&f.payload)?),
+            MSG_PAIRING_CONFIRMED => {
+                Message::PairingConfirmed(PairingConfirmed::from_payload(&f.payload)?)
+            }
             MSG_SESSION_HELLO => Message::SessionHello(SessionHello::from_payload(&f.payload)?),
             MSG_SESSION_HELLO_ACK => {
                 Message::SessionHelloAck(SessionHelloAck::from_payload(&f.payload)?)

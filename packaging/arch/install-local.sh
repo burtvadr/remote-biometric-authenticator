@@ -74,6 +74,12 @@ install -Dm0755 "$ROOT/linux/target/release/rba" /usr/local/bin/rba
 install -Dm0755 "$ROOT/linux/target/release/libpam_rba.so" \
     /usr/lib/security/pam_rba.so
 
+echo "==> installing PAM helper scripts"
+install -d /usr/libexec/rba
+for script in pam-gdm-rba.sh pam-polkit-rba.sh pam-sudo-rba.sh; do
+    install -Dm0755 "$ROOT/packaging/arch/$script" "/usr/libexec/rba/$script"
+done
+
 echo "==> installing the service"
 install -Dm0644 "$ROOT/linux/systemd/rbad.service" \
     /etc/systemd/system/rbad.service

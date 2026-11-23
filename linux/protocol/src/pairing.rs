@@ -644,6 +644,34 @@ pub struct PairingResult {
     pub revocation_token: Option<[u8; 32]>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingConfirmed {
+    pub session_id: Id,
+}
+
+impl PairingConfirmed {
+    pub fn to_payload(&self) -> Vec<u8> {
+        cbor::encode(&Value::map(vec![
+            ("session_id", Value::Bytes(self.session_id.0.to_vec())),
+        ]))
+    }
+
+    pub fn from_payload(payload: &[u8]) -> Result<PairingConfirmed> {
+        let v = cbor::decode_canonical(payload)
+            .map_err(|e| ProtocolError::BadRequest(format!("pairing_confirmed payload: {e}")))?;
+        let session_id = req_bytes(&v, "session_id")?;
+        if session_id.len() != 32 {
+            return Err(ProtocolError::BadRequest(
+                "session_id must be 32 bytes".into(),
+            ));
+        }
+        let sid_id = Id::from_slice(&session_id)?;
+        Ok(PairingConfirmed {
+            session_id: sid_id,
+        })
+    }
+}
+
 impl PairingResult {
     pub fn to_payload(&self) -> Vec<u8> {
         let mut e: Vec<(&str, Value)> = vec![
