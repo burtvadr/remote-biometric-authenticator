@@ -23,3 +23,7 @@ tests.
 
 When working on a feature, read the corresponding patch for ideas but write fresh
 code against the current `main`. Do not `git am` these patches.
+
+| `remote-biometric-authenticator-security-pake.patch` | Pairing upgrade: SPAKE2 PAKE (Phase 0) | Not started | 403KB, 6414 lines. Replaces ECDH+SAS pairing with SPAKE2. Massive scope. Does not apply to current tree. |
+
+| `remote-biometric-authenticator-security-pake.patch` | Pairing upgrade: SPAKE2 PAKE (Phase 0) | Not started | 403KB, 6414 lines. Replaces ECDH+SAS with SPAKE2 PAKE. Bumps protocol to v2. Does not apply to current tree. |
