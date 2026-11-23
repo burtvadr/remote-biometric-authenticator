@@ -1,0 +1,1440 @@
+From 73394f89bfc6838113d81583f5828dd5f2568222 Mon Sep 17 00:00:00 2001
+From: Patch Builder <patch-builder@example.invalid>
+Date: Mon, 23 Nov 2026 17:39:52 +0000
+Subject: [PATCH 3/3] feat(policy): enforce per-account per-device
+ authorization and rate limits
+
+---
+ .../io/github/burtvadr/rba/MainActivity.kt    |  11 +
+ .../burtvadr/rba/service/AppSettings.kt       |  18 ++
+ .../github/burtvadr/rba/session/HostLink.kt   |  28 +-
+ .../burtvadr/rba/ui/AuthenticatorScreen.kt    |  30 ++
+ docs/account-device-policy.md                 |  87 ++++++
+ linux/rba-sim/src/device.rs                   |   2 +-
+ linux/rba/src/main.rs                         |  78 ++++-
+ linux/rbad/src/account_policy.rs              | 276 ++++++++++++++++++
+ linux/rbad/src/engine.rs                      | 153 +++++++++-
+ linux/rbad/src/ipc.rs                         |  62 ++++
+ linux/rbad/src/lib.rs                         |  10 +-
+ linux/rbad/src/registry.rs                    |  56 +++-
+ linux/rbad/src/server.rs                      |  63 +++-
+ linux/rbad/tests/security.rs                  |  24 +-
+ 14 files changed, 864 insertions(+), 34 deletions(-)
+ create mode 100644 docs/account-device-policy.md
+ create mode 100644 linux/rbad/src/account_policy.rs
+
+diff --git a/android/app/src/main/kotlin/io/github/burtvadr/rba/MainActivity.kt b/android/app/src/main/kotlin/io/github/burtvadr/rba/MainActivity.kt
+index 26b079b..4a3485c 100644
+--- a/android/app/src/main/kotlin/io/github/burtvadr/rba/MainActivity.kt
++++ b/android/app/src/main/kotlin/io/github/burtvadr/rba/MainActivity.kt
+@@ -96,6 +96,7 @@ class MainActivity : androidx.fragment.app.FragmentActivity() {
+         var themeMode by mutableStateOf(AppSettings.themeMode(this))
+         var iconStyle by mutableStateOf(AppSettings.iconStyle(this))
+         var dynamicColor by mutableStateOf(AppSettings.dynamicColor(this))
++        var policyRevision by mutableStateOf(0)
+         AppIconController.apply(this, iconStyle, isDark(themeMode))
+ 
+         setContent {
+@@ -105,12 +106,22 @@ class MainActivity : androidx.fragment.app.FragmentActivity() {
+                 val connectedHostId by activeSession.connectedHostId.collectAsStateWithLifecycle()
+                 val discoveredKeyIds by activeSession.discoveredKeyIds.collectAsStateWithLifecycle()
+                 val backgroundStatus by background
++                val hostOperations = androidx.compose.runtime.remember(knownHosts, policyRevision) {
++                    knownHosts.associate { host ->
++                        host.hostId.toHex() to AppSettings.allowedOperations(this@MainActivity, host.hostId.toHex())
++                    }
++                }
+                 AuthenticatorScreen(
+                     state = state,
+                     deviceId = activeSession.deviceId.toHex(),
+                     deviceName = AuthenticatorRuntime.deviceName,
+                     capabilities = AuthenticatorRuntime.capabilities,
+                     hosts = knownHosts,
++                    hostOperations = hostOperations,
++                    onHostOperationToggle = { hostId, operation, allowed ->
++                        AppSettings.setAllowedOperation(this@MainActivity, hostId, operation, allowed)
++                        policyRevision++
++                    },
+                     connectedHostId = connectedHostId,
+                     discoveredKeyIds = discoveredKeyIds,
+                     background = backgroundStatus,
+diff --git a/android/app/src/main/kotlin/io/github/burtvadr/rba/service/AppSettings.kt b/android/app/src/main/kotlin/io/github/burtvadr/rba/service/AppSettings.kt
+index 74cf92f..a58cd4f 100644
+--- a/android/app/src/main/kotlin/io/github/burtvadr/rba/service/AppSettings.kt
++++ b/android/app/src/main/kotlin/io/github/burtvadr/rba/service/AppSettings.kt
+@@ -12,6 +12,8 @@ object AppSettings {
+     private const val KEY_THEME_MODE = "theme_mode"
+     private const val KEY_ICON_STYLE = "icon_style"
+     private const val KEY_DYNAMIC_COLOR = "dynamic_color"
++    private const val KEY_HOST_OPERATIONS = "host_operations_"
++    private val KNOWN_OPERATIONS = setOf("authenticate", "login", "sudo", "polkit", "unlock")
+ 
+     private fun prefs(context: Context) =
+         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+@@ -51,6 +53,22 @@ object AppSettings {
+         prefs(context).edit().putString(KEY_ICON_STYLE, style.name).apply()
+     }
+ 
++    /** Effective device-side capability toggles for one pinned host.
++     * Unknown operations are never enabled. Changes take effect immediately
++     * when requests arrive; newly enabled operations require a new session.
++     */
++    fun allowedOperations(context: Context, hostId: String): Set<String> =
++        prefs(context).getStringSet(KEY_HOST_OPERATIONS + hostId, null)
++            ?.intersect(KNOWN_OPERATIONS) ?: KNOWN_OPERATIONS
++
++    fun setAllowedOperation(context: Context, hostId: String, operation: String, allowed: Boolean) {
++        require(operation in KNOWN_OPERATIONS)
++        require(hostId.length == 32 && hostId.all { it in "0123456789abcdef" })
++        val changed = allowedOperations(context, hostId).toMutableSet()
++        if (allowed) changed.add(operation) else changed.remove(operation)
++        prefs(context).edit().putStringSet(KEY_HOST_OPERATIONS + hostId, changed).apply()
++    }
++
+     /** Material You wallpaper colors; off by default so the designed scheme appears. */
+     fun dynamicColor(context: Context): Boolean =
+         prefs(context).getBoolean(KEY_DYNAMIC_COLOR, false)
+diff --git a/android/app/src/main/kotlin/io/github/burtvadr/rba/session/HostLink.kt b/android/app/src/main/kotlin/io/github/burtvadr/rba/session/HostLink.kt
+index 33522ae..c6a9057 100644
+--- a/android/app/src/main/kotlin/io/github/burtvadr/rba/session/HostLink.kt
++++ b/android/app/src/main/kotlin/io/github/burtvadr/rba/session/HostLink.kt
+@@ -3,10 +3,12 @@ package io.github.burtvadr.rba.session
+ import android.content.Context
+ import android.net.wifi.WifiManager
+ import android.util.Log
++import io.github.burtvadr.rba.protocol.ErrorCode
+ import io.github.burtvadr.rba.protocol.Frame
+ import io.github.burtvadr.rba.protocol.Message
+ import io.github.burtvadr.rba.protocol.SessionHello
+ import io.github.burtvadr.rba.transport.WifiTransport
++import io.github.burtvadr.rba.service.AppSettings
+ import kotlinx.coroutines.CompletableDeferred
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+@@ -307,6 +309,7 @@ class HostLink(
+             // The bootstrap link stays open only to hold that context; no
+             // authentication may be answered on it.
+             var pairingParked = false
++            var negotiatedOperations: Set<String>? = null
+ 
+             while (isCurrent(token)) {
+                 val frame = transport.receive() ?: break
+@@ -359,7 +362,11 @@ class HostLink(
+                             Log.w(TAG, "untrusted or incompatible capability offer")
+                             break
+                         }
+-                        val locallyEnabled = io.github.burtvadr.rba.protocol.Capabilities.known
++                        if (negotiatedOperations != null) {
++                            Log.w(TAG, "capability renegotiation requires a fresh session")
++                            break
++                        }
++                        val locallyEnabled = AppSettings.allowedOperations(context, hello.hostId.toHex())
+                         if (!offer.required.all { it in locallyEnabled && it in offer.operations }) {
+                             Log.w(TAG, "required capability missing")
+                             break
+@@ -368,6 +375,7 @@ class HostLink(
+                             sessionId = hello.sessionId, endpoint = "device",
+                             operations = offer.operations.filter { it in locallyEnabled },
+                         )
++                        negotiatedOperations = reply.operations.toSet()
+                         outbound.trySend(Message.CapabilitiesMessage(reply).toFrame())
+                     }
+ 
+@@ -390,6 +398,24 @@ class HostLink(
+                             Log.w(TAG, "refusing an authentication request on an unpinned link")
+                             break
+                         }
++                        // A changed local toggle is enforced on every request,
++                        // not merely when capabilities were exchanged. Enabling
++                        // a permission cannot retroactively widen a live session.
++                        val req = message.v
++                        val op = when {
++                            req.purpose == "sudo" || req.service == "sudo" || req.service == "su" || req.operation == "sudo" -> "sudo"
++                            req.purpose == "polkit" || req.service == "polkit-1" || req.service.startsWith("polkit:") || req.operation == "polkit" -> "polkit"
++                            req.operation == "login" || (req.operation == "authenticate" && req.purpose == "login") -> "login"
++                            req.operation == "unlock" || (req.operation == "authenticate" && req.purpose == "unlock") -> "unlock"
++                            req.operation == "authenticate" && req.purpose == "authenticate" -> "authenticate"
++                            else -> null
++                        }
++                        if (op == null || op !in (negotiatedOperations ?: emptySet()) ||
++                            op !in AppSettings.allowedOperations(context, hello.hostId.toHex())) {
++                            Log.w(TAG, "request denied by capability toggle")
++                            session.reject(req, ErrorCode.CONTEXT_MISMATCH)
++                            continue
++                        }
+                         session.offerRequest(message.v)
+                     }
+ 
+diff --git a/android/app/src/main/kotlin/io/github/burtvadr/rba/ui/AuthenticatorScreen.kt b/android/app/src/main/kotlin/io/github/burtvadr/rba/ui/AuthenticatorScreen.kt
+index 806861e..50c9aa8 100644
+--- a/android/app/src/main/kotlin/io/github/burtvadr/rba/ui/AuthenticatorScreen.kt
++++ b/android/app/src/main/kotlin/io/github/burtvadr/rba/ui/AuthenticatorScreen.kt
+@@ -114,6 +114,8 @@ fun AuthenticatorScreen(
+     deviceName: String,
+     capabilities: DeviceAuthKey.Capabilities?,
+     hosts: List<KnownHost>,
++    hostOperations: Map<String, Set<String>>,
++    onHostOperationToggle: (String, String, Boolean) -> Unit,
+     connectedHostId: io.github.burtvadr.rba.protocol.Id?,
+     discoveredKeyIds: Set<String>,
+     background: BackgroundStatus,
+@@ -176,6 +178,9 @@ fun AuthenticatorScreen(
+                     modifier = Modifier.padding(padding),
+                 )
+                 Tab.SETTINGS -> SettingsScreen(
++                    hosts = hosts,
++                    hostOperations = hostOperations,
++                    onHostOperationToggle = onHostOperationToggle,
+                     themeMode = themeMode,
+                     iconStyle = iconStyle,
+                     dynamicColor = dynamicColor,
+@@ -738,6 +743,9 @@ private fun InfoRow(
+ 
+ @Composable
+ private fun SettingsScreen(
++    hosts: List<KnownHost>,
++    hostOperations: Map<String, Set<String>>,
++    onHostOperationToggle: (String, String, Boolean) -> Unit,
+     themeMode: ThemeMode,
+     iconStyle: AppIconStyle,
+     dynamicColor: Boolean,
+@@ -810,6 +818,28 @@ private fun SettingsScreen(
+                 }
+             }
+         }
++        item { SectionHeader("Host capability permissions") }
++        if (hosts.isEmpty()) {
++            item { Text("Pair a host to configure its operation permissions.") }
++        }
++        hosts.forEach { host ->
++            item(key = "capabilities-${host.hostId.toHex()}") {
++                val hostId = host.hostId.toHex()
++                val allowed = hostOperations[hostId] ?: emptySet()
++                Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp),
++                    colors = CardDefaults.cardColors(containerColor = cardContainer())) {
++                    Column {
++                        Text(host.hostName, modifier = Modifier.padding(16.dp),
++                            style = MaterialTheme.typography.titleMedium)
++                        listOf("authenticate", "login", "unlock", "sudo", "polkit").forEach { operation ->
++                            SwitchRow(title = operation, subtitle = "Allowed for this pinned host",
++                                checked = operation in allowed, enabled = true,
++                                onCheckedChange = { enabled -> onHostOperationToggle(hostId, operation, enabled) })
++                        }
++                    }
++                }
++            }
++        }
+         item { SectionHeader("About") }
+         item {
+             Card(
+diff --git a/docs/account-device-policy.md b/docs/account-device-policy.md
+new file mode 100644
+index 0000000..9caaf2b
+--- /dev/null
++++ b/docs/account-device-policy.md
+@@ -0,0 +1,87 @@
++# Account/device policy matrix (policy v1)
++
++The daemon evaluates five independent gates before creating any challenge:
++
++1. The device must be paired and its public key must still match the registry.
++2. The destination account must have `device_login=true` and the device ID in
++   `allowed_devices`; the device must also have `device_login=true`.
++3. The device must be owned by the account (ownership fixed at physical pairing)
++   **or** explicitly delegated: the target account must include the ID in
++   `delegated_devices`, and the device must have `allow_delegation=true`.
++   Only root may configure delegation. A delegated device cannot approve root
++   or elevated operations.
++4. The normalized operation must be allowed by **both** the account and device
++   `allowed_operations` and by the authenticated link's capabilities v1. The
++   union of permissions is never used. Changing a device toggle during a live
++   connection cannot widen its previously negotiated operation set.
++5. `sudo`/`su` and polkit service contexts count as elevation regardless of a
++   generic `operation=authenticate` value. Both account and device must have
++   `allow_elevated=true`; the device must be owned by the account, not delegated.
++   Root additionally requires a *root-owned* device physically paired using
++   `--allow-root`, then both explicit elevation toggles.
++
++These checks protect **biometric authentication**, not operating-system
++privileges. The daemon does not grant sudo rights, override PAM account policy,
++or bypass polkit action authorization.
++
++## Management and examples
++
++`rba policy --user alice` reads account policy. Pairing a device initially adds
++its ID to the owner's allowlist, enables login and permits only
++`authenticate,login,unlock`. Unknown or missing account records deny access.
++
++```
++# As root; replace IDs with real IDs returned by `rba devices`:
++rba policy --user alice --allowed-devices ID1,ID2
++rba policy --user alice --operations authenticate,login,unlock
++rba policy --user alice --rate-per-minute 5
++rba policy --user alice --allow-elevated yes --operations authenticate,login,unlock,sudo
++rba device-policy --device ID1 --allow-elevated yes --operations authenticate,login,unlock,sudo
++
++# A root-approved delegation from Alice's device to Bob, never elevated:
++rba device-policy --device ID1 --delegation yes
++rba policy --user bob --allowed-devices ID1 --delegated-devices ID1 --device-login yes
++
++# Account owner may toggle only their own login without changing privileges:
++rba policy --device-login no
++```
++
++`rba device-policy --device ID` reads device-local restrictions. Only root can
++modify device policy, grant devices to other accounts, delegate devices, adjust
++operation allowlists, change elevation flags, or adjust per-account limits.
++
++## Rate limiting
++
++Each account has an independent exact 60-second sliding window, by default five
++requests per minute, configurable from 1 to 60 by root. Requests across several
++devices and transports share the same account window. Existing per-device and
++per-transport limits remain and are also enforced. Denied over-limit attempts
++continue to count; a self-service `device_login` toggle does **not** clear the
++rate window. Restart currently resets in-memory rate history.
++
++## State and compatibility
++
++Each account is saved as `<state>/accounts/<user>` and each device as
++`<state>/devices/<device-id>`, with exactly one lowercase hex-encoded canonical
++CBOR map plus newline per file. State files are written mode 0600 through the
++existing atomic private-write helper. Device registry schema v2 introduces
++operation/delegation/elevation flags and deliberately **does not** load old v1
++records; re-pair devices on upgrade. Account policies are v1 and malformed
++records fail daemon startup, rather than silently granting default access.
++Audit and IPC also use newline-delimited hex-encoded canonical CBOR, never
++runtime JSON. There is no backward-compatible JSON reader. Operators must plan
++for intentional re-pairing and client upgrades before replacing an existing
++installation.
++
++## Focused checks
++
++- Paired owner authenticates for normal login; unlisted account cannot.
++- `device_login=false` on **either** side prevents authentication.
++- Delegation requires account allowlist, account delegation and device toggle;
++  it never authorizes sudo, polkit or root.
++- Privileged services default-deny until owner, both elevation flags and both
++  operation allowlists agree.
++- Unknown capabilities, a missing negotiation or altered session offers deny.
++- Account rate limit cannot be avoided by changing device or transport.
++- Malformed policy/registry CBOR and version mismatch never grant access.
++- A self-service toggle does not reset a saturated per-user rate window.
+diff --git a/linux/rba-sim/src/device.rs b/linux/rba-sim/src/device.rs
+index bcb7583..9b89a1d 100644
+--- a/linux/rba-sim/src/device.rs
++++ b/linux/rba-sim/src/device.rs
+@@ -277,7 +277,7 @@ where
+         }
+     }
+ 
+-    async fn send(&mut self, m: &Message) -> Result<()> {
++    pub async fn send(&mut self, m: &Message) -> Result<()> {
+         self.writer
+             .write_frame(&m.to_frame())
+             .await
+diff --git a/linux/rba/src/main.rs b/linux/rba/src/main.rs
+index 22c5486..63da2ae 100644
+--- a/linux/rba/src/main.rs
++++ b/linux/rba/src/main.rs
+@@ -9,6 +9,7 @@ use std::path::PathBuf;
+ 
+ use rba_protocol::pairing::CodeEntry;
+ use rbad::ipc::{ControlRequest, ControlResponse};
++use rbad::account_policy::PolicyPatch;
+ 
+ const DEFAULT_SOCKET: &str = rbad::config::DEFAULT_SOCKET;
+ 
+@@ -27,6 +28,8 @@ fn usage_text() -> String {
+          \x20   unpair --device D         remove trust for a device (owner or root)\n\
+          \x20   revoke --device D         revoke an authenticator immediately (root only)\n\
+          \x20   doctor                    check that everything is wired correctly\n\
++         \x20   policy --user U           inspect or edit account authorization rules\n\
++         \x20   device-policy --device D  edit device-local toggles (root only)\n\
+          \x20   version                   print the product and protocol version\n\
+          \x20   help                      show this help\n\
+          \n\
+@@ -42,8 +45,15 @@ fn usage_text() -> String {
+          \x20   --user NAME      Linux user to authenticate (defaults to $USER)\n\
+          \x20   --purpose P      purpose, e.g. sudo, login, polkit  (default authenticate)\n\
+          \x20   --service S      PAM service / polkit action       (default rba)\n\
+-         \x20   --operation O    authenticate or authorize         (default authenticate)\n\
++         \x20   --operation O    authenticate, login, sudo, polkit or unlock         (default authenticate)\n\
+          \x20   -s, --device D   device name or id (default: any connected authenticator)\n\
++         \x20   --device-login yes|no           account/device login toggle\n\
++         \x20   --allowed-devices ID,ID       account allowlist (root)\n\
++         \x20   --delegated-devices ID,ID     delegated device IDs (root)\n\
++         \x20   --operations OP,OP            allowed operations (root)\n\
++         \x20   --delegation yes|no           permit cross-account delegation (root)\n\
++         \x20   --allow-elevated yes|no       privileged authentication toggle (root)\n\
++         \x20   --rate-per-minute N           per-account limit, 1..60 (root)\n\
+          \x20   --timeout MS     how long to wait                     (default 90000)\n\
+          \x20   -h, --help       show this help\n\
+          \x20   -V, --version    print the product and protocol version\n\
+@@ -51,8 +61,9 @@ fn usage_text() -> String {
+          ENVIRONMENT:\n\
+          \x20   RBA_SOCKET       control socket (default {DEFAULT_SOCKET})\n\
+          \n\
+-         A device authenticates only the account it was paired for. Root is denied\n\
+-         unless pairing used --allow-root. The 'auth' command performs no\n\
++         A device authenticates an account only through the explicit policy\n\
++         intersection. Root requires a root-owned device, --allow-root, and both\n\
++         elevated toggles. The 'auth' command performs no\n\
+          cryptography here: it asks the daemon, which verifies a signature over a\n\
+          fresh challenge against the registered device public key.\n",
+         rba_protocol::VERSION
+@@ -90,6 +101,8 @@ struct Args {
+     owner: Option<String>,
+     allow_root: bool,
+     timeout_ms: u64,
++    patch: PolicyPatch,
++    delegation: Option<bool>,
+ }
+ 
+ fn parse() -> Args {
+@@ -108,6 +121,8 @@ fn parse() -> Args {
+         owner: None,
+         allow_root: false,
+         timeout_ms: rbad::server::DEFAULT_AUTH_TIMEOUT_MS,
++        patch: PolicyPatch::default(),
++        delegation: None,
+     };
+     let mut it = std::env::args().skip(1).peekable();
+     if it.peek().is_none() {
+@@ -151,6 +166,13 @@ fn parse() -> Args {
+             }
+             "--owner" => args.owner = Some(v("--owner")),
+             "--allow-root" => args.allow_root = true,
++            "--device-login" => args.patch.device_login = Some(read_bool(&v("--device-login"))),
++            "--allow-elevated" => args.patch.allow_elevated = Some(read_bool(&v("--allow-elevated"))),
++            "--delegation" => args.delegation = Some(read_bool(&v("--delegation"))),
++            "--allowed-devices" => args.patch.allowed_devices = Some(read_csv(&v("--allowed-devices"))),
++            "--delegated-devices" => args.patch.delegated_devices = Some(read_csv(&v("--delegated-devices"))),
++            "--operations" => args.patch.allowed_operations = Some(read_csv(&v("--operations"))),
++            "--rate-per-minute" => args.patch.rate_per_minute = Some(v("--rate-per-minute").parse().unwrap_or_else(|_|usage())),
+             "--timeout" => args.timeout_ms = v("--timeout").parse().unwrap_or(90_000),
+             "-h" | "--help" => help(),
+             "-V" | "--version" => version(),
+@@ -163,6 +185,13 @@ fn parse() -> Args {
+     args
+ }
+ 
++fn read_bool(s: &str) -> bool {
++    match s { "yes" | "true" | "on" => true, "no" | "false" | "off" => false, _ => usage() }
++}
++fn read_csv(s: &str) -> Vec<String> {
++    if s.is_empty() { vec![] } else { s.split(',').map(str::to_owned).collect() }
++}
++
+ /// Sends one control request and returns the response.
+ fn request(args: &Args, req: &ControlRequest) -> Result<ControlResponse, String> {
+     rbad::ipc::call_control(&args.socket, req).map_err(|e| format!("control socket {}: {e}",args.socket.display()))
+@@ -207,6 +236,47 @@ fn current_user() -> String {
+         .unwrap_or_else(|_| "root".into())
+ }
+ 
++fn cmd_policy(args: &Args, device: bool) {
++    let user = args.user.clone().unwrap_or_else(current_user);
++    let has_patch = args.patch.device_login.is_some() || args.patch.administrative();
++    let req = if device {
++        let id = args.device.clone().unwrap_or_else(||usage());
++        if !has_patch && args.delegation.is_none() {
++            ControlRequest::DevicePolicyGet {device:id}
++        } else {
++        if args.patch.allowed_devices.is_some() || args.patch.delegated_devices.is_some()
++            || args.patch.rate_per_minute.is_some() { usage(); }
++        ControlRequest::DevicePolicySet {device:id, device_login:args.patch.device_login,
++            allow_delegation:args.delegation, allow_elevated:args.patch.allow_elevated,
++            allowed_operations:args.patch.allowed_operations.clone() }
++        }
++    } else if has_patch {
++        if args.delegation.is_some() { usage(); }
++        ControlRequest::PolicySet {user, patch:args.patch.clone()}
++    } else {
++        if args.delegation.is_some() { usage(); }
++        ControlRequest::PolicyGet {user}
++    };
++    let resp = request(args, &req).unwrap_or_else(|e| {eprintln!("rba: {e}");std::process::exit(1)});
++    if !resp.ok { fail(&resp); }
++    if let Some(fields) = &resp.result {
++        for key in ["user", "owner", "device_login", "allowed_devices", "delegated_devices",
++            "allowed_operations", "allow_delegation", "allow_elevated", "rate_per_minute"] {
++            if let Some(value) = fields.get(key) {
++                let show = match value {
++                    rba_protocol::cbor::Value::Text(s) => s.clone(),
++                    rba_protocol::cbor::Value::Bool(b) => b.to_string(),
++                    rba_protocol::cbor::Value::Uint(n) => n.to_string(),
++                    rba_protocol::cbor::Value::Array(a) => a.iter()
++                        .filter_map(|v| v.as_text()).collect::<Vec<_>>().join(","),
++                    _ => "(unsupported)".into(),
++                };
++                println!("{key:<20} {show}");
++            }
++        }
++    }
++}
++
+ fn cmd_devices(args: &Args) {
+     let resp = request(args, &ControlRequest::List).unwrap_or_else(|e| {
+         eprintln!("rba: {e}");
+@@ -730,6 +800,8 @@ fn main() {
+         "revoke" => cmd_revoke(&args),
+         "unpair" => cmd_unpair(&args),
+         "doctor" => cmd_doctor(&args),
++        "policy" => cmd_policy(&args, false),
++        "device-policy" => cmd_policy(&args, true),
+         "version" => cmd_version(),
+         "help" => help(),
+         other => {
+diff --git a/linux/rbad/src/account_policy.rs b/linux/rbad/src/account_policy.rs
+new file mode 100644
+index 0000000..790c785
+--- /dev/null
++++ b/linux/rbad/src/account_policy.rs
+@@ -0,0 +1,276 @@
++//! Versioned, persistent host-side authorization matrix.
++//!
++//! The effective permission is the intersection of: a paired device, its
++//! operator-owned device policy, the target account's allow-list and policy,
++//! and the live session's capabilities. Delegation is an explicit, root-managed
++//! exception to *ownership*, never to operation or elevation checks.
++use std::collections::{BTreeMap, BTreeSet};
++use std::path::{Path, PathBuf};
++
++use rba_protocol::capabilities::KNOWN_OPERATIONS;
++use rba_protocol::cbor::Value;
++use rba_protocol::errors::{ProtocolError, Result};
++use rba_protocol::types::Id;
++
++use crate::config;
++use crate::registry::DeviceRecord;
++
++const DEFAULT_RATE: u32 = 5;
++const MAX_RATE: u32 = 60;
++
++pub fn valid_user(user: &str) -> bool {
++    !user.is_empty() && user.len() <= 64 && user != "." && user != ".."
++        && user.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
++}
++
++pub fn valid_operations(ops: &[String]) -> bool {
++    ops.len() <= KNOWN_OPERATIONS.len()
++        && ops.iter().all(|op| KNOWN_OPERATIONS.contains(&op.as_str()))
++        && ops.iter().collect::<BTreeSet<_>>().len() == ops.len()
++}
++
++fn valid_devices(devices: &[String]) -> bool {
++    devices.len() <= 128 && devices.iter().all(|id| Id::from_hex(id).is_ok())
++        && devices.iter().collect::<BTreeSet<_>>().len() == devices.len()
++}
++
++#[derive(Debug, Clone, Default)]
++pub struct PolicyPatch {
++    pub device_login: Option<bool>,
++    pub allowed_devices: Option<Vec<String>>,
++    pub delegated_devices: Option<Vec<String>>,
++    pub allowed_operations: Option<Vec<String>>,
++    pub allow_elevated: Option<bool>,
++    pub rate_per_minute: Option<u32>,
++}
++
++impl PolicyPatch {
++    /// All fields except self-service device_login require root.
++    pub fn administrative(&self) -> bool {
++        self.allowed_devices.is_some() || self.delegated_devices.is_some()
++            || self.allowed_operations.is_some() || self.allow_elevated.is_some()
++            || self.rate_per_minute.is_some()
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct AccountPolicy {
++    pub user: String,
++    pub device_login: bool,
++    pub allowed_devices: Vec<String>,
++    pub delegated_devices: Vec<String>,
++    pub allowed_operations: Vec<String>,
++    pub allow_elevated: bool,
++    pub rate_per_minute: u32,
++}
++
++impl AccountPolicy {
++    pub fn deny_all(user: &str) -> Self {
++        Self { user: user.into(), device_login: false, allowed_devices: vec![],
++            delegated_devices: vec![], allowed_operations: vec!["authenticate".into(), "login".into(), "unlock".into()],
++            allow_elevated: false, rate_per_minute: DEFAULT_RATE }
++    }
++    fn update(&mut self, patch: &PolicyPatch) -> Result<()> {
++        if let Some(v) = patch.device_login { self.device_login = v; }
++        if let Some(v) = &patch.allowed_devices { self.allowed_devices = v.clone(); }
++        if let Some(v) = &patch.delegated_devices { self.delegated_devices = v.clone(); }
++        if let Some(v) = &patch.allowed_operations { self.allowed_operations = v.clone(); }
++        if let Some(v) = patch.allow_elevated { self.allow_elevated = v; }
++        if let Some(v) = patch.rate_per_minute { self.rate_per_minute = v; }
++        self.validate()
++    }
++    fn validate(&self) -> Result<()> {
++        if !valid_user(&self.user) || !valid_devices(&self.allowed_devices)
++            || !valid_devices(&self.delegated_devices)
++            || self.allowed_operations.is_empty() || !valid_operations(&self.allowed_operations)
++            || self.rate_per_minute == 0 || self.rate_per_minute > MAX_RATE {
++            return Err(ProtocolError::BadRequest("invalid account policy field".into()));
++        }
++        if !self.delegated_devices.iter().all(|id| self.allowed_devices.contains(id)) {
++            return Err(ProtocolError::BadRequest("delegated device must also be allowed".into()));
++        }
++        Ok(())
++    }
++    pub fn to_value(&self) -> Value {
++        Value::map([
++            ("v", Value::Uint(1)), ("user", Value::Text(self.user.clone())),
++            ("device_login", Value::Bool(self.device_login)),
++            ("allowed_devices", texts(&self.allowed_devices)),
++            ("delegated_devices", texts(&self.delegated_devices)),
++            ("allowed_operations", texts(&self.allowed_operations)),
++            ("allow_elevated", Value::Bool(self.allow_elevated)),
++            ("rate_per_minute", Value::Uint(self.rate_per_minute as u64)),
++        ])
++    }
++    fn from_value(v: &Value) -> Option<Self> {
++        let Value::Map(entries) = v else { return None; };
++        if entries.len() != 8 || v.get("v")?.as_uint()? != 1 { return None; }
++        let policy = Self {
++            user: v.get("user")?.as_text()?.into(),
++            device_login: v.get("device_login")?.as_bool()?,
++            allowed_devices: read_texts(v.get("allowed_devices")?)?,
++            delegated_devices: read_texts(v.get("delegated_devices")?)?,
++            allowed_operations: read_texts(v.get("allowed_operations")?)?,
++            allow_elevated: v.get("allow_elevated")?.as_bool()?,
++            rate_per_minute: v.get("rate_per_minute")?.as_uint()?.try_into().ok()?,
++        };
++        policy.validate().ok()?;
++        Some(policy)
++    }
++    pub fn authorize(&self, device: &DeviceRecord, op: &str) -> Result<()> {
++        let id = &device.device_id;
++        if !self.device_login || !device.policy.device_login
++            || !device.status.may_authenticate()
++            || !self.allowed_devices.contains(id)
++            || !self.allowed_operations.iter().any(|o| o == op)
++            || !device.policy.allowed_operations.iter().any(|o| o == op) {
++            return Err(ProtocolError::ContextMismatch("account/device policy denies operation".into()));
++        }
++        let owner = device.policy.users.first().map(String::as_str) == Some(self.user.as_str());
++        if !owner {
++            if self.user == "root" || !device.policy.allow_delegation
++                || !self.delegated_devices.contains(id) {
++                return Err(ProtocolError::ContextMismatch("device has no delegation for account".into()));
++            }
++        }
++        let elevated = matches!(op, "sudo" | "polkit") || self.user == "root";
++        if elevated && (!owner || !self.allow_elevated || !device.policy.allow_elevated) {
++            return Err(ProtocolError::ContextMismatch("elevated authentication not permitted".into()));
++        }
++        if self.user == "root" && !device.policy.allow_root {
++            return Err(ProtocolError::ContextMismatch("root requires explicit device opt-in".into()));
++        }
++        Ok(())
++    }
++}
++
++fn texts(s: &[String]) -> Value { Value::Array(s.iter().cloned().map(Value::Text).collect()) }
++fn read_texts(v: &Value) -> Option<Vec<String>> {
++    let Value::Array(items) = v else { return None; };
++    items.iter().map(|x| x.as_text().map(str::to_owned)).collect()
++}
++
++pub struct AccountPolicies {
++    path: Option<PathBuf>,
++    accounts: BTreeMap<String, AccountPolicy>,
++}
++impl AccountPolicies {
++    pub fn in_memory() -> Self { Self { path: None, accounts: BTreeMap::new() } }
++    pub fn load(path: &Path) -> Result<Self> {
++        let mut out = Self { path: Some(path.to_owned()), accounts: BTreeMap::new() };
++        if !path.exists() { return Ok(out); }
++        for item in std::fs::read_dir(path).map_err(|e| ProtocolError::Internal(format!("read accounts: {e}")))? {
++            let item = item.map_err(|e| ProtocolError::Internal(format!("read account record: {e}")))?;
++            if !item.file_type().map(|t| t.is_file()).unwrap_or(false) { continue; }
++            let user = item.file_name().to_string_lossy().to_string();
++            if !valid_user(&user) { continue; }
++            let raw = std::fs::read_to_string(item.path())
++                .map_err(|e| ProtocolError::Internal(format!("read account {user}: {e}")))?;
++            let policy = rba_protocol::line::decode_cbor_line(&raw)
++                .and_then(|v| AccountPolicy::from_value(&v))
++                .ok_or_else(|| ProtocolError::Internal(format!("invalid policy for {user}; failing closed")))?;
++            if policy.user != user { return Err(ProtocolError::Internal("account policy filename mismatch".into())); }
++            out.accounts.insert(user, policy);
++        }
++        Ok(out)
++    }
++    pub fn get(&self, user: &str) -> AccountPolicy {
++        self.accounts.get(user).cloned().unwrap_or_else(|| AccountPolicy::deny_all(user))
++    }
++    fn write(&self, policy: &AccountPolicy) -> Result<()> {
++        if let Some(dir) = &self.path {
++            config::write_private(&dir.join(&policy.user), rba_protocol::line::encode_cbor_line(&policy.to_value()).as_bytes())
++                .map_err(|e| ProtocolError::Internal(format!("save account policy: {e}")))?;
++        }
++        Ok(())
++    }
++    /// Physical pairing enrolls exactly the owner and its verified device ID.
++    /// This never adds a delegated account or enables elevation.
++    pub fn enrol(&mut self, user: &str, device: &Id) -> Result<()> {
++        if !valid_user(user) { return Err(ProtocolError::BadRequest("invalid account name".into())); }
++        let mut policy = self.get(user);
++        let id = device.to_hex();
++        if !policy.allowed_devices.contains(&id) { policy.allowed_devices.push(id); }
++        policy.device_login = true;
++        policy.validate()?;
++        self.write(&policy)?;
++        self.accounts.insert(user.into(), policy);
++        Ok(())
++    }
++    /// Root may configure the matrix; ordinary users can only toggle their own
++    /// device_login flag (not add devices or raise privilege/rate caps).
++    pub fn patch(&mut self, user: &str, patch: &PolicyPatch, admin: bool) -> Result<AccountPolicy> {
++        if !valid_user(user) { return Err(ProtocolError::BadRequest("invalid account name".into())); }
++        if !admin && patch.administrative() {
++            return Err(ProtocolError::ContextMismatch("policy management requires root".into()));
++        }
++        let mut policy = self.get(user);
++        policy.update(patch)?;
++        self.write(&policy)?;
++        self.accounts.insert(user.into(), policy.clone());
++        Ok(policy)
++    }
++}
++
++#[cfg(test)] mod tests {
++    use super::*;
++    use crate::registry::{DevicePolicy, DeviceStatus};
++    fn fixture() -> (AccountPolicy, DeviceRecord) {
++        let device = Id::from_slice(&[7u8; 16]).unwrap();
++        let mut acc = AccountPolicy::deny_all("alice");
++        acc.device_login = true;
++        acc.allowed_devices.push(device.to_hex());
++        let rec = DeviceRecord { device_id: device.to_hex(), name: "key".into(), public_key: String::new(),
++            added_at: 1, last_seen: None, status: DeviceStatus::Paired,
++            policy: DevicePolicy::for_user("alice"), revocation_token_hash: None, auth_count: 0 };
++        (acc, rec)
++    }
++    #[test] fn intersection_deny_login_elevation_and_unlisted() {
++        let (mut a, mut d) = fixture();
++        assert!(a.authorize(&d, "login").is_ok());
++        a.device_login = false;
++        assert!(a.authorize(&d, "login").is_err());
++        a.device_login = true;
++        assert!(a.authorize(&d, "sudo").is_err());
++        a.allowed_operations.push("sudo".into());
++        a.allow_elevated = true;
++        assert!(a.authorize(&d, "sudo").is_err());
++        d.policy.allowed_operations.push("sudo".into());
++        d.policy.allow_elevated = true;
++        assert!(a.authorize(&d, "sudo").is_ok());
++        a.allowed_devices.clear();
++        assert!(a.authorize(&d, "login").is_err());
++        d.status = DeviceStatus::Revoked;
++        assert!(a.authorize(&d, "login").is_err());
++    }
++    #[test] fn delegation_is_explicit_and_never_elevates() {
++        let (mut a, mut d) = fixture();
++        a.user = "bob".into();
++        assert!(a.authorize(&d, "login").is_err());
++        a.delegated_devices.push(d.device_id.clone());
++        assert!(a.authorize(&d, "login").is_err());
++        d.policy.allow_delegation = true;
++        assert!(a.authorize(&d, "login").is_ok());
++        a.allowed_operations.push("sudo".into());
++        a.allow_elevated = true;
++        d.policy.allowed_operations.push("sudo".into());
++        d.policy.allow_elevated = true;
++        assert!(a.authorize(&d, "sudo").is_err());
++    }
++    #[test] fn persistence_is_canonical_and_malformed_fails() {
++        let dir = std::env::temp_dir().join(format!("rba-account-test-{}",std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        let id = Id::from_slice(&[1u8;16]).unwrap();
++        let mut set = AccountPolicies::load(&dir).unwrap();
++        set.enrol("alice", &id).unwrap();
++        assert!(AccountPolicies::load(&dir).unwrap().get("alice").allowed_devices.contains(&id.to_hex()));
++        std::fs::write(dir.join("alice"), "{}\\n").unwrap();
++        assert!(AccountPolicies::load(&dir).is_err());
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++    #[test] fn ordinary_user_cannot_change_admin_fields() {
++        let mut set = AccountPolicies::in_memory();
++        assert!(set.patch("alice", &PolicyPatch { allow_elevated: Some(true), ..Default::default() },false).is_err());
++        assert!(set.patch("alice", &PolicyPatch { device_login: Some(false), ..Default::default() },false).is_ok());
++    }
++}
+diff --git a/linux/rbad/src/engine.rs b/linux/rbad/src/engine.rs
+index 450f018..d3ec0e0 100644
+--- a/linux/rbad/src/engine.rs
++++ b/linux/rbad/src/engine.rs
+@@ -28,6 +28,7 @@ use rba_protocol::types::{
+ use rba_protocol::verifier;
+ use tokio::sync::{mpsc, oneshot, Notify};
+ 
++use crate::account_policy::{AccountPolicies, AccountPolicy, PolicyPatch};
+ use crate::audit::{AuditLog, Event};
+ use crate::registry::{DevicePolicy, DeviceStatus, HostIdentity, Registry};
+ 
+@@ -97,6 +98,8 @@ impl AuthOutcome {
+ pub struct Engine {
+     pub host: HostIdentity,
+     pub registry: Mutex<Registry>,
++    accounts: Mutex<AccountPolicies>,
++    rate_user: Mutex<HashMap<String, RateLimiter>>,
+     replay: Mutex<ReplayGuard>,
+     audit: AuditLog,
+     devices: Mutex<HashMap<Id, DeviceHandle>>,
+@@ -165,10 +168,27 @@ impl Engine {
+         audit: AuditLog,
+         host_name: String,
+     ) -> Arc<Engine> {
++        // Convenience constructor for in-memory tests; production always loads
++        // persistent account policy through Daemon::bootstrap.
++        let mut accounts = AccountPolicies::in_memory();
++        for rec in registry.all() {
++            if let (Some(owner), Ok(id)) = (rec.policy.users.first(), rec.id()) {
++                if rec.status.may_authenticate() && rec.policy.device_login {
++                    let _ = accounts.enrol(owner, &id);
++                }
++            }
++        }
++        Self::with_accounts(host, registry, accounts, audit, host_name)
++    }
++
++    pub fn with_accounts(host: HostIdentity, registry: Registry,
++        accounts: AccountPolicies, audit: AuditLog, host_name: String) -> Arc<Engine> {
+         Arc::new(Engine {
+             host,
+             next_conn: std::sync::atomic::AtomicU64::new(1),
+             registry: Mutex::new(registry),
++            accounts: Mutex::new(accounts),
++            rate_user: Mutex::new(HashMap::new()),
+             replay: Mutex::new(ReplayGuard::new()),
+             audit,
+             devices: Mutex::new(HashMap::new()),
+@@ -416,6 +436,11 @@ impl Engine {
+         Ok(())
+     }
+ 
++    /// Whether the currently registered link completed capability negotiation.
++    pub fn capabilities_ready(&self, device_id: &Id) -> bool {
++        self.negotiated.lock().expect("capabilities mutex").contains_key(device_id)
++    }
++
+     /// Delivers a message received from a device to whoever is waiting for it.
+     pub fn deliver(&self, device_id: &Id, msg: Message) {
+         match msg {
+@@ -852,9 +877,10 @@ impl Engine {
+         }
+         // Only now is anything persisted.
+         let policy = DevicePolicy {
+-            users: vec![owner.clone()],
+             allow_root,
++            ..DevicePolicy::for_user(owner.clone())
+         };
++        self.accounts.lock().expect("accounts mutex").enrol(&owner, &submit.device_id)?;
+         reg.upsert_paired_full(
+             submit.device_id,
+             &submit.device_name,
+@@ -978,19 +1004,37 @@ impl Engine {
+                 );
+                 e
+             })?;
+-        // No implicit fallback for old clients that never negotiated caps.
+-        let op = if operation == "authenticate" { "authenticate" }
+-            else if matches!(purpose.as_str(), "sudo" | "login" | "polkit" | "unlock") { purpose.as_str() }
+-            else { operation.as_str() };
++        // Capabilities only narrow policy. The effective operation is derived
++        // from both the caller-supplied context and the PAM/polkit service; an
++        // `operation=authenticate` default cannot hide an elevated service.
++        let op = effective_operation(&operation, &purpose, &service)?;
++        let (public_key, per_user_limit) = {
++            let reg = self.registry.lock().expect("registry mutex");
++            let rec = reg.get(&device_id).ok_or(ProtocolError::NotPaired)?;
++            let policy = self.accounts.lock().expect("accounts mutex").get(&username);
++            policy.authorize(rec, op)?;
++            (reg.resolve_authenticating(&device_id)?, policy.rate_per_minute)
++        };
+         if !self.negotiated.lock().expect("capabilities mutex")
+             .get(&device_id).map_or(false, |(_, v)| v.iter().any(|s| s == op)) {
+             return Err(ProtocolError::ContextMismatch(format!("capability not negotiated: {op}")));
+         }
+-        let public_key: PublicKey = self
+-            .registry
+-            .lock()
+-            .expect("registry mutex")
+-            .resolve_authenticating_for(&device_id, &username)?;
++        // Per-account limit is independent of device choice and transport,
++        // complementing the existing device/transport limits.
++        {
++            let mut map = self.rate_user.lock().expect("account rate mutex");
++            let limiter = map.entry(username.clone())
++                .or_insert_with(|| RateLimiter::new(Limit::new(per_user_limit, 60)));
++            if limiter.limit().max_events != per_user_limit {
++                *limiter = RateLimiter::new(Limit::new(per_user_limit, 60));
++            }
++            if !limiter.check_and_record(&username, now) {
++                let retry = limiter.retry_after(&username, now);
++                self.audit.write(&Event::new("account_rate_limited").denied("RATE_LIMITED")
++                    .username(&username).purpose(&purpose));
++                return Err(ProtocolError::RateLimited(retry));
++            }
++        }
+         let handle = {
+             let devs = self.devices.lock().expect("devices mutex");
+             devs.get(&device_id).cloned()
+@@ -1341,8 +1385,13 @@ impl Engine {
+     ) -> Result<(Id, String, String)> {
+         let reg = self.registry.lock().expect("registry mutex");
+         let allowed = |rec: &crate::registry::DeviceRecord| {
+-            rec.status.may_authenticate()
+-                && for_user.map_or(true, |user| rec.may_authenticate_user(user))
++            rec.status.may_authenticate() && for_user.map_or(true, |user| {
++                let account = self.accounts.lock().expect("accounts mutex").get(user);
++                account.allowed_devices.contains(&rec.device_id)
++                    && (rec.policy.users.first().map(String::as_str) == Some(user)
++                        || (account.delegated_devices.contains(&rec.device_id)
++                            && rec.policy.allow_delegation && user != "root"))
++            })
+         };
+         match selector {
+             None => {
+@@ -1405,7 +1454,9 @@ impl Engine {
+     pub fn list_devices(&self, viewer: Option<&str>) -> Vec<Value> {
+         let connected: Vec<Id> = self.connected_devices().iter().map(|h| h.device_id).collect();
+         self.registry.lock().expect("registry mutex").all().into_iter()
+-            .filter(|rec| viewer.map_or(true, |user| rec.is_bound_to(user)))
++            .filter(|rec| viewer.map_or(true, |user| {
++                self.accounts.lock().expect("accounts mutex").get(user).allowed_devices.contains(&rec.device_id)
++            }))
+             .map(|rec| {
+                 let id = rec.id().unwrap_or_default();
+                 let mut props = vec![
+@@ -1425,6 +1476,52 @@ impl Engine {
+             }).collect()
+     }
+ 
++    pub fn account_policy(&self, user: &str) -> AccountPolicy {
++        self.accounts.lock().expect("accounts mutex").get(user)
++    }
++
++    pub fn patch_account_policy(&self, user: &str, patch: &PolicyPatch, admin: bool) -> Result<AccountPolicy> {
++        // Validate the complete proposed allow-list against device ownership
++        // and the device's own delegation toggle, even when only delegation
++        // (rather than the allow-list) is being edited.
++        let current = self.account_policy(user);
++        let devices = patch.allowed_devices.as_ref().unwrap_or(&current.allowed_devices);
++        let delegates = patch.delegated_devices.as_ref().unwrap_or(&current.delegated_devices);
++        {
++            let registry = self.registry.lock().expect("registry mutex");
++            for id in devices.iter().chain(delegates.iter()) {
++                let parsed = Id::from_hex(id)?;
++                let rec = registry.get(&parsed).ok_or(ProtocolError::NotPaired)?;
++                if !rec.status.may_authenticate() { return Err(ProtocolError::Revoked); }
++                let owned = rec.policy.users.first().map(String::as_str) == Some(user);
++                if !owned && (!delegates.contains(id) || !rec.policy.allow_delegation || user == "root") {
++                    return Err(ProtocolError::ContextMismatch("device is neither owned nor delegated".into()));
++                }
++                if delegates.contains(id) && (owned || !rec.policy.allow_delegation || user == "root") {
++                    return Err(ProtocolError::ContextMismatch("invalid delegated device grant".into()));
++                }
++            }
++        }
++        let value = self.accounts.lock().expect("accounts mutex").patch(user, patch, admin)?;
++        if patch.rate_per_minute.is_some() && admin {
++            self.rate_user.lock().expect("rate mutex").remove(user);
++        }
++        Ok(value)
++    }
++
++    pub fn device_policy(&self, id: &str) -> Result<(String, DevicePolicy)> {
++        let reg = self.registry.lock().expect("registry mutex");
++        let rec = reg.get(&Id::from_hex(id)?).ok_or(ProtocolError::NotPaired)?;
++        Ok((rec.policy.users.first().cloned().unwrap_or_default(), rec.policy.clone()))
++    }
++
++    pub fn patch_device_policy(&self, id: &str, device_login: Option<bool>,
++        allow_delegation: Option<bool>, allow_elevated: Option<bool>,
++        allowed_operations: Option<Vec<String>>) -> Result<DevicePolicy> {
++        self.registry.lock().expect("registry mutex").patch_device(&Id::from_hex(id)?,
++            device_login, allow_delegation, allow_elevated, allowed_operations)
++    }
++
+     pub fn revoke_device(&self, selector: &str) -> Result<String> {
+         let (id, name, _) = self.resolve_device(Some(selector), None)?;
+         self.registry.lock().expect("registry mutex").revoke(&id)?;
+@@ -1487,9 +1584,9 @@ impl Engine {
+         let (paired_devices, connected_devices) = {
+             let reg = self.registry.lock().expect("registry mutex");
+             let paired = reg.all().iter().filter(|r| r.status.may_authenticate()
+-                && viewer.map_or(true, |user| r.is_bound_to(user))).count();
++                && viewer.map_or(true, |user| self.accounts.lock().expect("accounts mutex").get(user).allowed_devices.contains(&r.device_id))).count();
+             let connected = connected.iter().filter(|h| viewer.map_or(true, |user| {
+-                reg.get(&h.device_id).map(|r| r.is_bound_to(user)).unwrap_or(false)
++                reg.get(&h.device_id).map(|r| self.accounts.lock().expect("accounts mutex").get(user).allowed_devices.contains(&r.device_id)).unwrap_or(false)
+             })).count();
+             (paired, connected)
+         };
+@@ -1544,6 +1641,24 @@ pub fn reject_frame(request_id: Id, code: rba_protocol::errors::ErrorCode) -> Fr
+ }
+ 
+ /// Convenience used by transports and tests.
++/// Normalize the signed auth context to an authorization class. Unknown
++/// operations fail instead of inheriting a harmless-looking default.
++fn effective_operation<'a>(op: &'a str, purpose: &'a str, service: &'a str) -> Result<&'static str> {
++    let is_sudo = purpose == "sudo" || service == "sudo" || service == "su";
++    let is_polkit = purpose == "polkit" || service == "polkit-1" || service.starts_with("polkit:");
++    if is_sudo || op == "sudo" { return Ok("sudo"); }
++    if is_polkit || op == "polkit" { return Ok("polkit"); }
++    match op {
++        "login" => Ok("login"), "unlock" => Ok("unlock"),
++        "authenticate" => match purpose {
++            "login" => Ok("login"), "unlock" => Ok("unlock"),
++            "authenticate" => Ok("authenticate"),
++            _ => Err(ProtocolError::BadRequest("unknown authentication purpose".into())),
++        },
++        _ => Err(ProtocolError::BadRequest("unknown authentication operation".into())),
++    }
++}
++
+ pub fn auth_response(
+     request_id: Id,
+     device_id: Id,
+@@ -1613,6 +1728,14 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn privileged_context_overrides_generic_operation() {
++        assert_eq!(effective_operation("authenticate", "sudo", "gdm").unwrap(), "sudo");
++        assert_eq!(effective_operation("authenticate", "login", "polkit-1").unwrap(), "polkit");
++        assert_eq!(effective_operation("authenticate", "login", "gdm").unwrap(), "login");
++        assert!(effective_operation("unknown", "authenticate", "app").is_err());
++    }
++
+     /// The bug this guards: a device whose connection blips reconnects, and the old
+     /// connection's teardown then unregisters the new one. The device is left
+     /// unusable until it happens to reconnect a second time, which looks to a user
+diff --git a/linux/rbad/src/ipc.rs b/linux/rbad/src/ipc.rs
+index 0945f80..48cd46f 100644
+--- a/linux/rbad/src/ipc.rs
++++ b/linux/rbad/src/ipc.rs
+@@ -12,6 +12,7 @@
+ //! `root`.
+ 
+ use rba_protocol::errors::{ProtocolError, Result};
++use crate::account_policy::PolicyPatch;
+ use rba_protocol::cbor::Value;
+ use rba_protocol::line;
+ use std::io;
+@@ -162,6 +163,11 @@ pub enum ControlRequest {
+     PairingCode,
+     ConfirmPairing { code: Option<String> },
+     CancelPairing,
++    PolicyGet { user: String },
++    DevicePolicyGet { device: String },
++    PolicySet { user: String, patch: PolicyPatch },
++    DevicePolicySet { device: String, device_login: Option<bool>, allow_delegation: Option<bool>,
++        allow_elevated: Option<bool>, allowed_operations: Option<Vec<String>> },
+ }
+ 
+ fn t(s: impl Into<String>) -> Value { Value::Text(s.into()) }
+@@ -175,10 +181,34 @@ fn optional_text(out: &mut Vec<(&'static str, Value)>, key: &'static str, value:
+ fn optional_uint(out: &mut Vec<(&'static str, Value)>, key: &'static str, value: Option<u64>) {
+     if let Some(v) = value { out.push((key, u(v))); }
+ }
++fn optional_bool(out: &mut Vec<(&'static str, Value)>, key: &'static str, value: Option<bool>) {
++    if let Some(v) = value { out.push((key, Value::Bool(v))); }
++}
++fn optional_strings(out: &mut Vec<(&'static str, Value)>, key: &'static str, value: &Option<Vec<String>>) {
++    if let Some(v) = value { out.push((key, Value::Array(v.iter().cloned().map(Value::Text).collect()))); }
++}
+ impl ControlRequest {
+     pub fn to_value(&self) -> Value {
+         let mut f = match self {
+             Self::List => fields("list"), Self::Status => fields("status"),
++            Self::PolicyGet { user } => { let mut f=fields("policy_get"); f.push(("user",t(user.clone()))); f },
++            Self::DevicePolicyGet { device } => { let mut f=fields("device_policy_get"); f.push(("device",t(device.clone()))); f },
++            Self::PolicySet { user, patch } => {
++                let mut f=fields("policy_set"); f.push(("user",t(user.clone())));
++                optional_bool(&mut f,"device_login",patch.device_login);
++                optional_strings(&mut f,"allowed_devices",&patch.allowed_devices);
++                optional_strings(&mut f,"delegated_devices",&patch.delegated_devices);
++                optional_strings(&mut f,"allowed_operations",&patch.allowed_operations);
++                optional_bool(&mut f,"allow_elevated",patch.allow_elevated);
++                optional_uint(&mut f,"rate_per_minute",patch.rate_per_minute.map(u64::from)); f
++            },
++            Self::DevicePolicySet {device,device_login,allow_delegation,allow_elevated,allowed_operations} => {
++                let mut f=fields("device_policy_set"); f.push(("device",t(device.clone())));
++                optional_bool(&mut f,"device_login",*device_login);
++                optional_bool(&mut f,"allow_delegation",*allow_delegation);
++                optional_bool(&mut f,"allow_elevated",*allow_elevated);
++                optional_strings(&mut f,"allowed_operations",allowed_operations); f
++            },
+             Self::PairingCode => fields("pairing_code"),
+             Self::CancelPairing => fields("cancel_pairing"),
+             Self::ConfirmPairing { code } => { let mut f=fields("confirm_pairing"); optional_text(&mut f,"code",code); f },
+@@ -209,8 +239,34 @@ impl ControlRequest {
+         let uint_opt = |key: &str| -> io::Result<Option<u64>> {
+             match v.get(key) { None => Ok(None), Some(Value::Uint(n)) => Ok(Some(*n)), _ => Err(bad(key)) }
+         };
++        let bool_opt = |key: &str| -> io::Result<Option<bool>> {
++            match v.get(key) { None => Ok(None), Some(Value::Bool(b)) => Ok(Some(*b)), _ => Err(bad(key)) }
++        };
++        let texts_opt = |key: &str| -> io::Result<Option<Vec<String>>> {
++            match v.get(key) { None => Ok(None), Some(Value::Array(items)) if items.len() <= 128 => {
++                items.iter().map(|item| item.as_text().map(str::to_owned)
++                    .ok_or_else(||bad(key))).collect::<io::Result<Vec<_>>>().map(Some)
++            }, _ => Err(bad(key)) }
++        };
+         Ok(match text("cmd")?.as_str() {
+             "list" => Self::List, "status" => Self::Status,
++            "policy_get" => Self::PolicyGet {user: text("user")?},
++            "device_policy_get" => Self::DevicePolicyGet {device: text("device")?},
++            "policy_set" => Self::PolicySet {user: text("user")?, patch: PolicyPatch {
++                device_login: bool_opt("device_login")?,
++                allowed_devices: texts_opt("allowed_devices")?,
++                delegated_devices: texts_opt("delegated_devices")?,
++                allowed_operations: texts_opt("allowed_operations")?,
++                allow_elevated: bool_opt("allow_elevated")?,
++                rate_per_minute: match uint_opt("rate_per_minute")? {
++                    None => None, Some(n) => Some(n.try_into().map_err(|_|bad("rate_per_minute"))?),
++                },
++            }},
++            "device_policy_set" => Self::DevicePolicySet {device: text("device")?,
++                device_login:bool_opt("device_login")?,
++                allow_delegation:bool_opt("allow_delegation")?,
++                allow_elevated:bool_opt("allow_elevated")?,
++                allowed_operations:texts_opt("allowed_operations")? },
+             "pairing_code" => Self::PairingCode, "cancel_pairing" => Self::CancelPairing,
+             "confirm_pairing" => Self::ConfirmPairing { code: text_opt("code")? },
+             "revoke" => Self::Revoke { device: text("device")? },
+@@ -326,6 +382,12 @@ pub fn call_control(socket: &Path, request: &ControlRequest) -> io::Result<Contr
+         assert!(matches!(ControlRequest::from_value(&decode_packet(&encoded).unwrap()).unwrap(),
+             ControlRequest::Unpair { device } if device == "id"));
+         assert!(ControlRequest::from_value(&Value::map([("v",u(2)),("cmd",t("list"))])).is_err());
++        let policy = ControlRequest::PolicySet {user:"alice".into(), patch:PolicyPatch {
++            device_login:Some(false), rate_per_minute:Some(7), ..Default::default()
++        }};
++        let policy_wire=encode_packet(&policy.to_value()).unwrap();
++        assert!(matches!(ControlRequest::from_value(&decode_packet(&policy_wire).unwrap()).unwrap(),
++            ControlRequest::PolicySet {patch:PolicyPatch {device_login:Some(false), rate_per_minute:Some(7), ..}, ..}));
+         let resp=ControlResponse::ok(Value::map([("authenticated",Value::Bool(true))]));
+         assert!(ControlResponse::from_value(&resp.to_value()).unwrap().authenticated());
+     }
+diff --git a/linux/rbad/src/lib.rs b/linux/rbad/src/lib.rs
+index 18c527b..e2a05b1 100644
+--- a/linux/rbad/src/lib.rs
++++ b/linux/rbad/src/lib.rs
+@@ -11,6 +11,7 @@
+ //!
+ //! Every authentication path terminates in a deny-by-default decision.
+ 
++pub mod account_policy;
+ pub mod audit;
+ pub mod config;
+ pub mod engine;
+@@ -24,6 +25,7 @@ use std::sync::Arc;
+ 
+ use rba_protocol::types::Transport;
+ 
++use crate::account_policy::AccountPolicies;
+ use crate::audit::AuditLog;
+ use crate::config::Config;
+ use crate::engine::Engine;
+@@ -52,7 +54,9 @@ impl Daemon {
+             .map_err(|e| format!("cannot open audit log {}: {e}", config.audit_log.display()))?
+             .with_echo(echo_audit);
+         let name = config.host_name.clone().unwrap_or_else(host_name);
+-        let engine = Engine::new(host, registry, audit, name);
++        let accounts = AccountPolicies::load(&config.state_dir.join("accounts"))
++            .map_err(|e| format!("cannot load account policies: {e}"))?;
++        let engine = Engine::with_accounts(host, registry, accounts, audit, name);
+         Ok(Daemon { config, engine })
+     }
+ 
+@@ -73,9 +77,11 @@ impl Daemon {
+         let registry = Registry::load(&config.registry_path())
+             .map_err(|e| format!("cannot load device registry: {e}"))?;
+         let name = config.host_name.clone().unwrap_or_else(host_name);
++        let accounts = AccountPolicies::load(&config.state_dir.join("accounts"))
++            .map_err(|e| format!("cannot load account policies: {e}"))?;
+         Ok(Daemon {
+             config,
+-            engine: Engine::new(host, registry, AuditLog::null(), name),
++            engine: Engine::with_accounts(host, registry, accounts, AuditLog::null(), name),
+         })
+     }
+ 
+diff --git a/linux/rbad/src/registry.rs b/linux/rbad/src/registry.rs
+index 2598fd5..f9ca94f 100644
+--- a/linux/rbad/src/registry.rs
++++ b/linux/rbad/src/registry.rs
+@@ -57,6 +57,15 @@ pub struct DevicePolicy {
+     /// Whether the operator explicitly allowed this device to authenticate root.
+     #[serde(default)]
+     pub allow_root: bool,
++    /// Device-local operator toggles, intersected with account policy and caps.
++    #[serde(default)]
++    pub device_login: bool,
++    #[serde(default)]
++    pub allow_delegation: bool,
++    #[serde(default)]
++    pub allow_elevated: bool,
++    #[serde(default)]
++    pub allowed_operations: Vec<String>,
+ }
+ 
+ impl DevicePolicy {
+@@ -64,6 +73,10 @@ impl DevicePolicy {
+         DevicePolicy {
+             users: vec![user.into()],
+             allow_root: false,
++            device_login: true,
++            allow_delegation: false,
++            allow_elevated: false,
++            allowed_operations: vec!["authenticate".into(), "login".into(), "unlock".into()],
+         }
+     }
+ 
+@@ -201,7 +214,11 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
+ fn encode_record(rec: &DeviceRecord) -> String {
+     use rba_protocol::cbor::Value;
+     rba_protocol::line::encode_cbor_line(&Value::map([
+-        ("v", Value::Uint(1)),
++        ("v", Value::Uint(2)),
++        ("device_login", Value::Bool(rec.policy.device_login)),
++        ("allow_delegation", Value::Bool(rec.policy.allow_delegation)),
++        ("allow_elevated", Value::Bool(rec.policy.allow_elevated)),
++        ("allowed_operations", Value::Array(rec.policy.allowed_operations.iter().cloned().map(Value::Text).collect())),
+         ("device_id", Value::Text(rec.device_id.clone())),
+         ("name", Value::Text(rec.name.clone())),
+         ("public_key", Value::Text(rec.public_key.clone())),
+@@ -218,7 +235,7 @@ fn decode_record(raw: &str) -> Option<DeviceRecord> {
+     use rba_protocol::cbor::Value;
+     let value = rba_protocol::line::decode_cbor_line(raw)?;
+     let Value::Map(ref kv) = value else { return None; };
+-    if kv.len() != 11 || value.get("v")?.as_uint()? != 1 { return None; }
++    if kv.len() != 15 || value.get("v")?.as_uint()? != 2 { return None; }
+     let text = |key: &str| value.get(key).and_then(Value::as_text).map(str::to_owned);
+     let uint = |key: &str| value.get(key).and_then(Value::as_uint);
+     let device_id = text("device_id")?;
+@@ -238,11 +255,20 @@ fn decode_record(raw: &str) -> Option<DeviceRecord> {
+     };
+     if users.iter().any(|u| u.is_empty() || u.contains('/') || u.contains(' ')) { return None; }
+     let allow_root = value.get("allow_root")?.as_bool()?;
++    let device_login = value.get("device_login")?.as_bool()?;
++    let allow_delegation = value.get("allow_delegation")?.as_bool()?;
++    let allow_elevated = value.get("allow_elevated")?.as_bool()?;
++    let allowed_operations: Vec<String> = match value.get("allowed_operations")? {
++        Value::Array(a) => a.iter().map(|o| o.as_text().map(str::to_owned)).collect::<Option<Vec<_>>>()?,
++        _ => return None,
++    };
++    if !crate::account_policy::valid_operations(&allowed_operations) { return None; }
+     let revocation_token_hash = match text("revocation_token_hash")? {
+         v if v.is_empty() => None, v => Some(v),
+     };
+     Some(DeviceRecord { device_id, name, public_key, added_at, last_seen, status,
+-        policy: DevicePolicy { users, allow_root }, revocation_token_hash, auth_count })
++        policy: DevicePolicy { users, allow_root, device_login, allow_delegation, allow_elevated,
++            allowed_operations }, revocation_token_hash, auth_count })
+ }
+ 
+ /// In-memory registry with load/save. All mutations go through methods that
+@@ -441,6 +467,9 @@ impl Registry {
+                 )));
+             }
+         }
++        if !crate::account_policy::valid_operations(&policy.allowed_operations) {
++            return Err(ProtocolError::BadRequest("invalid device operations".into()));
++        }
+         let rec = DeviceRecord {
+             device_id: device_id.to_hex(),
+             name: name.to_owned(),
+@@ -457,6 +486,26 @@ impl Registry {
+         self.save()
+     }
+ 
++    /// Root-managed device-local restrictions. Owner/users are never writable here.
++    pub fn patch_device(&mut self, id: &Id, device_login: Option<bool>,
++        allow_delegation: Option<bool>, allow_elevated: Option<bool>,
++        allowed_operations: Option<Vec<String>>) -> Result<DevicePolicy> {
++        let rec = self.devices.get_mut(id).ok_or(ProtocolError::NotPaired)?;
++        if !rec.status.may_authenticate() { return Err(ProtocolError::Revoked); }
++        let mut policy = rec.policy.clone();
++        if let Some(b) = device_login { policy.device_login = b; }
++        if let Some(b) = allow_delegation { policy.allow_delegation = b; }
++        if let Some(b) = allow_elevated { policy.allow_elevated = b; }
++        if let Some(ops) = allowed_operations { policy.allowed_operations = ops; }
++        if !crate::account_policy::valid_operations(&policy.allowed_operations) {
++            return Err(ProtocolError::BadRequest("invalid device operations".into()));
++        }
++        rec.policy = policy.clone();
++        self.dirty = true;
++        self.save()?;
++        Ok(policy)
++    }
++
+     pub fn revoke(&mut self, id: &Id) -> Result<()> {
+         let rec = self.devices.get_mut(id).ok_or(ProtocolError::NotPaired)?;
+         rec.status = DeviceStatus::Revoked;
+@@ -691,6 +740,7 @@ mod tests {
+         let policy = DevicePolicy {
+             users: vec!["alice".into()],
+             allow_root: true,
++            ..DevicePolicy::for_user("alice")
+         };
+         r.upsert_paired_full(id, "Pixel", &pk(1), 200, None, &policy)
+             .unwrap();
+diff --git a/linux/rbad/src/server.rs b/linux/rbad/src/server.rs
+index 907de59..04c1630 100644
+--- a/linux/rbad/src/server.rs
++++ b/linux/rbad/src/server.rs
+@@ -180,6 +180,64 @@ async fn dispatch(
+     };
+ 
+     match request {
++        ControlRequest::PolicyGet {user} => {
++            if let Err(e) = ipc::authorize_caller(peer, &user) {
++                return ControlResponse::from_protocol_error(&e);
++            }
++            if !ipc::user_exists(&user) {
++                return ControlResponse::err("BAD_REQUEST", "unknown local account");
++            }
++            ControlResponse::ok(engine.account_policy(&user).to_value())
++        }
++        ControlRequest::PolicySet {user, patch} => {
++            if let Err(e) = ipc::authorize_caller(peer, &user) {
++                return ControlResponse::from_protocol_error(&e);
++            }
++            if !ipc::user_exists(&user) {
++                return ControlResponse::err("BAD_REQUEST", "unknown local account");
++            }
++            match engine.patch_account_policy(&user, &patch, peer.uid == 0) {
++                Ok(policy) => {
++                    engine.audit().write(&Event::new("account_policy_updated")
++                        .username(user).local_uid(peer.uid).success());
++                    ControlResponse::ok(policy.to_value())
++                }
++                Err(e) => ControlResponse::from_protocol_error(&e),
++            }
++        }
++        ControlRequest::DevicePolicyGet {device} => {
++            match engine.device_policy(&device) {
++                Ok((owner, policy)) if peer.uid == 0 || viewer.as_deref() == Some(owner.as_str()) => {
++                    ControlResponse::ok(Value::map([
++                        ("owner", Value::Text(owner)),
++                        ("device_login", Value::Bool(policy.device_login)),
++                        ("allow_delegation", Value::Bool(policy.allow_delegation)),
++                        ("allow_elevated", Value::Bool(policy.allow_elevated)),
++                        ("allowed_operations", Value::Array(policy.allowed_operations.into_iter().map(Value::Text).collect())),
++                    ]))
++                }
++                Ok(_) => ControlResponse::err("PERMISSION_DENIED", "not the device owner"),
++                Err(e) => ControlResponse::from_protocol_error(&e),
++            }
++        }
++        ControlRequest::DevicePolicySet {device,device_login,allow_delegation,allow_elevated,allowed_operations} => {
++            if peer.uid != 0 {
++                return ControlResponse::err("PERMISSION_DENIED", "device policy updates require root");
++            }
++            match engine.patch_device_policy(&device, device_login, allow_delegation,
++                allow_elevated, allowed_operations) {
++                Ok(policy) => {
++                    engine.audit().write(&Event::new("device_policy_updated").device_id(device).local_uid(peer.uid).success());
++                    ControlResponse::ok(Value::map([
++                        ("device_login", Value::Bool(policy.device_login)),
++                        ("allow_delegation", Value::Bool(policy.allow_delegation)),
++                        ("allow_elevated", Value::Bool(policy.allow_elevated)),
++                        ("allowed_operations", Value::Array(policy.allowed_operations.into_iter().map(Value::Text).collect())),
++                    ]))
++                }
++                Err(e) => ControlResponse::from_protocol_error(&e),
++            }
++        }
+         ControlRequest::List => ControlResponse::ok(Value::map([("devices",Value::Array(engine.list_devices(viewer.as_deref())))])),
+ 
+         ControlRequest::Status => ControlResponse::ok(engine.status(viewer.as_deref(), &peer_key)),
+@@ -363,7 +421,10 @@ async fn dispatch(
+ 
+         ControlRequest::Unpair { device } => {
+             // The owner may unpair their own device; root may unpair any.
+-            let viewer = ipc::viewer_name(peer).ok().flatten();
++            let viewer = match ipc::viewer_name(peer) {
++                Ok(viewer) => viewer,
++                Err(e) => return ControlResponse::from_protocol_error(&e),
++            };
+             if !engine.may_unpair(&device, viewer.as_deref()) {
+                 return ControlResponse::err(
+                     "PERMISSION_DENIED",
+diff --git a/linux/rbad/tests/security.rs b/linux/rbad/tests/security.rs
+index f9134f2..d62da92 100644
+--- a/linux/rbad/tests/security.rs
++++ b/linux/rbad/tests/security.rs
+@@ -187,6 +187,7 @@ impl LivePair {
+                 .connected_devices()
+                 .iter()
+                 .any(|h| h.device_id == self.device_id)
++                && engine.capabilities_ready(&self.device_id)
+             {
+                 return true;
+             }
+@@ -229,6 +230,13 @@ async fn connect(f: &Fixture, behaviour: Behaviour) -> LivePair {
+                 Ok(Some(Message::SessionHello(hello))) => {
+                     let _ = dev.hello_ack(&hello).await;
+                 }
++                Ok(Some(Message::Capabilities(host))) => {
++                    let reply = rba_protocol::capabilities::Capabilities::offer(
++                        host.session_id, "device", &[
++                            "authenticate", "login", "sudo", "polkit", "unlock",
++                        ]);
++                    let _ = dev.send(&Message::Capabilities(reply)).await;
++                }
+                 Ok(Some(Message::AuthRequest(request))) => {
+                     let _ = dev.handle_auth(&request).await;
+                 }
+@@ -273,8 +281,8 @@ async fn authenticate_as(
+         f.engine.authenticate(AuthContext {
+             local_uid: 0,
+             username,
+-            purpose: "sudo",
+-            service: "sudo",
++            purpose: "login",
++            service: "login",
+             operation: "authenticate",
+             device_selector: Some(&f.device_selector()),
+             timeout_ms,
+@@ -304,9 +312,9 @@ async fn authenticate_repeatedly(
+ 
+                 username: "alice",
+ 
+-                purpose: "sudo",
++                purpose: "login",
+ 
+-                service: "sudo",
++                service: "login",
+ 
+                 operation: "authenticate",
+ 
+@@ -374,12 +382,12 @@ async fn a_device_paired_for_alice_cannot_authenticate_root_by_default() {
+ }
+ 
+ #[tokio::test]
+-async fn a_device_explicitly_allowed_can_authenticate_root() {
++async fn a_root_opt_in_is_not_enough_without_account_and_elevation_policy() {
+     let f = Fixture::paired_allowing_root("root-explicit").await;
+-    let out = authenticate_as(&f, "root", Behaviour::Approve, 5000)
++    let err = authenticate_as(&f, "root", Behaviour::Approve, 5000)
+         .await
+-        .expect("an explicitly root-capable device must work");
+-    assert!(out.ok);
++        .expect_err("a device originally paired for alice cannot be delegated to root");
++    assert_eq!(err.code(), ErrorCode::ContextMismatch);
+ }
+ 
+ #[tokio::test]

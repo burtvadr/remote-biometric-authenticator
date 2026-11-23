@@ -1,0 +1,514 @@
+From 12bb2f167cf171ec123d248b8753be601b862849 Mon Sep 17 00:00:00 2001
+From: Patch Builder <patch-builder@example.invalid>
+Date: Mon, 23 Nov 2026 17:15:14 +0000
+Subject: [PATCH 1/3] feat(protocol): negotiate session-bound capabilities v1
+ with fail-closed downgrade checks
+
+---
+ .../github/burtvadr/rba/session/HostLink.kt   |  19 +++
+ .../github/burtvadr/rba/protocol/Messages.kt  |  49 ++++++++
+ linux/protocol/src/capabilities.rs            | 114 ++++++++++++++++++
+ linux/protocol/src/lib.rs                     |   1 +
+ linux/protocol/src/messages.rs                |   9 +-
+ linux/rba-sim/src/main.rs                     |  17 ++-
+ linux/rbad/src/engine.rs                      |  34 ++++++
+ linux/rbad/src/transport/mod.rs               |  13 ++
+ protocol/specification/PROTOCOL.md            |  19 ++-
+ 9 files changed, 272 insertions(+), 3 deletions(-)
+ create mode 100644 linux/protocol/src/capabilities.rs
+
+diff --git a/android/app/src/main/kotlin/io/github/burtvadr/rba/session/HostLink.kt b/android/app/src/main/kotlin/io/github/burtvadr/rba/session/HostLink.kt
+index 57dc674..33522ae 100644
+--- a/android/app/src/main/kotlin/io/github/burtvadr/rba/session/HostLink.kt
++++ b/android/app/src/main/kotlin/io/github/burtvadr/rba/session/HostLink.kt
+@@ -352,6 +352,25 @@ class HostLink(
+                         }
+                     }
+ 
++                    is Message.CapabilitiesMessage -> {
++                        val offer = message.v
++                        if (!pinnedLink || offer.endpoint != "host" || offer.sessionId != hello.sessionId ||
++                            offer.required.any { it !in io.github.burtvadr.rba.protocol.Capabilities.known }) {
++                            Log.w(TAG, "untrusted or incompatible capability offer")
++                            break
++                        }
++                        val locallyEnabled = io.github.burtvadr.rba.protocol.Capabilities.known
++                        if (!offer.required.all { it in locallyEnabled && it in offer.operations }) {
++                            Log.w(TAG, "required capability missing")
++                            break
++                        }
++                        val reply = io.github.burtvadr.rba.protocol.Capabilities(
++                            sessionId = hello.sessionId, endpoint = "device",
++                            operations = offer.operations.filter { it in locallyEnabled },
++                        )
++                        outbound.trySend(Message.CapabilitiesMessage(reply).toFrame())
++                    }
++
+                     is Message.AuthRequestMessage -> {
+                         if (message.v.hostId != hello.hostId) {
+                             // The request must carry the identity that opened this
+diff --git a/android/protocol/src/main/kotlin/io/github/burtvadr/rba/protocol/Messages.kt b/android/protocol/src/main/kotlin/io/github/burtvadr/rba/protocol/Messages.kt
+index 90ba9e3..88b3285 100644
+--- a/android/protocol/src/main/kotlin/io/github/burtvadr/rba/protocol/Messages.kt
++++ b/android/protocol/src/main/kotlin/io/github/burtvadr/rba/protocol/Messages.kt
+@@ -986,6 +986,48 @@ private fun ecdh(privateKey: PrivateKey, peer: PublicKey): ByteArray {
+     }
+ }
+ 
++/** Versioned, session-bound capability advertisement. It never authorizes an operation. */
++data class Capabilities(
++    val sessionId: Id,
++    val endpoint: String,
++    val version: Long = 1L,
++    val operations: List<String>,
++    val required: List<String> = emptyList(),
++) {
++    fun toPayload(): ByteArray = Cbor.encode(Cbor.ofMap(
++        "version" to Cbor.uint(version),
++        "session_id" to Cbor.bytes(sessionId.bytes),
++        "endpoint" to Cbor.text(endpoint),
++        "operations" to Cbor.Value.Arr(operations.map(Cbor::text)),
++        "required" to Cbor.Value.Arr(required.map(Cbor::text)),
++    ))
++    companion object {
++        val known = setOf("authenticate", "login", "sudo", "polkit", "unlock")
++        fun fromPayload(payload: ByteArray): Capabilities {
++            val v = Cbor.decode(payload) as? Cbor.Value.Map
++                ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "capabilities not a map")
++            val version = (v["version"] as? Cbor.Value.Uint)?.value
++                ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "missing version")
++            if (version != 1L) throw ProtocolException(ErrorCode.UNSUPPORTED_VERSION, "capabilities version")
++            fun list(key: String): List<String> {
++                val items = (v[key] as? Cbor.Value.Arr)?.items
++                    ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "missing $key")
++                if (items.size > 32) throw ProtocolException(ErrorCode.BAD_REQUEST, "too many capabilities")
++                val values = items.map { (it as? Cbor.Value.Text)?.value
++                    ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "bad $key") }
++                if (values.any { it.isEmpty() || it.length > 64 } || values.distinct().size != values.size)
++                    throw ProtocolException(ErrorCode.BAD_REQUEST, "bad $key")
++                return values
++            }
++            val endpoint = (v["endpoint"] as? Cbor.Value.Text)?.value ?: ""
++            if (endpoint !in listOf("host", "device")) throw ProtocolException(ErrorCode.BAD_REQUEST, "bad endpoint")
++            return Capabilities(Id((v["session_id"] as? Cbor.Value.Bytes)?.value
++                ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "missing session id")),
++                endpoint, version, list("operations"), list("required"))
++        }
++    }
++}
++
+ // ---------------------------------------------------------------------------
+ // Messages
+ // ---------------------------------------------------------------------------
+@@ -1000,6 +1042,7 @@ object MessageType {
+     const val AUTH_RESPONSE = 13
+     const val AUTH_REJECT = 14
+     const val UNPAIR = 15
++    const val CAPABILITIES = 16
+     const val ERROR = 20
+ }
+ 
+@@ -1048,6 +1091,11 @@ sealed class Message {
+         override fun toPayload() = v.toPayload()
+     }
+ 
++    data class CapabilitiesMessage(val v: Capabilities) : Message() {
++        override val type = MessageType.CAPABILITIES
++        override fun toPayload() = v.toPayload()
++    }
++
+     data class UnpairMessage(val v: Unpair) : Message() {
+         override val type = MessageType.UNPAIR
+         override fun toPayload() = v.toPayload()
+@@ -1076,6 +1124,7 @@ sealed class Message {
+                 MessageType.AUTH_RESPONSE -> AuthResponseMessage(AuthResponse.fromPayload(frame.payload))
+                 MessageType.AUTH_REJECT -> AuthRejectMessage(AuthReject.fromPayload(frame.payload))
+                 MessageType.UNPAIR -> UnpairMessage(Unpair.fromPayload(frame.payload))
++                MessageType.CAPABILITIES -> CapabilitiesMessage(Capabilities.fromPayload(frame.payload))
+                 MessageType.ERROR -> ErrorMessageEnvelope(ErrorMessage.fromPayload(frame.payload))
+                 else -> throw ProtocolException(ErrorCode.UNKNOWN_MESSAGE, "unknown message type ${frame.msgType}")
+             }
+diff --git a/linux/protocol/src/capabilities.rs b/linux/protocol/src/capabilities.rs
+new file mode 100644
+index 0000000..b6bcccc
+--- /dev/null
++++ b/linux/protocol/src/capabilities.rs
+@@ -0,0 +1,114 @@
++//! Capability protocol v1. Advertisements never grant authorization.
++//! The transport must be an authenticated SESSION_HELLO connection; the
++//! session identifier prevents messages from being replayed on a new link.
++use std::collections::BTreeSet;
++use crate::cbor::{self, Value};
++use crate::errors::{ProtocolError, Result};
++use crate::types::Id;
++
++pub const VERSION: u64 = 1;
++pub const KNOWN_OPERATIONS: &[&str] = &["authenticate", "login", "sudo", "polkit", "unlock"];
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Capabilities {
++    pub session_id: Id,
++    pub endpoint: String,
++    pub version: u64,
++    pub operations: Vec<String>,
++    pub required: Vec<String>,
++}
++
++impl Capabilities {
++    pub fn offer(session_id: Id, endpoint: &str, operations: &[&str]) -> Self {
++        Self { session_id, endpoint: endpoint.into(), version: VERSION,
++            operations: operations.iter().map(|s| (*s).into()).collect(), required: vec![] }
++    }
++    pub fn to_payload(&self) -> Vec<u8> {
++        cbor::encode(&Value::map([
++            ("version", Value::Uint(self.version)),
++            ("session_id", Value::Bytes(self.session_id.0.to_vec())),
++            ("endpoint", Value::Text(self.endpoint.clone())),
++            ("operations", Value::Array(self.operations.iter().cloned().map(Value::Text).collect())),
++            ("required", Value::Array(self.required.iter().cloned().map(Value::Text).collect())),
++        ]))
++    }
++    pub fn from_payload(bytes: &[u8]) -> Result<Self> {
++        let v = cbor::decode_canonical(bytes).map_err(|e| ProtocolError::BadRequest(format!("capabilities: {e}")))?;
++        let get_text = |key: &str| -> Result<String> { v.get(key).and_then(Value::as_text)
++            .map(str::to_owned).ok_or_else(|| ProtocolError::BadRequest(format!("capabilities: missing {key}"))) };
++        let get_array = |key: &str| -> Result<Vec<String>> {
++            match v.get(key) {
++                Some(Value::Array(a)) if a.len() <= 32 => a.iter().map(|x| x.as_text()
++                    .filter(|s| !s.is_empty() && s.len() <= 64)
++                    .map(str::to_owned)
++                    .ok_or_else(|| ProtocolError::BadRequest(format!("capabilities: bad {key}")))).collect(),
++                _ => Err(ProtocolError::BadRequest(format!("capabilities: missing/bad {key}"))),
++            }
++        };
++        let version = v.get("version").and_then(Value::as_uint)
++            .ok_or_else(|| ProtocolError::BadRequest("capabilities: missing version".into()))?;
++        if version != VERSION { return Err(ProtocolError::UnsupportedVersion(version.min(255) as u8)); }
++        let session_id = Id::from_slice(v.get("session_id").and_then(Value::as_bytes)
++            .ok_or_else(|| ProtocolError::BadRequest("capabilities: missing session_id".into()))?)?;
++        let cap = Self { session_id, endpoint: get_text("endpoint")?, version,
++            operations: get_array("operations")?, required: get_array("required")? };
++        if !matches!(cap.endpoint.as_str(), "host" | "device") {
++            return Err(ProtocolError::BadRequest("capabilities: invalid endpoint".into()));
++        }
++        if cap.operations.iter().collect::<BTreeSet<_>>().len() != cap.operations.len()
++            || cap.required.iter().collect::<BTreeSet<_>>().len() != cap.required.len() {
++            return Err(ProtocolError::BadRequest("capabilities: duplicate item".into()));
++        }
++        Ok(cap)
++    }
++    /// Host and device capabilities intersect with both policy layers. Unknown
++    /// required items and missing required operations fail closed.
++    pub fn negotiate(&self, device: &Self, host_policy: &[&str], device_policy: &[&str]) -> Result<Vec<String>> {
++        if self.endpoint != "host" || device.endpoint != "device" || self.session_id != device.session_id {
++            return Err(ProtocolError::ContextMismatch("capability endpoint/session mismatch".into()));
++        }
++        for item in self.required.iter().chain(device.required.iter()) {
++            if !KNOWN_OPERATIONS.contains(&item.as_str())
++                || !self.operations.contains(item) || !device.operations.contains(item) {
++                return Err(ProtocolError::ContextMismatch(format!("required capability unavailable: {item}")));
++            }
++        }
++        Ok(self.operations.iter().filter(|op| KNOWN_OPERATIONS.contains(&op.as_str())
++            && device.operations.contains(op) && host_policy.contains(&op.as_str())
++            && device_policy.contains(&op.as_str())).cloned().collect())
++    }
++    /// A capability change is never implicitly accepted after negotiation.
++    pub fn unchanged(&self, newer: &Self) -> Result<()> {
++        if self != newer { return Err(ProtocolError::ContextMismatch("capability downgrade or change requires a new session".into())); }
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test] fn canonical_roundtrip() {
++        let v = Capabilities::offer(Id::default(), "host", &["login", "sudo"]);
++        assert_eq!(Capabilities::from_payload(&v.to_payload()).unwrap(), v);
++    }
++    #[test] fn intersection_and_toggles_never_grant() {
++        let s = Id::default();
++        let host = Capabilities::offer(s, "host", &["login", "sudo", "polkit"]);
++        let dev = Capabilities::offer(s, "device", &["login", "sudo", "polkit"]);
++        assert_eq!(host.negotiate(&dev, &["login", "sudo"], &["login", "polkit"]).unwrap(), vec!["login"]);
++    }
++    #[test] fn downgrade_required_and_session_mismatch_fail_closed() {
++        let s = Id::default();
++        let mut host = Capabilities::offer(s, "host", &["login", "sudo"]);
++        let mut dev = Capabilities::offer(s, "device", &["login"]);
++        host.required.push("sudo".into());
++        assert!(host.negotiate(&dev, &["login", "sudo"], &["login"]).is_err());
++        host.required.clear();
++        dev.required.push("unknown".into());
++        assert!(host.negotiate(&dev, &["login"], &["login"]).is_err());
++        dev.required.clear();
++        assert!(host.unchanged(&Capabilities::offer(s, "host", &["login"])).is_err());
++        dev.session_id = Id::from_slice(&[3; 16]).unwrap();
++        assert!(host.negotiate(&dev, &["login"], &["login"]).is_err());
++    }
++}
+diff --git a/linux/protocol/src/lib.rs b/linux/protocol/src/lib.rs
+index 9ad8104..0820213 100644
+--- a/linux/protocol/src/lib.rs
++++ b/linux/protocol/src/lib.rs
+@@ -21,6 +21,7 @@
+ //! Nothing in this crate performs I/O or holds policy beyond the protocol, so it
+ //! is straightforward to exercise exhaustively in tests.
+ 
++pub mod capabilities;
+ pub mod cbor;
+ pub mod crypto;
+ pub mod errors;
+diff --git a/linux/protocol/src/messages.rs b/linux/protocol/src/messages.rs
+index e5e968c..69120d7 100644
+--- a/linux/protocol/src/messages.rs
++++ b/linux/protocol/src/messages.rs
+@@ -1,5 +1,6 @@
+ //! The protocol message set and its mapping onto frames (`PROTOCOL.md` §5).
+ 
++use crate::capabilities::Capabilities;
+ use crate::errors::{ProtocolError, Result};
+ use crate::frame::Frame;
+ use crate::pairing::{PairingResult, PairingStart, PairingSubmit, Unpair};
+@@ -16,9 +17,10 @@ pub const MSG_AUTH_REQUEST: u16 = 12;
+ pub const MSG_AUTH_RESPONSE: u16 = 13;
+ pub const MSG_AUTH_REJECT: u16 = 14;
+ pub const MSG_UNPAIR: u16 = 15;
++pub const MSG_CAPABILITIES: u16 = 16;
+ pub const MSG_ERROR: u16 = 20;
+ 
+-pub const MESSAGE_NAMES: [(u16, &str); 10] = [
++pub const MESSAGE_NAMES: [(u16, &str); 11] = [
+     (MSG_PAIRING_START, "PAIRING_START"),
+     (MSG_PAIRING_SUBMIT, "PAIRING_SUBMIT"),
+     (MSG_PAIRING_RESULT, "PAIRING_RESULT"),
+@@ -28,6 +30,7 @@ pub const MESSAGE_NAMES: [(u16, &str); 10] = [
+     (MSG_AUTH_RESPONSE, "AUTH_RESPONSE"),
+     (MSG_AUTH_REJECT, "AUTH_REJECT"),
+     (MSG_UNPAIR, "UNPAIR"),
++    (MSG_CAPABILITIES, "CAPABILITIES"),
+     (MSG_ERROR, "ERROR"),
+ ];
+ 
+@@ -50,6 +53,7 @@ pub enum Message {
+     AuthResponse(AuthResponse),
+     AuthReject(AuthReject),
+     Unpair(Unpair),
++    Capabilities(Capabilities),
+     Error(ErrorMsg),
+ }
+ 
+@@ -65,6 +69,7 @@ impl Message {
+             Message::AuthResponse(_) => MSG_AUTH_RESPONSE,
+             Message::AuthReject(_) => MSG_AUTH_REJECT,
+             Message::Unpair(_) => MSG_UNPAIR,
++            Message::Capabilities(_) => MSG_CAPABILITIES,
+             Message::Error(_) => MSG_ERROR,
+         }
+     }
+@@ -84,6 +89,7 @@ impl Message {
+             Message::AuthResponse(m) => m.to_payload(),
+             Message::AuthReject(m) => m.to_payload(),
+             Message::Unpair(m) => m.to_payload(),
++            Message::Capabilities(m) => m.to_payload(),
+             Message::Error(m) => m.to_payload(),
+         }
+     }
+@@ -130,6 +136,7 @@ impl Message {
+                 })
+             }
+             MSG_UNPAIR => Message::Unpair(Unpair::from_payload(&f.payload)?),
++            MSG_CAPABILITIES => Message::Capabilities(Capabilities::from_payload(&f.payload)?),
+             MSG_ERROR => Message::Error(ErrorMsg::from_payload(&f.payload)?),
+             other => return Err(ProtocolError::UnknownMessage(other)),
+         })
+diff --git a/linux/rba-sim/src/main.rs b/linux/rba-sim/src/main.rs
+index 7c97308..58f79e3 100644
+--- a/linux/rba-sim/src/main.rs
++++ b/linux/rba-sim/src/main.rs
+@@ -284,7 +284,22 @@ async fn run(mut args: Args) -> Result<()> {
+             "expected PAIRING_START, got {}. Start pairing on Linux first with: rba pair",
+             other.name()
+         ))),
+-        (_, Message::AuthRequest(request)) => serve_loop(&mut dev, request, &args).await,
++        (_, Message::Capabilities(host)) => {
++            if host.endpoint != "host" || host.session_id != hello.session_id {
++                return Err(ProtocolError::ContextMismatch("capability session mismatch".into()));
++            }
++            let supported = &["authenticate", "login", "sudo", "polkit", "unlock"];
++            if host.required.iter().any(|r| !supported.contains(&r.as_str())) {
++                return Err(ProtocolError::ContextMismatch("missing required capability".into()));
++            }
++            let reply = rba_protocol::capabilities::Capabilities::offer(hello.session_id, "device", supported);
++            dev.send(&Message::Capabilities(reply)).await?;
++            match dev.recv().await? {
++                Some(Message::AuthRequest(request)) => serve_loop(&mut dev, request, &args).await,
++                Some(other) => Err(ProtocolError::BadRequest(format!("expected AUTH_REQUEST got {}", other.name()))),
++                None => Ok(()),
++            }
++        },
+         (_, other) => Err(ProtocolError::BadRequest(format!(
+             "unexpected message {}",
+             other.name()
+diff --git a/linux/rbad/src/engine.rs b/linux/rbad/src/engine.rs
+index 644033a..2ddd8d4 100644
+--- a/linux/rbad/src/engine.rs
++++ b/linux/rbad/src/engine.rs
+@@ -10,6 +10,7 @@ use std::collections::HashMap;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, Mutex};
+ 
++use rba_protocol::capabilities::Capabilities;
+ use rba_protocol::crypto::PublicKey;
+ use rba_protocol::errors::{ProtocolError, Result};
+ use rba_protocol::frame::Frame;
+@@ -47,6 +48,7 @@ pub struct DeviceHandle {
+     /// instead. Without it a device that blinks its Wi-Fi is unregistered by its own
+     /// dead connection and stays unusable until it reconnects a second time.
+     pub conn_id: u64,
++    pub session_id: Id,
+ }
+ 
+ /// Everything one authentication attempt needs.
+@@ -96,6 +98,7 @@ pub struct Engine {
+     replay: Mutex<ReplayGuard>,
+     audit: AuditLog,
+     devices: Mutex<HashMap<Id, DeviceHandle>>,
++    negotiated: Mutex<HashMap<Id, (Capabilities, Vec<String>)>>,
+     /// Where a connection task delivers a received message for in-flight work.
+     pending_auth: Mutex<HashMap<Id, oneshot::Sender<Message>>>,
+     pending_pairing: Mutex<Option<oneshot::Sender<PairingSubmit>>>,
+@@ -167,6 +170,7 @@ impl Engine {
+             replay: Mutex::new(ReplayGuard::new()),
+             audit,
+             devices: Mutex::new(HashMap::new()),
++            negotiated: Mutex::new(HashMap::new()),
+             pending_auth: Mutex::new(HashMap::new()),
+             pending_pairing: Mutex::new(None),
+             pairing: Mutex::new(None),
+@@ -274,7 +278,9 @@ impl Engine {
+             tx,
+             transport,
+             connected_at: rba_protocol::unix_now(),
++            session_id: hello.session_id,
+         };
++        self.negotiated.lock().expect("capabilities mutex").remove(&ack.device_id);
+         self.devices
+             .lock()
+             .expect("devices mutex")
+@@ -341,6 +347,7 @@ impl Engine {
+         if !removed {
+             return false;
+         }
++        self.negotiated.lock().expect("capabilities mutex").remove(device_id);
+         // Any in-flight request for a device that vanished can never complete;
+         // let the waiting client fail fast rather than until timeout. Guarded the
+         // same way, so a stale teardown cannot cancel a request the replacement
+@@ -359,6 +366,7 @@ impl Engine {
+             Err(_) => false,
+         };
+         if removed {
++            self.negotiated.lock().expect("capabilities mutex").remove(device_id);
+             if let Ok(mut p) = self.pending_auth.lock() {
+                 p.remove(device_id);
+             }
+@@ -388,6 +396,24 @@ impl Engine {
+             .write(&Event::new("pairing_submit_unexpected").denied("NOT_PAIRED"));
+     }
+ 
++    /// Accept device caps only from its registered session. A changed offer is
++    /// a downgrade/reconfiguration attempt: require a fresh authenticated link.
++    pub fn receive_capabilities(&self, device_id: &Id, offer: Capabilities) -> Result<()> {
++        let devices = self.devices.lock().expect("devices mutex");
++        let h = devices.get(device_id).ok_or(ProtocolError::NotPaired)?;
++        if h.session_id != offer.session_id || offer.endpoint != "device" {
++            return Err(ProtocolError::ContextMismatch("capability session mismatch".into()));
++        }
++        let host = Capabilities::offer(h.session_id, "host", &["authenticate", "login", "sudo", "polkit", "unlock"]);
++        let allowed = host.negotiate(&offer, rba_protocol::capabilities::KNOWN_OPERATIONS,
++            rba_protocol::capabilities::KNOWN_OPERATIONS)?;
++        drop(devices);
++        let mut state = self.negotiated.lock().expect("capabilities mutex");
++        if let Some((prior, _)) = state.get(device_id) { prior.unchanged(&offer)?; }
++        state.insert(*device_id, (offer, allowed));
++        Ok(())
++    }
++
+     /// Delivers a message received from a device to whoever is waiting for it.
+     pub fn deliver(&self, device_id: &Id, msg: Message) {
+         match msg {
+@@ -952,6 +978,14 @@ impl Engine {
+                 );
+                 e
+             })?;
++        // No implicit fallback for old clients that never negotiated caps.
++        let op = if operation == "authenticate" { "authenticate" }
++            else if matches!(purpose.as_str(), "sudo" | "login" | "polkit" | "unlock") { purpose.as_str() }
++            else { operation.as_str() };
++        if !self.negotiated.lock().expect("capabilities mutex")
++            .get(&device_id).map_or(false, |(_, v)| v.iter().any(|s| s == op)) {
++            return Err(ProtocolError::ContextMismatch(format!("capability not negotiated: {op}")));
++        }
+         let public_key: PublicKey = self
+             .registry
+             .lock()
+diff --git a/linux/rbad/src/transport/mod.rs b/linux/rbad/src/transport/mod.rs
+index 0a45453..1a640a1 100644
+--- a/linux/rbad/src/transport/mod.rs
++++ b/linux/rbad/src/transport/mod.rs
+@@ -172,6 +172,10 @@ where
+             };
+             self.device_id = Some(handle.device_id);
+             self.conn_id = Some(handle.conn_id);
++            // Sent only after registered SESSION_HELLO_ACK on the pinned channel.
++            let offer = rba_protocol::capabilities::Capabilities::offer(session_id, "host",
++                &["authenticate", "login", "sudo", "polkit", "unlock"]);
++            let _ = self.send(&Message::Capabilities(offer).to_frame()).await;
+         }
+ 
+         // 4. Serve until the peer disconnects or a protocol error occurs.
+@@ -220,6 +224,15 @@ where
+                                         }
+                                     }
+                                 }
++                                Ok(Message::Capabilities(caps)) => {
++                                    match self.device_id {
++                                        Some(id) => if let Err(e) = self.engine.receive_capabilities(&id, caps) {
++                                            self.send_error(&e, None).await;
++                                            break;
++                                        },
++                                        None => break,
++                                    }
++                                }
+                                 Ok(m) => match self.device_id {
+                                     Some(d) => self.engine.deliver(&d, m),
+                                     None => {
+diff --git a/protocol/specification/PROTOCOL.md b/protocol/specification/PROTOCOL.md
+index 523bf5d..3bb609d 100644
+--- a/protocol/specification/PROTOCOL.md
++++ b/protocol/specification/PROTOCOL.md
+@@ -887,4 +887,21 @@ checked for byte-exact agreement without reproducing the ECDSA operation.
+ * A receiver MUST reject any version it does not implement. It MUST NOT attempt
+   a best-effort parse.
+ * Breaking changes get a new integer. Adding optional fields requires updating
+-  this document, both implementations, and the vectors atomically.
+\ No newline at end of file
++  this document, both implementations, and the vectors atomically.
++
++## Capability protocol v1 (message 16)
++
++After `SESSION_HELLO_ACK` on the authenticated/pinned session, the host sends
++`CAPABILITIES` (16), and the device replies once. Canonical CBOR payload keys:
++`version=1`, `session_id` (16 bytes, equal to hello), `endpoint` (`host` or
++`device`), `operations` (text array), `required` (text array). Arrays are at
++most 32 unique names, each at most 64 UTF-8 bytes. Unknown optional operation
++IDs are ignored. Unknown/missing required IDs, different session IDs, repeated
++changed advertisements and unsupported versions fail closed. No authentication
++request may be dispatched before an accepted device advertisement.
++
++Effective operations are the intersection of host-supported, device-supported,
++host-policy-enabled and device-policy-enabled operation IDs; the per-request
++biometric consent and account authorization must *also* succeed. Advertising
++capabilities never grants an authorization. Modifying negotiated capabilities
++requires a new authenticated session; no silent downgrade is supported.
