@@ -564,6 +564,71 @@ These are properties every implementation must keep, even in the minimal version
 The minimal set is the next transport task. The upgrade items stay on the
 roadmap; the robustness rules apply from the first implementation.
 
+## Transport failover and multi-path
+
+The user expectation: a device paired over Wi-Fi should keep working when Wi-Fi
+drops, by failing over to ADB (wireless or wired), then Bluetooth, then USB,
+without re-pairing and without manual configuration. **This is not possible
+today.** It is a real feature, not a configuration, and it needs its own design
+pass.
+
+### Why it is not possible today
+
+- The host keeps **one** connection handle per `device_id`
+  (`HashMap<Id, DeviceHandle>`). A new transport replaces the old handle; there
+  is no pool.
+- The device's `HostLink` connects to **one** candidate at a time and rotates
+  only after the current link fails. It never holds two links concurrently.
+- Discovery is single-transport: mDNS for Wi-Fi, `adb devices` for ADB, BLE scan
+  for Bluetooth. There is no unified candidate list tagged by transport.
+- Authentication routes through "any connected authenticator" with no transport
+  preference or priority. There is no "try Wi-Fi, then ADB, then BLE" logic.
+- Transport selection is per-request (`--transport`), not per-link or per-failover.
+- Half-open TCP connections take up to 180 s to notice a dead peer (now
+  improved to ~1 min with keepalive), so failover would be slow even if the
+  routing existed.
+
+### What would be needed
+
+1. **Multi-link device side.** `HostLink` (or a successor) holds N concurrent
+   links to the same host, one per transport, each pinned to the host key. Links
+   are independent; one dying does not tear down the others.
+2. **Transport-tagged discovery.** A unified candidate list with a transport
+   label and a priority order (Wi-Fi → ADB wireless → ADB wired → BLE). Each
+   transport implements `discover()`; results are merged and deduplicated by host
+   identity.
+3. **Failover routing.** `authenticate` picks the highest-priority *live* link.
+   If it fails mid-request, retry on the next live link before reporting failure.
+   The device's biometric prompt is shown once; the transport underneath is
+   transparent.
+4. **Priority and policy.** The host and device agree on a transport preference
+   (LAN first, then Tailscale, etc.) and the device honours it. A user override
+   (`--prefer-transport`) is available but optional.
+5. **Connection health.** Keepalive (already added on the daemon side) plus
+   application-level heartbeats so a dead link is detected in seconds, not
+   minutes. A link that misses two heartbeats is marked dead and removed.
+6. **No re-pairing across transports.** The device key and host pin are
+   transport-independent; any transport that can carry the protocol can carry the
+   pairing. This already holds for Wi-Fi and ADB; BLE needs its own handshake
+   but the same trust model.
+
+### Security constraints
+
+- Failover must never weaken the trust model. Every link is pinned to the host
+  key and the device key; a transport that cannot carry TLS pinning or the
+  signed transcript is not a valid transport.
+- Discovery remains untrusted on every transport. A malicious device on Bluetooth
+  cannot pair without the code and the human gate, same as Wi-Fi.
+- A transport that drops mid-authentication must not leave a half-completed
+  request; the replay guard and request ID ensure a retry is a fresh attempt.
+
+### Effort estimate
+
+Large. This is the single biggest transport feature after BLE wiring. It touches
+the device's connection manager, the host's device-handle model, discovery, and
+the auth routing path. It should land after BLE and ADB are individually stable,
+not before.
+
 ## Native desktop integration via fprintd (future)
 
 GNOME and KDE show a native fingerprint UI only because they talk to `fprintd`,
