@@ -288,6 +288,18 @@ sudo ./packaging/arch/pam-polkit-rba.sh --rollback
 that use `common-auth`; it is not part of the recommended integration. Neither is
 a substitute for a root shell and a tested rollback on your machine.
 
+### Uninstall
+
+```bash
+sudo ./packaging/arch/uninstall-local.sh           # keep state and logs
+sudo ./packaging/arch/uninstall-local.sh --purge   # also remove state, logs, account
+```
+
+It rolls back the `gdm-password` and `polkit-1` overrides first, then removes the
+service, binaries and PAM module. It refuses to remove the module while any PAM
+stack still references it. The Android app is separate:
+`adb uninstall io.github.burtvadr.rba.debug`.
+
 ## Why there is no polkit agent
 
 An earlier version of this had one, and it does not work on a normal desktop. polkit
