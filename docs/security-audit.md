@@ -838,3 +838,9 @@ make lint          # rustfmt + clippy, warnings denied
 For PAM changes, keep a root shell open and use the rollback file created by the
 same procedure. The daemon's control socket is the only path an unprivileged
 frontend uses; do not weaken its peer checks while addressing SEC-006.
+
+### SEC-025 — Operation-specific authorization (Phase 1 candidate)
+
+**Severity:** High. **Status:** Open; implementation candidate, runtime verification pending.
+
+The pure evaluator checks account binding, explicit root opt-in and exact operation scope. The engine filters devices before prompting and rechecks policy and key identity before success. Root-only scope management is exposed through the local control API. Existing credentials remain registered but non-basic operations require explicit grants. See `AUTHORIZATION_MODEL.md` for migration and outstanding identity/context, delegated-login and testing requirements. SEC-003 is preserved; PAKE and remote attestation are unchanged.

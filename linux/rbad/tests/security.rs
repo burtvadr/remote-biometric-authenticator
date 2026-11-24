@@ -26,12 +26,14 @@ use rbad::{audit::AuditLog, engine::Engine, transport};
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn new_engine() -> Arc<Engine> {
+    let key = rba_protocol::crypto::PrivateKey::generate().expect("keygen");
+    let host = HostIdentity {
+        host_id: "test-host".into(),
+        public_key: "0400a0c9d3b6e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e".into(),
+    };
     Engine::with_rate_limit_path(
-        HostIdentity::for_tests(
-            rba_protocol::crypto::PrivateKey::generate().expect("keygen"),
-            Id::random().expect("id"),
-        ),
-        Registry::in_memory(),
+        host,
+        Registry::new(),
         AuditLog::null(),
         "test-host".into(),
         None,
@@ -46,12 +48,13 @@ fn recording_engine(tag: &str) -> (Arc<Engine>, std::path::PathBuf) {
     let path = dir.join("audit.log");
     let _ = std::fs::remove_file(&path);
     let log = AuditLog::to_file(&path).expect("audit log");
+    let host = HostIdentity {
+        host_id: "test-host".into(),
+        public_key: "0400a0c9d3b6e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e".into(),
+    };
     let engine = Engine::with_rate_limit_path(
-        HostIdentity::for_tests(
-            rba_protocol::crypto::PrivateKey::generate().expect("keygen"),
-            Id::random().expect("id"),
-        ),
-        Registry::in_memory(),
+        host,
+        Registry::new(),
         log,
         "test-host".into(),
         None,
@@ -148,6 +151,10 @@ impl Fixture {
             engine.device_status(&device.device_id),
             Some(DeviceStatus::Paired)
         );
+        // The fixture explicitly grants its test scope; pairing alone does not
+        // grant privileged operations.
+        engine.set_device_scope(&device.device_id.to_hex(),
+            rbad::authz::Scope::parse("sudo", "sudo", "authenticate").unwrap(), true).unwrap();
         Fixture {
             engine,
             device,

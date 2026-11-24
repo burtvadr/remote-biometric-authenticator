@@ -295,10 +295,20 @@ async fn dispatch(
         }
 
         ControlRequest::PairingConfirmed => {
+            // This is a query, not a confirmation: the host-side human gate was
+            // already passed via ConfirmPairing. Here the caller learns whether
+            // the device sent PAIRING_CONFIRMED after persisting its record.
+            if let Some(confirmed) = engine.pairing_acknowledged_by(&peer_key) {
+                return ControlResponse::ok(serde_json::json!({
+                    "confirmed": confirmed,
+                    "active": false,
+                    "completed": true,
+                }));
+            }
             if !engine.pairing_active() {
                 return ControlResponse::err(
                     "NOT_PAIRED",
-                    "no active pairing session",
+                    "no active or completed pairing session",
                 );
             }
             if !engine.pairing_opened_by(&peer_key) {
@@ -307,10 +317,11 @@ async fn dispatch(
                     "this pairing session was opened by another user",
                 );
             }
-            match engine.mark_pairing_confirmed() {
-                Ok(()) => ControlResponse::ok(serde_json::json!({ "confirmed": true })),
-                Err(e) => ControlResponse::from_protocol_error(&e),
-            }
+            ControlResponse::ok(serde_json::json!({
+                "confirmed": false,
+                "active": true,
+                "seconds_remaining": engine.pairing_remaining().unwrap_or(0),
+            }))
         }
 
         ControlRequest::CancelPairing => {
@@ -366,6 +377,19 @@ async fn dispatch(
             }
         }
 
+        ControlRequest::SetScope { device, purpose, service, operation, grant } => {
+            if peer.uid != 0 {
+                return ControlResponse::err("PERMISSION_DENIED", "only root may change scope grants");
+            }
+            let scope = match crate::authz::Scope::parse(&purpose, &service, &operation) {
+                Ok(scope) => scope,
+                Err(_) => return ControlResponse::err("BAD_REQUEST", "invalid scope"),
+            };
+            match engine.set_device_scope(&device, scope, grant) {
+                Ok(()) => ControlResponse::ok(serde_json::json!({ "updated": true })),
+                Err(e) => ControlResponse::from_protocol_error(&e),
+            }
+        }
         ControlRequest::Revoke { device } => {
             // Revocation changes who may authenticate, so only root may do it.
             if peer.uid != 0 {

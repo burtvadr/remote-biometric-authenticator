@@ -12,6 +12,7 @@ sha2.workspace = true
 hmac.workspace = true
 hkdf.workspace = true
 getrandom.workspace = true
+serde = "1"
 rand_core.workspace = true
 hex.workspace = true
 base64.workspace = true

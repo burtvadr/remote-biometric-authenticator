@@ -5,7 +5,6 @@
 //! and reversible.
 
 use std::fs;
-use std::io::Write;
 use std::path::Path;
 
 const MODULE_PATH: &str = "/usr/lib/security/pam_rba.so";
@@ -148,7 +147,7 @@ pub fn plan_enable(b: &Backend, timeout_ms: u32) -> Result<(String, String), Str
     Ok((base, new))
 }
 
-pub fn apply_enable(b: &Backend, timeout_ms: u32, base: &str, new: &str) -> Result<(), String> {
+pub fn apply_enable(b: &Backend, base: &str, new: &str) -> Result<(), String> {
     let backup = format!("{}.bak.{}", b.target, chrono_stamp());
     fs::write(&backup, base).map_err(|e| e.to_string())?;
 

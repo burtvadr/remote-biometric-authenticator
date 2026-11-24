@@ -3,6 +3,25 @@
 //! Every subcommand is a thin request to the daemon over its control socket. The
 //! CLI performs no authentication decision of its own: it cannot, because it
 //! holds no keys and trusts nothing.
+//!
+//! Portability: path resolution order (for all path-like options):
+//!   1. `--<opt>` explicit argument (takes absolute precedence)
+//!   2. Environment variable `RBA_<opt>` (e.g. `RBA_SOCKET`, `RBA_STATE_DIR`)
+//!   3. If the binary is run from a directory that contains companion files
+//!      (e.g. `libpam_rba.so` next to the binary in a platform-tools zip),
+//!      those are discovered and used as defaults for user-level operations.
+//!      This mirrors the `adb` model: running `rba` from a directory next to
+//!      its companions just works.
+//!   4. XDG user directories: `$XDG_STATE_HOME/rba`, `$XDG_RUNTIME_DIR/rba`
+//!   5. Compiled-in fallbacks: `/var/lib/rba`, `/run/rba/control.sock`,
+//!      `/var/log/rba` (root-only)
+//!   6. Temp directory: `/tmp/rba-state-<uid>` as final fallback
+//!
+//! The installer (packaging/arch/install-local.sh, or distro .rpm/.deb scripts)
+//! is responsible for placing the binary on PATH and installing man pages, systemd
+//! units, and PAM modules at system-standard locations. However, the binary can
+//! function without those: it can auto-start a user-level daemon and operate
+//! from environment variables or companion files next to the binary.
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -12,6 +31,15 @@ use rbad::ipc::{ControlRequest, ControlResponse};
 
 #[cfg(target_os = "linux")]
 mod pam;
+
+/// Directory containing the `rba` binary, used to resolve relative paths.
+/// If the binary is next to companion files (e.g. `libpam_rba.so`), those
+/// are discovered and used as defaults for user-level operations.
+fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+}
 
 const DEFAULT_SOCKET: &str = rbad::config::DEFAULT_SOCKET;
 
@@ -28,6 +56,8 @@ fn usage_text() -> String {
          \x20   pair                      pair a device; one side shows the code, the other types it\n\
          \x20   auth --user U             ask a device to authenticate a Linux user\n\
          \x20   unpair --device D         remove trust for a device (owner or root)\n\
+         \x20   grant-scope --device D    grant exact purpose/service/operation (root only)\n\
+         \x20   remove-scope --device D   remove an explicit scope grant (root only)\n\
          \x20   revoke --device D         revoke an authenticator immediately (root only)\n\
          \x20   enable <backend>          enable a host integration (gdm, polkit, sudo) [linux]\n\
          \x20   disable <backend>         roll back a host integration [linux]\n\
@@ -583,6 +613,21 @@ fn cmd_auth(args: &Args) {
     );
 }
 
+fn cmd_scope(args: &Args, grant: bool) {
+    let Some(device) = args.device.clone() else {
+        eprintln!("rba: --device is required");
+        std::process::exit(2);
+    };
+    match request(args, &ControlRequest::SetScope {
+        device, purpose: args.purpose.clone(), service: args.service.clone(),
+        operation: args.operation.clone(), grant,
+    }) {
+        Ok(r) if r.ok => println!("Scope updated."),
+        Ok(r) => fail(&r),
+        Err(e) => { eprintln!("rba: {e}"); std::process::exit(1); }
+    }
+}
+
 fn cmd_revoke(args: &Args) {
     let Some(device) = args.device.clone() else {
         eprintln!("rba: --device is required");
@@ -657,7 +702,7 @@ fn cmd_enable(args: &Args) {
         println!("Aborted; no files changed.");
         std::process::exit(1);
     }
-    if let Err(e) = pam::apply_enable(backend, timeout_ms, &old, &new) {
+    if let Err(e) = pam::apply_enable(backend, &old, &new) {
         eprintln!("rba: {e}");
         std::process::exit(1);
     }
@@ -722,6 +767,8 @@ fn main() {
         "status" => cmd_status(&args),
         "pair" => cmd_pair(&args),
         "auth" => cmd_auth(&args),
+        "grant-scope" => cmd_scope(&args, true),
+        "remove-scope" => cmd_scope(&args, false),
         "revoke" => cmd_revoke(&args),
         "unpair" => cmd_unpair(&args),
         #[cfg(target_os = "linux")]

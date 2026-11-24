@@ -19,6 +19,8 @@ This installs:
   /usr/local/bin/rba
   /usr/lib/security/pam_rba.so
   /etc/systemd/system/rbad.service
+  /usr/share/man/man1/rba.1.gz
+  /usr/share/man/man8/rbad.8.gz
 
 It does not modify any PAM stack. Enable the scoped GDM or polkit integration
 separately with packaging/arch/pam-gdm-rba.sh or pam-polkit-rba.sh.
@@ -74,11 +76,10 @@ install -Dm0755 "$ROOT/linux/target/release/rba" /usr/local/bin/rba
 install -Dm0755 "$ROOT/linux/target/release/libpam_rba.so" \
     /usr/lib/security/pam_rba.so
 
-echo "==> installing PAM helper scripts"
-install -d /usr/libexec/rba
-for script in pam-gdm-rba.sh pam-polkit-rba.sh pam-sudo-rba.sh; do
-    install -Dm0755 "$ROOT/packaging/arch/$script" "/usr/libexec/rba/$script"
-done
+echo "==> installing man pages"
+# Install man pages compressed with gzip.
+gzip -c "$ROOT/linux/rba.1" > /usr/share/man/man1/rba.1.gz
+gzip -c "$ROOT/linux/rbad.8" > /usr/share/man/man8/rbad.8.gz
 
 echo "==> installing the service"
 install -Dm0644 "$ROOT/linux/systemd/rbad.service" \

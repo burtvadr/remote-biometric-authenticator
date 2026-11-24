@@ -204,6 +204,31 @@ where
                                 Ok(Message::PairingSubmit(submit)) => {
                                     self.engine.deliver_pairing(submit);
                                 }
+                                // The device persists its record after receiving
+                                // PAIRING_RESULT, then sends this acknowledgement.
+                                // It is bound to the session that just completed.
+                                Ok(Message::PairingConfirmed(confirm)) => {
+                                    eprintln!(
+                                        "rbad: pairing ack received for {}",
+                                        confirm.session_id.short()
+                                    );
+                                    match self.engine.acknowledge_pairing(&confirm.session_id) {
+                                        Ok(()) => {
+                                            self.engine.audit().write(
+                                                &crate::audit::Event::new("pairing_acknowledged")
+                                                    .success(),
+                                            );
+                                        }
+                                        Err(e) => {
+                                            let ev = crate::audit::Event::new("pairing_rejected")
+                                                .denied(e.code().as_str())
+                                                .detail(e.to_string());
+                                            self.engine.audit().write(&ev);
+                                            self.send_error(&e, None).await;
+                                            break;
+                                        }
+                                    }
+                                }
                                 // A device may revoke itself with the bearer token
                                 // issued at pairing. This works after local unpair,
                                 // when the device no longer has a host record.

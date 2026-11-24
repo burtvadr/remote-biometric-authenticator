@@ -276,7 +276,9 @@ async fn run(mut args: Args) -> Result<()> {
     match (args.command.as_str(), second) {
         ("pair", Message::PairingStart(start)) => {
             dev.pair(&start, true).await?;
+            // Only acknowledge after the host record is durable on this side.
             save_hosts(&hosts_path, &dev.hosts)?;
+            dev.confirm_pairing(start.session_id).await?;
             println!("[rba] pairing complete");
             Ok(())
         }

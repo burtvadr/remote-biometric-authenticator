@@ -651,9 +651,10 @@ pub struct PairingConfirmed {
 
 impl PairingConfirmed {
     pub fn to_payload(&self) -> Vec<u8> {
-        cbor::encode(&Value::map(vec![
-            ("session_id", Value::Bytes(self.session_id.0.to_vec())),
-        ]))
+        cbor::encode(&Value::map(vec![(
+            "session_id",
+            Value::Bytes(self.session_id.0.to_vec()),
+        )]))
     }
 
     pub fn from_payload(payload: &[u8]) -> Result<PairingConfirmed> {
@@ -665,10 +666,8 @@ impl PairingConfirmed {
                 "session_id must be 32 bytes".into(),
             ));
         }
-        let sid_id = Id::from_slice(&session_id)?;
-        Ok(PairingConfirmed {
-            session_id: sid_id,
-        })
+        let sid_id = Id::from_slice(session_id)?;
+        Ok(PairingConfirmed { session_id: sid_id })
     }
 }
 

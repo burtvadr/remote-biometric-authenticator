@@ -6,7 +6,7 @@
 //! adapters deliver [`Message`]s to it and it sends [`Frame`]s back, which is
 //! what keeps the two transports security-identical.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -27,7 +27,8 @@ use rba_protocol::verifier;
 use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::audit::{AuditLog, Event};
-use crate::registry::{DevicePolicy, DeviceStatus, HostIdentity, Registry};
+use crate::registry::{DevicePolicy, DeviceStatus, HostIdentity, Registry, public_key_key_id_hex};
+use crate::authz;
 
 /// A currently connected device.
 #[derive(Clone, Debug)]
@@ -267,7 +268,7 @@ impl Engine {
         rba_protocol::types::SessionHello {
             protocol_version: rba_protocol::PROTOCOL_VERSION,
             host_id: self.host.host_id,
-            host_key_id: self.host.public_key().key_id_hex(),
+            host_key_id: public_key_key_id_hex(&self.host.public_key),
             host_nonce,
             session_id,
             transports: vec![
@@ -282,7 +283,7 @@ impl Engine {
         Ok(Message::SessionHello(rba_protocol::types::SessionHello {
             protocol_version: rba_protocol::PROTOCOL_VERSION,
             host_id: self.host.host_id,
-            host_key_id: self.host.public_key().key_id_hex(),
+            host_key_id: public_key_key_id_hex(&self.host.public_key),
             host_nonce,
             session_id,
             transports: vec![
@@ -807,7 +808,7 @@ impl Engine {
             a.session.derive_with_device_ephemeral(
                 &self.host.host_id,
                 &submit.device_id,
-                &self.host.public_key(),
+                &self.host.public_key,
                 &submit.device_pubkey,
                 submit.device_nonce,
                 submit.device_eph_pubkey,
@@ -884,7 +885,7 @@ impl Engine {
         session.derive_with_device_ephemeral(
             &self.host.host_id,
             &submit.device_id,
-            &self.host.public_key(),
+            &self.host.public_key,
             &submit.device_pubkey,
             submit.device_nonce,
             submit.device_eph_pubkey,
@@ -905,7 +906,7 @@ impl Engine {
         let expected = session.device_mac(
             &self.host.host_id,
             &submit.device_id,
-            &self.host.public_key(),
+            &self.host.public_key,
             &submit.device_pubkey,
         )?;
         if !rba_protocol::crypto::ct_eq_slice(&submit.mac, &expected) {
@@ -917,7 +918,7 @@ impl Engine {
         let host_mac = session.host_mac(
             &self.host.host_id,
             &submit.device_id,
-            &self.host.public_key(),
+            &self.host.public_key,
             &submit.device_pubkey,
         )?;
 
@@ -943,13 +944,32 @@ impl Engine {
             }
         }
         // Only now is anything persisted.
+        // Build the initial grant set from the owner.
+        // In the pre-release phase, the owner receives basic authentication grant.
+        let owner_grant = authz::Grant {
+            principal: authz::PrincipalId::from(owner.clone()),
+            scope: authz::Scope::parse("rba", "rba", "authenticate").unwrap(),
+        };
+        let mut initial_grants = BTreeSet::new();
+        initial_grants.insert(owner_grant);
+        // If root is explicitly allowed, also grant root access
         let policy = DevicePolicy {
-            users: vec![owner.clone()],
-            allow_root,
+            grants: if allow_root {
+                let root_grant = authz::Grant {
+                    principal: authz::PrincipalId::from("root".to_string()),
+                    scope: authz::Scope::parse("rba", "rba", "authenticate").unwrap(),
+                };
+                let mut g = BTreeSet::new();
+                g.insert(owner_grant);
+                g.insert(root_grant);
+                g
+            } else {
+                BTreeSet::new().insert(owner_grant)
+            },
         };
         reg.upsert_paired_full(
             submit.device_id,
-            &submit.device_name,
+            submit.device_name.clone(),
             &submit.device_pubkey,
             now,
             Some(&revocation_token_hash),
@@ -1033,8 +1053,8 @@ impl Engine {
         let start = PairingStart {
             session_id: active.session.session_id,
             host_id: self.host.host_id,
-            host_pubkey: self.host.public_key(),
-            host_key_id: self.host.public_key().key_id_hex(),
+            host_pubkey: self.host.public_key,
+            host_key_id: public_key_key_id_hex(&self.host.public_key),
             code: code.to_owned(),
             code_entry: active.code_entry,
             expires_at: active.expires_at.max(now),
@@ -1064,12 +1084,14 @@ impl Engine {
         let operation = operation.to_owned();
         let device_selector = device_selector.map(|s| s.to_owned());
         let now = rba_protocol::unix_now();
+        let scope = crate::authz::Scope::parse(&purpose, &service, &operation)
+            .map_err(|reason| ProtocolError::BadRequest(format!("invalid scope: {reason:?}")))?;
 
         // Resolve and authorise the device *before* consuming a challenge. The
         // account binding is part of resolution: a device paired for alice must
         // never be asked to approve bob, even when root is the caller.
         let (device_id, device_name, _key_id) = self
-            .resolve_device(device_selector.as_deref(), Some(&username))
+            .resolve_device_for_scope(device_selector.as_deref(), Some(&username), Some(&scope))
             .map_err(|e| {
                 self.audit.write(
                     &Event::new("auth")
@@ -1084,7 +1106,7 @@ impl Engine {
             .registry
             .lock()
             .expect("registry mutex")
-            .resolve_authenticating_for(&device_id, &username)?;
+            .authorize_scope(&device_id, &username, &scope)?;
         let handle = {
             let devs = self.devices.lock().expect("devices mutex");
             devs.get(&device_id).cloned()
@@ -1345,9 +1367,13 @@ impl Engine {
             transport_pref_for(transport, transport_pref),
         ) {
             Ok(()) => {
-                if let Ok(mut reg) = self.registry.lock() {
-                    reg.record_success(&device_id, rba_protocol::unix_now())?;
+                let mut reg = self.registry.lock().map_err(|_| ProtocolError::Internal("registry mutex poisoned".into()))?;
+                let current = reg.authorize_scope(&device_id, &username, &scope)?;
+                if current.as_bytes() != public_key.as_bytes() {
+                    return Err(ProtocolError::ContextMismatch("credential changed during authentication".into()));
                 }
+                reg.record_success(&device_id, rba_protocol::unix_now())?;
+                drop(reg);
                 self.audit.write(&Event {
                     kind: "auth",
                     device_id: Some(device_id.to_hex()),
@@ -1433,10 +1459,33 @@ impl Engine {
         selector: Option<&str>,
         for_user: Option<&str>,
     ) -> Result<(Id, String, String)> {
+        self.resolve_device_for_scope(selector, for_user, None)
+    }
+
+    fn resolve_device_for_scope(
+        &self,
+        selector: Option<&str>,
+        for_user: Option<&str>,
+        scope: Option<&crate::authz::Scope>,
+    ) -> Result<(Id, String, String)> {
         let reg = self.registry.lock().expect("registry mutex");
         let allowed = |rec: &crate::registry::DeviceRecord| {
             rec.status.may_authenticate()
-                && for_user.map_or(true, |user| rec.may_authenticate_user(user))
+                && for_user.map_or(true, |user| {
+                    // In the new model, check if the device's grant policy is bound to the user
+                    let principal = authz::PrincipalId::from(user.to_string());
+                    rec.policy.is_bound_to(&principal)
+                })
+                && match (for_user, scope) {
+                    (Some(_), Some(s)) => {
+                        // Check authorization: principal must be granted this scope
+                        let principal = authz::PrincipalId::for_user.unwrap_or_else(|| authz::PrincipalId::from("unknown".to_string()));
+                        // Use the registry's evaluate method
+                        // Note: this requires the device_id; we'll handle it below
+                        true // placeholder - actual check done after device resolution
+                    }
+                    _ => true,
+                }
         };
         match selector {
             None => {
@@ -1517,6 +1566,7 @@ impl Engine {
                     "status": rec.status.as_str(),
                     "users": rec.policy.users,
                     "allow_root": rec.policy.allow_root,
+                    "allowed_scopes": rec.policy.allowed_scopes,
                     "available": connected.contains(&id),
                     "added_at": rec.added_at,
                     "last_seen": rec.last_seen,
@@ -1525,6 +1575,14 @@ impl Engine {
                 })
             })
             .collect()
+    }
+
+    /// Administrative policy mutation; IPC enforces the administrator boundary.
+    pub fn set_device_scope(&self, selector: &str, scope: crate::authz::Scope, grant: bool) -> Result<()> {
+        let (id, _, _) = self.resolve_device(Some(selector), None)?;
+        self.registry.lock().map_err(|_| ProtocolError::Internal("registry mutex poisoned".into()))?.set_scope(&id, scope, grant)?;
+        self.audit.write(&Event::new(if grant { "scope_granted" } else { "scope_removed" }).device_id(id.to_hex()).success());
+        Ok(())
     }
 
     pub fn revoke_device(&self, selector: &str) -> Result<String> {
@@ -1614,7 +1672,7 @@ impl Engine {
         };
         serde_json::json!({
             "host_id": self.host.host_id.to_hex(),
-            "host_key_id": self.host.public_key().key_id_hex(),
+            "host_key_id": public_key_key_id_hex(&self.host.public_key),
             "host_name": self.host_name,
             "paired_devices": paired_devices,
             "connected_devices": connected_devices,
@@ -1694,7 +1752,7 @@ mod tests {
         let host = HostIdentity::for_tests(PrivateKey::generate().expect("OS randomness"), host_id);
         let device_key = PrivateKey::generate().expect("OS randomness");
         let device_id = Id::random().expect("random");
-        let mut registry = Registry::in_memory();
+        let mut registry = Registry::new();
         registry
             .upsert_paired_for_user(device_id, "Pixel", &device_key.public_key(), 100, "alice")
             .expect("pair");

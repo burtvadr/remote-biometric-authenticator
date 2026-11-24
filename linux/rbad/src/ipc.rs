@@ -188,6 +188,7 @@ pub enum ControlRequest {
         #[serde(default)]
         timeout_ms: Option<u64>,
     },
+    SetScope { device: String, purpose: String, service: String, operation: String, grant: bool },
     /// Revoke a device's authorisation immediately.
     Revoke { device: String },
     /// Remove trust for a device (marks it Replaced, retained for audit).

@@ -20,7 +20,9 @@ use rba_protocol::crypto::{self, PrivateKey, PublicKey};
 use rba_protocol::errors::{ProtocolError, Result};
 use rba_protocol::frame::{AsyncFrameWriter, AsyncFrames, Frame};
 use rba_protocol::messages::Message;
-use rba_protocol::pairing::{PairingResult, PairingSession, PairingStart, PairingSubmit};
+use rba_protocol::pairing::{
+    PairingConfirmed, PairingResult, PairingSession, PairingStart, PairingSubmit,
+};
 use rba_protocol::types::{AuthRequest, AuthResponse, Id, SessionHelloAck, CHALLENGE_LEN};
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -468,6 +470,15 @@ where
             start.host_pubkey.short_fingerprint()
         );
         Ok(result)
+    }
+
+    /// Tells the host that the pairing record is durable.
+    ///
+    /// Called only after `save_hosts` has succeeded. Until this arrives the host
+    /// must not claim the pairing is complete.
+    pub async fn confirm_pairing(&mut self, session_id: Id) -> Result<()> {
+        self.send(&Message::PairingConfirmed(PairingConfirmed { session_id }))
+            .await
     }
 
     /// Handles one authentication request and returns whether it replied.
