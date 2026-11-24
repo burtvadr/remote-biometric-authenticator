@@ -100,6 +100,9 @@ pub struct Engine {
     pending_auth: Mutex<HashMap<Id, oneshot::Sender<Message>>>,
     pending_pairing: Mutex<Option<oneshot::Sender<PairingSubmit>>>,
     pairing: Mutex<Option<ActivePairing>>,
+    /// The most recent host-side pairing completion, retained after the active
+    /// session is consumed so the device's final acknowledgement can be observed.
+    last_pairing: Mutex<Option<CompletedPairing>>,
     rate_pairing: Mutex<RateLimiter>,
     /// One limiter per transport, because the limits differ (§11). Keyed by
     /// `Transport` so a request cannot dodge the limit by switching transport.
@@ -132,9 +135,9 @@ struct ActivePairing {
     /// Code both sides derived, available once the device has submitted.
     derived: Option<String>,
     phase: PairingPhase,
-    /// Flipped by `confirm_pairing`; flipped by `mark_pairing_confirmed` when the
-    /// device acknowledges its persistent state; observed by the waiting
-    /// connection task.
+    /// Flipped by `confirm_pairing` when the operator passes the human gate;
+    /// observed by the waiting connection task. This is not the device's final
+    /// acknowledgement, which arrives later as `PAIRING_CONFIRMED`.
     confirmed: Arc<AtomicBool>,
     notify: Arc<Notify>,
     started_at: u64,
@@ -145,6 +148,16 @@ struct ActivePairing {
     owner: String,
     /// Whether the operator explicitly allowed this device to authenticate root.
     allow_root: bool,
+}
+
+/// A pairing whose host side finished and which is waiting for the device's
+/// final `PAIRING_CONFIRMED`.
+struct CompletedPairing {
+    session_id: Id,
+    /// The local principal that opened the session; only it may observe or
+    /// acknowledge the completion.
+    peer_key: String,
+    acknowledged: bool,
 }
 
 impl ActivePairing {
@@ -215,6 +228,7 @@ impl Engine {
             pending_auth: Mutex::new(HashMap::new()),
             pending_pairing: Mutex::new(None),
             pairing: Mutex::new(None),
+            last_pairing: Mutex::new(None),
             rate_pairing: Mutex::new(rate_pairing),
             rate_auth: Mutex::new(rate_auth),
             rate_limit_path,
@@ -492,6 +506,11 @@ impl Engine {
                 return Err(ProtocolError::RateLimited(retry));
             }
         }
+        // A new session supersedes any previous completion; its acknowledgement
+        // must never be mistaken for this one.
+        if let Ok(mut last) = self.last_pairing.lock() {
+            *last = None;
+        }
         if let Ok(mut guard) = self.pairing.lock() {
             if let Some(active) = guard.as_ref() {
                 if active.expires_at > now {
@@ -672,18 +691,53 @@ impl Engine {
         if let Ok(mut g) = self.pairing.lock() {
             *g = None;
         }
+        if let Ok(mut last) = self.last_pairing.lock() {
+            *last = None;
+        }
     }
 
-    /// The device has persisted its pairing record and sent an acknowledgement.
+    /// Records the device's final `PAIRING_CONFIRMED`.
     ///
-    /// Flips the `confirmed` flag so that callers waiting on the host side
-    /// (e.g. `rba pair`) may consider the pairing fully complete.
-    pub fn mark_pairing_confirmed(&self) -> Result<()> {
-        if let Ok(mut g) = self.pairing.lock() {
-            let a = g.as_mut().ok_or(ProtocolError::NotPaired)?;
-            a.confirmed.store(true, Ordering::SeqCst);
+    /// The session id must match the host-side pairing that just completed, so a
+    /// device cannot acknowledge a session it did not participate in. This is a
+    /// statement by the device that it persisted its record; the host cannot
+    /// verify that claim, but it is the only signal that the pairing is complete
+    /// on both sides.
+    pub fn acknowledge_pairing(&self, session_id: &Id) -> Result<()> {
+        let mut guard = self
+            .last_pairing
+            .lock()
+            .map_err(|_| ProtocolError::Internal("pairing mutex poisoned".into()))?;
+        let completed = guard.as_mut().ok_or(ProtocolError::NotPaired)?;
+        if completed.session_id != *session_id {
+            return Err(ProtocolError::ContextMismatch(
+                "PAIRING_CONFIRMED does not match the completed session".into(),
+            ));
         }
+        completed.acknowledged = true;
         Ok(())
+    }
+
+    /// Whether the device has acknowledged the last completed pairing, for the
+    /// local principal that opened it. `None` means no completion is pending for
+    /// this caller.
+    pub fn pairing_acknowledged_by(&self, peer_key: &str) -> Option<bool> {
+        self.last_pairing
+            .lock()
+            .ok()?
+            .as_ref()
+            .filter(|p| p.peer_key == peer_key)
+            .map(|p| p.acknowledged)
+    }
+
+    /// Seconds left in the open pairing session, if any.
+    pub fn pairing_remaining(&self) -> Option<u64> {
+        let now = rba_protocol::unix_now();
+        self.pairing
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|a| a.expires_at.saturating_sub(now))
     }
 
     /// Drives the connection half of a pairing exchange.
@@ -824,6 +878,8 @@ impl Engine {
         // the session over.
         let owner = active.owner.clone();
         let allow_root = active.allow_root;
+        let peer_key = active.peer_key.clone();
+        let session_id = active.session.session_id;
         let mut session = active.session;
         session.derive_with_device_ephemeral(
             &self.host.host_id,
@@ -905,6 +961,16 @@ impl Engine {
             e
         })?;
         drop(reg);
+
+        // The record is durable. Remember the completed session so the device's
+        // final acknowledgement can be matched to it and observed by `rba pair`.
+        if let Ok(mut last) = self.last_pairing.lock() {
+            *last = Some(CompletedPairing {
+                session_id,
+                peer_key,
+                acknowledged: false,
+            });
+        }
 
         self.audit.write(
             &Event {

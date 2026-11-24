@@ -39,7 +39,7 @@ when the finding was first written.
 |---|---|---|
 | SEC-001 | Pairing code is not bound to the public keys; an on-path attacker can substitute keys | Resolved |
 | SEC-002 | Pairing code was truncated to one HMAC byte, leaving only 256 values | Resolved (review retracted) |
-| SEC-003 | Broad `common-auth` deployment plus no per-request context creates an MFA-fatigue surface | Confirmed |
+| SEC-003 | Broad `common-auth` deployment plus no per-request context creates an MFA-fatigue surface | Confirmed — partially remediated |
 | SEC-004 | No device-to-Linux-user binding; a paired device can approve another account's PAM request | Resolved |
 
 ### Medium
