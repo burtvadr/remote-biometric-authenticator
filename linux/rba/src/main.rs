@@ -57,7 +57,6 @@ fn usage_text() -> String {
          \x20   help                      show this help\n\
          \n\
          PAIRING:\n\
-         \x20   rba pair --code NNNNNN       pair using an operator-chosen code\n\
          \x20   rba pair --code-entry device  host shows the code; type it on the device (default)\n\
          \x20   rba pair --code-entry host    device shows the code; type it in this terminal\n\
          \x20   --owner USER                  account the device may authenticate (default: you)\n\
@@ -111,7 +110,6 @@ struct Args {
     service: String,
     operation: String,
     device: Option<String>,
-    code: Option<String>,
     code_entry: CodeEntry,
     owner: Option<String>,
     dry_run: bool,
@@ -131,7 +129,6 @@ fn parse() -> Args {
         service: "rba".into(),
         operation: "authenticate".into(),
         device: None,
-        code: None,
         code_entry: CodeEntry::Device,
         owner: None,
         dry_run: false,
@@ -170,7 +167,6 @@ fn parse() -> Args {
             "--service" => args.service = v("--service"),
             "--operation" => args.operation = v("--operation"),
             "-s" | "--device" => args.device = Some(v("--device")),
-            "--code" => args.code = Some(v("--code")),
             "--code-entry" => {
                 let value = v("--code-entry");
                 args.code_entry = match value.as_str() {
@@ -409,7 +405,6 @@ fn cmd_pair(args: &Args) {
     let resp = request(
         args,
         &ControlRequest::Pair {
-            code: args.code.clone(),
             code_entry: Some(args.code_entry.as_str().to_string()),
             timeout_ms: Some(args.timeout_ms.max(1000)),
             owner: args.owner.clone(),
@@ -433,44 +428,21 @@ fn cmd_pair(args: &Args) {
     // running `pair` is already the operator's decision.
     eprintln!("Waiting for device... ({remaining}s)");
 
-    // Wait until the device has submitted and both sides can derive the code.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(remaining.max(0) as u64);
-    let code = loop {
-        if std::time::Instant::now() >= deadline {
-            eprintln!("rba: pairing timed out");
-            std::process::exit(1);
-        }
-        let st = match request(args, &ControlRequest::PairingCode) {
-            Ok(r) if r.ok => r,
-            Ok(r) => fail(&r),
-            Err(e) => {
-                eprintln!("rba: {e}");
-                std::process::exit(1)
+    let code = if args.code_entry == CodeEntry::Device {
+        resp.result.as_ref().and_then(|r| r.get("display_code")).and_then(|v| v.as_str()).unwrap_or("").to_owned()
+    } else {
+        loop {
+            if std::time::Instant::now() >= deadline { eprintln!("rba: pairing timed out"); std::process::exit(1); }
+            let st = request(args, &ControlRequest::PairingStatus).unwrap_or_else(|e| { eprintln!("rba: {e}"); std::process::exit(1) });
+            if !st.ok { fail(&st); }
+            let result = st.result.as_ref();
+            if result.and_then(|v| v.get("active")).and_then(|v| v.as_bool()) != Some(true) {
+                eprintln!("rba: pairing cancelled"); std::process::exit(1);
             }
-        };
-        if st.result.as_ref().and_then(|r| r.get("active")).and_then(|v| v.as_bool()) == Some(false) {
-            eprintln!("rba: pairing expired or cancelled");
-            std::process::exit(1);
+            if result.and_then(|v| v.get("phase")).and_then(|v| v.as_str()) == Some("awaitingconfirmation") { break String::new(); }
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
-        let phase = st
-            .result
-            .as_ref()
-            .and_then(|r| r.get("phase"))
-            .and_then(|p| p.as_str())
-            .unwrap_or("");
-        let candidate = st
-            .result
-            .as_ref()
-            .and_then(|r| r.get("code"))
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
-        if (phase.eq_ignore_ascii_case("awaitingconfirmation")
-            || phase.eq_ignore_ascii_case("confirmed"))
-            && !candidate.is_empty()
-        {
-            break candidate.to_string();
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
     };
 
     let confirmation = match args.code_entry {
@@ -479,6 +451,7 @@ fn cmd_pair(args: &Args) {
             // host [y/N]: the device's typed code is the human gate, so the
             // confirmation is sent automatically.
             println!("Code: {code}  type this on the device");
+            let _ = std::io::stdout().flush();
             None
         }
         CodeEntry::Host => {

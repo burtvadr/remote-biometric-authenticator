@@ -349,6 +349,7 @@ impl Registry {
     pub(crate) fn commit_enrollment(
         &mut self,
         submit: &rba_protocol::pairing::PairingSubmit,
+        cleanup_tokens: &[[u8; 32]],
         now: u64,
         token_hash: &str,
         policy: &DevicePolicy,
@@ -358,7 +359,7 @@ impl Registry {
         let mut candidate = Self::in_memory();
         candidate.devices = self.devices.clone();
         let mut revoked = Vec::new();
-        for token in &submit.cleanup_tokens {
+        for token in cleanup_tokens {
             let hash = hex::encode(rba_protocol::crypto::sha256(token));
             if let Some(id) = candidate.revoke_by_token_hash(&hash)? {
                 revoked.push(id);

@@ -35,3 +35,8 @@
 # Toolchain / SDK pinned per machine
 /android/.kotlin/
 .kotlin/
+
+# Portable enrollment crate build output
+/crates/rba-enrollment/target/
+
+/crates/rba-enrollment-jni/target/

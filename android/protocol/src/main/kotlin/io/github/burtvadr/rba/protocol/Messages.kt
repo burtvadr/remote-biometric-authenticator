@@ -3,18 +3,12 @@ package io.github.burtvadr.rba.protocol
 import java.math.BigInteger
 import java.security.AlgorithmParameters
 import java.security.KeyFactory
-import java.security.KeyPair
-import java.security.KeyPairGenerator
 import java.security.MessageDigest
-import java.security.PrivateKey
-import java.security.PublicKey
 import java.security.interfaces.ECPublicKey
 import java.security.spec.ECGenParameterSpec
 import java.security.spec.ECParameterSpec
 import java.security.spec.ECPoint
-import java.security.spec.ECPrivateKeySpec
 import java.security.spec.ECPublicKeySpec
-import javax.crypto.KeyAgreement
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
@@ -70,14 +64,6 @@ object Limits {
 /** Domain separators. Changing any of these requires a protocol version bump. */
 object Domains {
     val SIGNING = "RBA_AUTH_V1".toByteArray(Charsets.UTF_8)
-    val PAIR = "RBA-PAIR-V1".toByteArray(Charsets.UTF_8)
-    /** Domain separator for the transcript fed into the pairing HKDF. */
-    val PAIR_TRANSCRIPT = "RBA-PAIR-TRANSCRIPT-V2".toByteArray(Charsets.UTF_8)
-    val SALT_PAIR = "RBA-PAIR-SALT-V1".toByteArray(Charsets.UTF_8)
-    val DEVICE_CONFIRM = "RBA-DEVICE-CONFIRM-V1".toByteArray(Charsets.UTF_8)
-    val HOST_CONFIRM = "RBA-HOST-CONFIRM-V1".toByteArray(Charsets.UTF_8)
-    /** Expansion domain used only if rejection sampling exhausts the first block. */
-    val PAIR_CODE = "RBA-PAIR-CODE-V1".toByteArray(Charsets.UTF_8)
 }
 
 /** Convenience for hex, which the CLI and the vector runner need. */
@@ -492,208 +478,99 @@ enum class CodeEntry(val wire: String) {
     }
 }
 
-data class PairingStart(
-    val sessionId: Id,
-    val hostId: Id,
-    val hostPublicKey: ByteArray,
-    val hostKeyId: String,
-    /** Operator-chosen code, or empty when the host chose none. */
-    val code: String,
-    /** Which endpoint must type the derived code. */
-    val codeEntry: CodeEntry = CodeEntry.DEVICE,
-    val expiresAt: Long,
-    val hostNonce: ByteArray,
-    /** Host ephemeral ECDH public key (SEC1 uncompressed, 65 bytes). */
-    val hostEphPublicKey: ByteArray,
-) {
-    fun toPayload(): ByteArray = Cbor.encode(
-        Cbor.ofMap(
-            "code" to Cbor.text(code),
-            "code_entry" to Cbor.text(codeEntry.wire),
-            "expires_at" to Cbor.uint(expiresAt),
-            "host_id" to Cbor.bytes(hostId.bytes),
-            "host_key_id" to Cbor.text(hostKeyId),
-            "host_nonce" to Cbor.bytes(hostNonce),
-            "host_eph_pubkey" to Cbor.bytes(hostEphPublicKey),
-            "host_pubkey" to Cbor.bytes(hostPublicKey),
-            "session_id" to Cbor.bytes(sessionId.bytes),
-        )
-    )
+private const val ENROLLMENT_SUITE = "spake2-p256-sha256-v2"
+private fun pairingMap(payload: ByteArray, size: Int): Cbor.Value.Map {
+    val map = Cbor.decode(payload) as? Cbor.Value.Map ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "enrollment must be a map")
+    if (map.entries.size != size) throw ProtocolException(ErrorCode.BAD_REQUEST, "unexpected enrollment fields")
+    return map
+}
+private fun Cbor.Value.Map.pairBytes(field: String, size: Int): ByteArray {
+    val value = (this[field] as? Cbor.Value.Bytes)?.value ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "missing $field")
+    if (value.size != size) throw ProtocolException(ErrorCode.BAD_REQUEST, "invalid $field length")
+    return value
+}
+private fun Cbor.Value.Map.pairText(field: String): String = (this[field] as? Cbor.Value.Text)?.value ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "missing $field")
+private fun Cbor.Value.Map.pairUint(field: String): Long = (this[field] as? Cbor.Value.Uint)?.value ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "missing $field")
+private fun Cbor.Value.Map.pairId(field: String) = Id(pairBytes(field, Limits.ID_LEN))
+private fun Cbor.Value.Map.pairPoint(field: String): ByteArray = pairBytes(field, Limits.PUBKEY_LEN).also { decodeEcpPublicKey(it) }
+private fun Cbor.Value.Map.requireSuite() {
+    if (pairText("suite") != ENROLLMENT_SUITE) throw ProtocolException(ErrorCode.BAD_REQUEST, "unsupported enrollment suite")
+}
 
+data class PairingStart(val sessionId: Id, val hostId: Id, val hostPublicKey: ByteArray, val hostKeyId: String, val codeEntry: CodeEntry, val expiresAt: Long) {
+    fun toPayload() = Cbor.encode(Cbor.ofMap(
+        "suite" to Cbor.text(ENROLLMENT_SUITE), "session_id" to Cbor.bytes(sessionId.bytes),
+        "host_id" to Cbor.bytes(hostId.bytes), "host_pubkey" to Cbor.bytes(hostPublicKey),
+        "host_key_id" to Cbor.text(hostKeyId), "code_entry" to Cbor.text(codeEntry.wire), "expires_at" to Cbor.uint(expiresAt),
+    ))
     companion object {
         fun fromPayload(payload: ByteArray): PairingStart {
-            val v = Cbor.decode(payload) as? Cbor.Value.Map
-                ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "pairing_start is not a map")
-            val code = (v["code"] as? Cbor.Value.Text)?.value
-                ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "missing code")
-            if (code.isNotEmpty() &&
-                (code.length != Limits.PAIRING_CODE_DIGITS || !code.all { it.isDigit() })
-            ) {
-                throw ProtocolException(ErrorCode.BAD_REQUEST, "code must be empty or six ASCII digits")
-            }
-            val codeEntry = when (val entry = v["code_entry"]) {
-                null -> CodeEntry.DEVICE
-                is Cbor.Value.Text -> CodeEntry.fromWire(entry.value)
-                else -> throw ProtocolException(ErrorCode.BAD_REQUEST, "code_entry must be text")
-            }
-            val nonce = (v["host_nonce"] as? Cbor.Value.Bytes)?.value
-                ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "missing host_nonce")
-            if (nonce.size != Limits.CHALLENGE_LEN) {
-                throw ProtocolException(ErrorCode.BAD_REQUEST, "host_nonce must be 32 bytes")
-            }
-            val hostEph = (v["host_eph_pubkey"] as? Cbor.Value.Bytes)?.value
-                ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "missing host_eph_pubkey")
-            if (hostEph.size != Limits.PUBKEY_LEN) {
-                throw ProtocolException(
-                    ErrorCode.BAD_REQUEST,
-                    "host_eph_pubkey must be 65 bytes",
-                )
-            }
-            // Reject off-curve points before they reach the ECDH implementation.
-            decodeEcpPublicKey(hostEph)
-            return PairingStart(
-                sessionId = Id((v["session_id"] as Cbor.Value.Bytes).value),
-                hostId = Id((v["host_id"] as Cbor.Value.Bytes).value),
-                hostPublicKey = (v["host_pubkey"] as Cbor.Value.Bytes).value,
-                hostKeyId = (v["host_key_id"] as Cbor.Value.Text).value,
-                code = code,
-                codeEntry = codeEntry,
-                expiresAt = (v["expires_at"] as Cbor.Value.Uint).value,
-                hostNonce = nonce,
-                hostEphPublicKey = hostEph,
-            )
+            val v = pairingMap(payload, 7); v.requireSuite()
+            val pk = v.pairPoint("host_pubkey"); val keyId = v.pairText("host_key_id")
+            if (Hex.encode(sha256(pk)) != keyId) throw ProtocolException(ErrorCode.CONTEXT_MISMATCH, "host key id")
+            val expiry = v.pairUint("expires_at"); val now = System.currentTimeMillis() / 1000
+            if (expiry <= now || expiry > now + Limits.PAIRING_TTL) throw ProtocolException(ErrorCode.EXPIRED, "pairing expired")
+            return PairingStart(v.pairId("session_id"), v.pairId("host_id"), pk, keyId, CodeEntry.fromWire(v.pairText("code_entry")), expiry)
         }
     }
 }
 
-data class PairingSubmit(
-    val sessionId: Id,
-    val deviceId: Id,
-    val deviceName: String,
-    val devicePublicKey: ByteArray,
-    val deviceKeyId: String,
-    val deviceNonce: ByteArray,
-    /** Device ephemeral ECDH public key (SEC1 uncompressed, 65 bytes). */
-    val deviceEphPublicKey: ByteArray,
-    val mac: ByteArray,
-    /** Revocation tokens for older pairings this device asks the host to clean up. */
-    val cleanupTokens: List<ByteArray> = emptyList(),
-) {
-    fun toPayload(): ByteArray {
-        val entries = mutableListOf(
-            "device_id" to Cbor.bytes(deviceId.bytes),
-            "device_key_id" to Cbor.text(deviceKeyId),
-            "device_name" to Cbor.text(deviceName),
-            "device_nonce" to Cbor.bytes(deviceNonce),
-            "device_eph_pubkey" to Cbor.bytes(deviceEphPublicKey),
-            "device_pubkey" to Cbor.bytes(devicePublicKey),
-            "mac" to Cbor.bytes(mac),
-            "session_id" to Cbor.bytes(sessionId.bytes),
-        )
-        if (cleanupTokens.isNotEmpty()) {
-            entries += "cleanup_tokens" to Cbor.array(cleanupTokens.map { Cbor.bytes(it) })
-        }
-        return Cbor.encode(Cbor.ofMap(*entries.toTypedArray()))
-    }
-
+data class PairingSubmit(val sessionId: Id, val deviceId: Id, val deviceName: String, val devicePublicKey: ByteArray, val deviceKeyId: String, val share: ByteArray) {
+    fun toPayload() = Cbor.encode(Cbor.ofMap(
+        "suite" to Cbor.text(ENROLLMENT_SUITE), "session_id" to Cbor.bytes(sessionId.bytes),
+        "device_id" to Cbor.bytes(deviceId.bytes), "device_name" to Cbor.text(deviceName),
+        "device_pubkey" to Cbor.bytes(devicePublicKey), "device_key_id" to Cbor.text(deviceKeyId), "share" to Cbor.bytes(share),
+    ))
     companion object {
         fun fromPayload(payload: ByteArray): PairingSubmit {
-            val v = Cbor.decode(payload) as? Cbor.Value.Map
-                ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "pairing_submit is not a map")
-            val mac = (v["mac"] as? Cbor.Value.Bytes)?.value
-                ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "missing mac")
-            if (mac.size != 32) throw ProtocolException(ErrorCode.BAD_REQUEST, "mac must be 32 bytes")
-            val nonce = (v["device_nonce"] as? Cbor.Value.Bytes)?.value
-                ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "missing device_nonce")
-            if (nonce.size != Limits.CHALLENGE_LEN) {
-                throw ProtocolException(ErrorCode.BAD_REQUEST, "device_nonce must be 32 bytes")
-            }
-            val deviceEph = (v["device_eph_pubkey"] as? Cbor.Value.Bytes)?.value
-                ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "missing device_eph_pubkey")
-            if (deviceEph.size != Limits.PUBKEY_LEN) {
-                throw ProtocolException(
-                    ErrorCode.BAD_REQUEST,
-                    "device_eph_pubkey must be 65 bytes",
-                )
-            }
-            decodeEcpPublicKey(deviceEph)
-            val cleanupTokens = when (val raw = v["cleanup_tokens"]) {
-                null -> emptyList()
-                is Cbor.Value.Arr -> raw.items.map { entry ->
-                    val bytes = (entry as? Cbor.Value.Bytes)?.value
-                        ?: throw ProtocolException(
-                            ErrorCode.BAD_REQUEST,
-                            "cleanup_tokens entries must be byte strings",
-                        )
-                    if (bytes.size != 32) {
-                        throw ProtocolException(
-                            ErrorCode.BAD_REQUEST,
-                            "cleanup_tokens entries must be 32 bytes",
-                        )
-                    }
-                    bytes
-                }
-                else -> throw ProtocolException(
-                    ErrorCode.BAD_REQUEST,
-                    "cleanup_tokens must be an array",
-                )
-            }
-            return PairingSubmit(
-                sessionId = Id((v["session_id"] as Cbor.Value.Bytes).value),
-                deviceId = Id((v["device_id"] as Cbor.Value.Bytes).value),
-                deviceName = (v["device_name"] as Cbor.Value.Text).value,
-                devicePublicKey = (v["device_pubkey"] as Cbor.Value.Bytes).value,
-                deviceKeyId = (v["device_key_id"] as Cbor.Value.Text).value,
-                deviceNonce = nonce,
-                deviceEphPublicKey = deviceEph,
-                mac = mac,
-                cleanupTokens = cleanupTokens,
-            )
+            val v = pairingMap(payload, 7); v.requireSuite()
+            val pk = v.pairPoint("device_pubkey"); val keyId = v.pairText("device_key_id")
+            if (Hex.encode(sha256(pk)) != keyId) throw ProtocolException(ErrorCode.CONTEXT_MISMATCH, "device key id")
+            return PairingSubmit(v.pairId("session_id"), v.pairId("device_id"), v.pairText("device_name"), pk, keyId, v.pairPoint("share"))
         }
     }
 }
 
-data class PairingResult(
-    val sessionId: Id,
-    val status: Long,
-    val hostMac: ByteArray?,
-    /** Bearer capability for revoking this pairing later. */
-    val revocationToken: ByteArray? = null,
-) {
-    fun toPayload(): ByteArray {
-        val entries = mutableListOf(
-            "session_id" to Cbor.bytes(sessionId.bytes),
-            "status" to Cbor.uint(status),
-        )
-        hostMac?.let { entries += "host_mac" to Cbor.bytes(it) }
-        revocationToken?.let { entries += "revocation_token" to Cbor.bytes(it) }
-        return Cbor.encode(Cbor.ofMap(*entries.toTypedArray()))
+data class PairingChallenge(val sessionId: Id, val share: ByteArray, val confirmation: ByteArray) {
+    fun toPayload() = Cbor.encode(Cbor.ofMap("session_id" to Cbor.bytes(sessionId.bytes), "share" to Cbor.bytes(share), "confirmation" to Cbor.bytes(confirmation)))
+    companion object {
+        fun fromPayload(payload: ByteArray): PairingChallenge {
+            val v = pairingMap(payload, 3)
+            return PairingChallenge(v.pairId("session_id"), v.pairPoint("share"), v.pairBytes("confirmation", 32))
+        }
     }
+}
 
+data class PairingProof(val sessionId: Id, val confirmation: ByteArray, val cleanupTokens: List<ByteArray>) {
+    fun toPayload() = Cbor.encode(Cbor.ofMap("session_id" to Cbor.bytes(sessionId.bytes), "confirmation" to Cbor.bytes(confirmation), "cleanup_tokens" to Cbor.Value.Arr(cleanupTokens.map { Cbor.bytes(it) })))
+    companion object {
+        fun fromPayload(payload: ByteArray): PairingProof {
+            val v = pairingMap(payload, 3)
+            val tokens = (v["cleanup_tokens"] as? Cbor.Value.Arr)?.items ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "invalid cleanup tokens")
+            if (tokens.size > 64) throw ProtocolException(ErrorCode.BAD_REQUEST, "too many cleanup tokens")
+            return PairingProof(v.pairId("session_id"), v.pairBytes("confirmation", 32), tokens.map {
+                (it as? Cbor.Value.Bytes)?.value?.takeIf { b -> b.size == 32 } ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "invalid cleanup token")
+            })
+        }
+    }
+}
+
+data class PairingResult(val sessionId: Id, val status: Long, val revocationToken: ByteArray? = null) {
+    fun toPayload(): ByteArray {
+        val fields = mutableListOf("session_id" to Cbor.bytes(sessionId.bytes), "status" to Cbor.uint(status))
+        revocationToken?.let { fields += "revocation_token" to Cbor.bytes(it) }
+        return Cbor.encode(Cbor.ofMap(*fields.toTypedArray()))
+    }
     companion object {
         fun fromPayload(payload: ByteArray): PairingResult {
-            val v = Cbor.decode(payload) as? Cbor.Value.Map
-                ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "pairing_result is not a map")
-            val status = (v["status"] as? Cbor.Value.Uint)?.value
-                ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "missing status")
-            if (status > 1L) throw ProtocolException(ErrorCode.BAD_REQUEST, "status must be 0 or 1")
-            val hostMac = (v["host_mac"] as? Cbor.Value.Bytes)?.value
-            if (status == 0L && hostMac == null) {
-                throw ProtocolException(ErrorCode.BAD_REQUEST, "a success must carry host_mac")
+            val v = Cbor.decode(payload) as? Cbor.Value.Map ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "invalid pairing result")
+            val status = v.pairUint("status")
+            val token = when {
+                status == 0L && v.entries.size == 3 -> v.pairBytes("revocation_token", 32)
+                status == 1L && v.entries.size == 2 -> null
+                else -> throw ProtocolException(ErrorCode.BAD_REQUEST, "invalid pairing result")
             }
-            val revocationToken = (v["revocation_token"] as? Cbor.Value.Bytes)?.value
-            if (revocationToken != null && revocationToken.size != 32) {
-                throw ProtocolException(
-                    ErrorCode.BAD_REQUEST,
-                    "revocation_token must be 32 bytes",
-                )
-            }
-            return PairingResult(
-                sessionId = Id((v["session_id"] as Cbor.Value.Bytes).value),
-                status = status,
-                hostMac = hostMac,
-                revocationToken = revocationToken,
-            )
+            return PairingResult(v.pairId("session_id"), status, token)
         }
     }
 }
@@ -743,225 +620,10 @@ data class Unpair(val token: ByteArray) {
     }
 }
 
-/**
- * The device side of the pairing confirmation (`PROTOCOL.md` §6.4).
- *
- * The six-digit code is derived from an ephemeral ECDH secret over the full
- * transcript: session id, host/device ids, both long-term public keys, both
- * nonces and both ephemeral public keys. A network attacker who substitutes
- * either endpoint's keys computes a different secret on each side, so the codes
- * shown on the two screens do not match. That is the property the old
- * public-nonce-only construction lacked.
- *
- * The code is still a short authentication string, not a PAKE: an active attacker
- * gets about one success in 10^6 per live, rate-limited pairing session.
- */
-class PairingSession private constructor(
-    val sessionId: Id,
-    val hostNonce: ByteArray,
-    val hostEphPublicKey: ByteArray,
-    val codeEntry: CodeEntry,
-    private val deviceKeyPair: KeyPair,
-) {
-    private var deviceNonce: ByteArray? = null
-    private var secret: ByteArray? = null
-    private var transcript: ByteArray? = null
-
-    /** The device's ephemeral ECDH public key, sent in `PAIRING_SUBMIT`. */
-    val deviceEphemeralPublicKey: ByteArray by lazy {
-        encodeEcpPublicKey(deviceKeyPair.public as ECPublicKey)
-    }
-
-    constructor(
-        sessionId: Id,
-        hostNonce: ByteArray,
-        hostEphPublicKey: ByteArray,
-        codeEntry: CodeEntry = CodeEntry.DEVICE,
-    ) : this(
-        sessionId,
-        hostNonce,
-        hostEphPublicKey,
-        codeEntry,
-        generateP256KeyPair(),
-    )
-
-    /**
-     * Binds the complete transcript and derives the shared secret.
-     *
-     * Call after the device nonce exists and before [code], [deviceMac] or
-     * [hostMac]. The same host/device identity arguments must be used for all
-     * three, otherwise the methods refuse rather than confirm a different
-     * transcript.
-     */
-    @Suppress("LongParameterList")
-    fun derive(
-        hostId: Id,
-        deviceId: Id,
-        hostPub: ByteArray,
-        devicePub: ByteArray,
-        deviceNonce: ByteArray,
-    ) {
-        require(deviceNonce.size == Limits.CHALLENGE_LEN) { "device nonce must be 32 bytes" }
-        require(hostEphPublicKey.size == Limits.PUBKEY_LEN) {
-            "host ephemeral key must be 65 bytes"
-        }
-        val peer = decodeEcpPublicKey(hostEphPublicKey)
-        val shared = ecdh(deviceKeyPair.private, peer)
-        try {
-            val t = transcriptWith(hostId, deviceId, hostPub, devicePub, deviceNonce)
-            val info = Domains.PAIR_TRANSCRIPT + t
-            secret = hkdf(ikm = shared, salt = Domains.SALT_PAIR, info = info, length = 32)
-            transcript = t
-            this.deviceNonce = deviceNonce.copyOf()
-        } finally {
-            shared.fill(0)
-        }
-    }
-
-    private fun confirmationKey(): ByteArray {
-        val s = secret ?: throw IllegalStateException("derive must be called first")
-        val t = transcript ?: throw IllegalStateException("derive must be called first")
-        return hmac(s, Domains.PAIR + byteArrayOf(0x00) + t)
-    }
-
-    /**
-     * The six-digit code the operator types on the other endpoint.
-     *
-     * Rejection sampling, not a modulo reduction. `4_294_000_000` is the largest
-     * multiple of `1_000_000` below `2^32`, so rejecting words at or above it
-     * leaves every code 000000..999999 with exactly 4,294 chances. The expansion
-     * is only reached with probability about 6e-30.
-     */
-    fun code(): String {
-        val v = codeFromMaterial(confirmationKey())
-        return v.toString().padStart(Limits.PAIRING_CODE_DIGITS, '0')
-    }
-
-    private fun codeFromMaterial(p: ByteArray): Long {
-        val limit = 4_294_000_000L
-        var block = p
-        var counter = 0L
-        while (true) {
-            var i = 0
-            while (i + 4 <= block.size) {
-                val v = ((block[i].toLong() and 0xFF) shl 24) or
-                    ((block[i + 1].toLong() and 0xFF) shl 16) or
-                    ((block[i + 2].toLong() and 0xFF) shl 8) or
-                    (block[i + 3].toLong() and 0xFF)
-                if (v < limit) return v % 1_000_000L
-                i += 4
-            }
-            counter += 1
-            val msg = Domains.PAIR_CODE + byteArrayOf(0) + counter.toBigEndianBytes()
-            block = hmac(p, msg)
-        }
-    }
-
-    private fun Long.toBigEndianBytes(): ByteArray = ByteArray(8) { i ->
-        (this ushr (56 - 8 * i)).toByte()
-    }
-
-    private fun transcriptWith(
-        hostId: Id,
-        deviceId: Id,
-        hostPub: ByteArray,
-        devicePub: ByteArray,
-        deviceNonce: ByteArray,
-    ): ByteArray = sessionId.bytes + hostId.bytes + deviceId.bytes + hostPub + devicePub +
-        hostNonce + deviceNonce + hostEphPublicKey + deviceEphemeralPublicKey +
-        byteArrayOf(codeEntryByte())
-
-    private fun checkedTranscript(
-        hostId: Id,
-        deviceId: Id,
-        hostPub: ByteArray,
-        devicePub: ByteArray,
-    ): ByteArray {
-        val nonce = deviceNonce ?: throw IllegalStateException("derive must be called first")
-        val t = transcriptWith(hostId, deviceId, hostPub, devicePub, nonce)
-        val derived = transcript ?: throw IllegalStateException("derive must be called first")
-        if (!t.contentEquals(derived)) {
-            throw ProtocolException(
-                ErrorCode.CONTEXT_MISMATCH,
-                "pairing transcript does not match the derived secret",
-            )
-        }
-        return t
-    }
-
-    fun deviceMac(
-        hostId: Id,
-        deviceId: Id,
-        hostPub: ByteArray,
-        devicePub: ByteArray,
-    ): ByteArray = hmac(
-        confirmationKey(),
-        Domains.DEVICE_CONFIRM + byteArrayOf(0x00) +
-            checkedTranscript(hostId, deviceId, hostPub, devicePub),
-    )
-
-    fun hostMac(
-        hostId: Id,
-        deviceId: Id,
-        hostPub: ByteArray,
-        devicePub: ByteArray,
-    ): ByteArray = hmac(
-        confirmationKey(),
-        Domains.HOST_CONFIRM + byteArrayOf(0x00) +
-            checkedTranscript(hostId, deviceId, hostPub, devicePub),
-    )
-
-    /** Stable transcript byte for the code-entry mode. */
-    private fun codeEntryByte(): Byte = when (codeEntry) {
-        CodeEntry.DEVICE -> 0
-        CodeEntry.HOST -> 1
-    }
-
-    companion object {
-        /**
-         * Deterministic ephemeral key for conformance vectors only. Production
-         * callers must use the public constructor, which generates a fresh key.
-         */
-        fun withDeviceEphemeralScalar(
-            sessionId: Id,
-            hostNonce: ByteArray,
-            hostEphPublicKey: ByteArray,
-            scalar: ByteArray,
-            publicKey: ByteArray,
-            codeEntry: CodeEntry = CodeEntry.DEVICE,
-        ): PairingSession {
-            require(scalar.size == 32) { "ephemeral scalar must be 32 bytes" }
-            val params = p256Params()
-            val d = BigInteger(1, scalar)
-            require(d.signum() > 0 && d < params.order) { "ephemeral scalar out of range" }
-            val public = decodeEcpPublicKey(publicKey)
-            val private = KeyFactory.getInstance("EC")
-                .generatePrivate(ECPrivateKeySpec(d, params))
-            return PairingSession(
-                sessionId,
-                hostNonce,
-                hostEphPublicKey,
-                codeEntry,
-                KeyPair(public, private),
-            )
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// P-256 ECDH helpers
-// ---------------------------------------------------------------------------
-
 private fun p256Params(): ECParameterSpec {
     val parameters = AlgorithmParameters.getInstance("EC")
     parameters.init(ECGenParameterSpec("secp256r1"))
     return parameters.getParameterSpec(ECParameterSpec::class.java)
-}
-
-internal fun generateP256KeyPair(): KeyPair {
-    val generator = KeyPairGenerator.getInstance("EC")
-    generator.initialize(ECGenParameterSpec("secp256r1"))
-    return generator.generateKeyPair()
 }
 
 /** Parses an uncompressed P-256 point and rejects off-curve coordinates. */
@@ -981,31 +643,6 @@ internal fun decodeEcpPublicKey(bytes: ByteArray): ECPublicKey {
         .generatePublic(ECPublicKeySpec(point, params)) as ECPublicKey
 }
 
-internal fun encodeEcpPublicKey(key: ECPublicKey): ByteArray =
-    byteArrayOf(0x04) + toFixed32(key.w.affineX) + toFixed32(key.w.affineY)
-
-private fun toFixed32(value: BigInteger): ByteArray {
-    val raw = value.toByteArray().let {
-        if (it.size > 1 && it[0] == 0.toByte()) it.copyOfRange(1, it.size) else it
-    }
-    require(raw.size <= 32) { "coordinate does not fit in 32 bytes" }
-    return ByteArray(32 - raw.size) + raw
-}
-
-private fun ecdh(privateKey: PrivateKey, peer: PublicKey): ByteArray {
-    val agreement = KeyAgreement.getInstance("ECDH")
-    agreement.init(privateKey)
-    agreement.doPhase(peer, true)
-    val raw = agreement.generateSecret()
-    // JCA normally returns the fixed-width X coordinate. Normalise defensively so
-    // a provider that trims leading zeros still agrees with P-256 ECDH.
-    return when {
-        raw.size == 32 -> raw
-        raw.size > 32 -> raw.copyOfRange(raw.size - 32, raw.size)
-        else -> ByteArray(32 - raw.size) + raw
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
@@ -1015,6 +652,8 @@ object MessageType {
     const val PAIRING_SUBMIT = 2
     const val PAIRING_RESULT = 3
     const val PAIRING_CONFIRMED = 4
+    const val PAIRING_CHALLENGE = 5
+    const val PAIRING_PROOF = 6
     const val SESSION_HELLO = 10
     const val SESSION_HELLO_ACK = 11
     const val AUTH_REQUEST = 12
@@ -1046,6 +685,15 @@ sealed class Message {
 
     data class PairingConfirmedMessage(val v: PairingConfirmed) : Message() {
         override val type = MessageType.PAIRING_CONFIRMED
+        override fun toPayload() = v.toPayload()
+    }
+
+    data class PairingChallengeMessage(val v: PairingChallenge) : Message() {
+        override val type = MessageType.PAIRING_CHALLENGE
+        override fun toPayload() = v.toPayload()
+    }
+    data class PairingProofMessage(val v: PairingProof) : Message() {
+        override val type = MessageType.PAIRING_PROOF
         override fun toPayload() = v.toPayload()
     }
 
@@ -1097,6 +745,8 @@ sealed class Message {
                 MessageType.PAIRING_SUBMIT -> PairingSubmitMessage(PairingSubmit.fromPayload(frame.payload))
                 MessageType.PAIRING_RESULT -> PairingResultMessage(PairingResult.fromPayload(frame.payload))
                 MessageType.PAIRING_CONFIRMED -> PairingConfirmedMessage(PairingConfirmed.fromPayload(frame.payload))
+                MessageType.PAIRING_CHALLENGE -> PairingChallengeMessage(PairingChallenge.fromPayload(frame.payload))
+                MessageType.PAIRING_PROOF -> PairingProofMessage(PairingProof.fromPayload(frame.payload))
                 MessageType.SESSION_HELLO -> SessionHelloMessage(SessionHello.fromPayload(frame.payload))
                 MessageType.SESSION_HELLO_ACK -> SessionHelloAckMessage(SessionHelloAck.fromPayload(frame.payload))
                 MessageType.AUTH_REQUEST -> AuthRequestMessage(AuthRequest.fromPayload(frame.payload))

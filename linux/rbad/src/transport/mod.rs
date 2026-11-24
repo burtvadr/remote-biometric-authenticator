@@ -39,6 +39,7 @@ pub struct Connection<R, W> {
     pub transport: Transport,
     pub peer: String,
     session_id: Id,
+    certificate_sha256: Option<[u8; 32]>,
     device_id: Option<Id>,
     /// Which connection this task registered, so its teardown only unregisters that
     /// connection and not a newer one for the same device.
@@ -55,6 +56,7 @@ pub fn open<S>(
     stream: S,
     transport: Transport,
     peer: String,
+    certificate_sha256: Option<[u8; 32]>,
 ) -> SplitConnection<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -67,6 +69,7 @@ where
         transport,
         peer,
         session_id: Id::default(),
+        certificate_sha256,
         device_id: None,
         conn_id: None,
     }
@@ -121,14 +124,20 @@ where
             }
         };
 
+        if ack.session_id != session_id || ack.protocol_version != hello.protocol_version {
+            self.send_error(&ProtocolError::ContextMismatch("session acknowledgement".into()), None).await;
+            return Ok(());
+        }
+
         // 3. If pairing is open, this connection is a pairing attempt. The pairing
         //    task runs *alongside* the read loop below rather than instead of it:
         //    it needs the device's `PAIRING_SUBMIT` to be read and delivered while
         //    it waits.
-        let pairing_session = self.engine.claim_pairing_connection();
+        let pairing_session = self.certificate_sha256.and_then(|_| self.engine.claim_pairing_connection());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Frame>();
         let mut pairing_task = None;
         let mut submit_sender = None;
+        let mut proof_sender = None;
         if let Some(sid) = pairing_session {
             self.engine
                 .audit()
@@ -137,8 +146,11 @@ where
             let tx_for_pairing = tx.clone();
             let (sender, receiver) = tokio::sync::oneshot::channel();
             submit_sender = Some(sender);
+            let (proof_tx, proof_rx) = tokio::sync::oneshot::channel();
+            proof_sender = Some(proof_tx);
+            let certificate_sha256 = self.certificate_sha256.expect("pairing requires channel identity");
             pairing_task = Some(tokio::spawn(async move {
-                let outcome = engine.drive_pairing(sid, &tx_for_pairing, receiver, pairing_timeout).await;
+                let outcome = engine.drive_pairing(sid, &tx_for_pairing, receiver, proof_rx, certificate_sha256, pairing_timeout).await;
                 match outcome {
                     Ok(result) => {
                         let msg = Message::PairingResult(result);
@@ -153,7 +165,6 @@ where
                         let reject = Message::PairingResult(PairingResult {
                             session_id: sid,
                             status: 1,
-                            host_mac: None,
                             revocation_token: None,
                         });
                         let _ = tx_for_pairing.send(reject.to_frame());
@@ -227,6 +238,12 @@ where
                                         self.send_error(&ProtocolError::NotPaired, None).await;
                                         break;
                                     }
+                                }
+                                Ok(Message::PairingProof(proof)) => {
+                                    if pairing_session != Some(proof.session_id) { break; }
+                                    if let Some(sender) = proof_sender.take() {
+                                        if sender.send(proof).is_err() { break; }
+                                    } else { break; }
                                 }
                                 // The device persists its record after receiving
                                 // PAIRING_RESULT, then sends this acknowledgement.

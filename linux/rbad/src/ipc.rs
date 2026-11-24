@@ -154,11 +154,8 @@ pub enum ControlRequest {
     List,
     /// Daemon status: listeners, sessions, pending pairing.
     Status,
-    /// Enter pairing mode for a bounded time, optionally with a chosen code.
+    /// Enter pairing mode for a bounded time.
     Pair {
-        /// Six ASCII digits. The daemon generates one when absent.
-        #[serde(default)]
-        code: Option<String>,
         /// Which endpoint types the code: `device` (default) or `host`.
         #[serde(default)]
         code_entry: Option<String>,
@@ -190,8 +187,8 @@ pub enum ControlRequest {
     Revoke { device: String },
     /// Remove trust for a device (marks it Replaced, retained for audit).
     Unpair { device: String },
-    /// Fetch the pairing code for an in-progress pairing session.
-    PairingCode,
+    /// Inspect the pairing phase without exposing its password.
+    PairingStatus,
     /// Record the operator's confirmation. In `host` mode this carries the code
     /// the operator typed from the device; the daemon verifies it before persisting.
     ConfirmPairing {

@@ -60,13 +60,11 @@ claim to evidence is checkable.
 
 Stated rather than hidden:
 
-* **Pairing is not a PAKE.** The six-digit code is an HMAC over the transcript keyed
-  by an ephemeral ECDH secret, so an on-path attacker cannot derive it from public
-  nonces and a key substitution produces different codes on each endpoint. The
-  remaining active-attack bound is the six-digit SAS: about `2^20` work per live,
-  single-use pairing session. Both ephemeral private keys are zeroized, so the
-  recorded transcript does not reveal the secret even if a long-term key is later
-  compromised. See `PROTOCOL.md` §6.4.
+* **Short pairing passwords and integration assurance.** The candidate uses
+  RFC 9382 SPAKE2 with an independently obtained TLS certificate binding and
+  durable admission. Six digits still permit online guesses; protect the code
+  and limit attempts. Old enrollments retain their original assurance until
+  re-enrolled. Full integration and independent review remain pending.
 * **ECDSA malleability.** `(r, s)` and `(r, n-s)` both verify. Signature bytes are
   therefore never used as identifiers, and replay defence rests on `request_id`
   and `challenge`.
@@ -77,7 +75,11 @@ Stated rather than hidden:
   filtering. A fixed endpoint can be configured; it is never a trust anchor.
 * **BLE freshness window.** BLE uses a tighter 10 s skew than Wi-Fi's 30 s, because
   the link is slower. This is a liveness trade-off, not a security difference.
-* **Rate limiting is per-process.** The daemon's limits do not survive a restart.
+* **Admission persistence candidate.** Pairing, account, device and both transport
+  budgets are committed before dispatch; restart and failure tests are supplied
+  but require Rust verification. A trustworthy host clock and protected state
+  directory are assumed. Authentication intent and pre-auth network flood controls
+  remain separate concerns. See `SESSION_ADMISSION.md`.
 
 ## Verification status
 

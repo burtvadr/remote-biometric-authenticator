@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+umask 077
 # End-to-end smoke test: real daemon, real TLS, real pairing, real signature.
 # Usage: tests/e2e-smoke.sh [workdir]
 set -uo pipefail
@@ -39,7 +40,7 @@ step "pair"
 "$CTL" $CTL_SOCK pair --owner "$(id -un)" >"$WORK/pair.log" 2>&1 &
 PAIR_PID=$!
 sleep 1
-timeout 60 "$SIM" pair --host "127.0.0.1:$PORT" --name "Pixel 9" \
+sed -n 's/^Code: \([0-9]\{6\}\).*/\1/p' "$WORK/pair.log" | timeout 60 "$SIM" pair --host "127.0.0.1:$PORT" --name "Pixel 9" \
     --daemon "$DAEMON" --daemon-arg --state-dir --daemon-arg "$WORK/state" \
     >"$WORK/sim-pair.log" 2>&1
 SIM_RC=$?
@@ -50,7 +51,7 @@ echo "--- rba pair (rc=$PAIR_RC) ---"; cat "$WORK/pair.log"
 [ "$SIM_RC" -eq 0 ] || fail "simulator pairing failed"
 [ "$PAIR_RC" -eq 0 ] || fail "host pairing did not complete"
 grep -q "^Paired" "$WORK/pair.log" || fail "missing host pairing acknowledgement"
-grep -q "Compare this code" "$WORK/sim-pair.log" || fail "no code was displayed"
+grep -q "Host verified" "$WORK/sim-pair.log" || fail "PAKE did not verify"
 grep -qi "confirm" "$WORK/pair.log" || true
 
 step "devices now shows the paired device"
@@ -96,13 +97,13 @@ if grep -Eq '"(challenge|signature|mac|host_mac|pairing_code|code_hex|private_ke
     fail "audit log carries a secret-bearing field"
 fi
 # The real invariant: the pairing code the operator saw must never appear in the log.
-PAIR_CODE="$(sed -n 's/.*|  \([0-9]\{6\}\)  |.*/\1/p' "$WORK/pair.log" | head -1)"
+PAIR_CODE="$(sed -n 's/^Code: \([0-9]\{6\}\).*/\1/p' "$WORK/pair.log" | head -1)"
 if [ -n "$PAIR_CODE" ]; then
     if grep -q "$PAIR_CODE" "$WORK/audit.log"; then
         echo "audit log leaks the pairing code:"; cat "$WORK/audit.log"
-        fail "pairing code $PAIR_CODE appears in the audit log"
+        fail "pairing code appears in the audit log"
     fi
-    echo "pairing code $PAIR_CODE is absent from the audit log"
+    echo "pairing code is absent from the audit log"
 fi
 echo "--- audit.log ---"; cat "$WORK/audit.log"
 python3 - "$WORK/audit.log" <<'PY'

@@ -16,18 +16,19 @@ use rba_protocol::frame::Frame;
 use rba_protocol::messages::Message;
 use rba_protocol::nonce::ReplayGuard;
 use rba_protocol::pairing::{
-    CodeEntry, PairingResult, PairingSession, PairingStart, PairingSubmit,
+    CodeEntry, PairingChallenge, PairingProof, PairingResult, PairingStart, PairingSubmit,
 };
-use rba_protocol::ratelimit::{Limit, RateLimiter};
 use rba_protocol::types::{
-    AuthRequest, AuthResponse, Challenge, Id, Transport, AUTH_REQUEST_TTL_DEFAULT, RATE_AUTH,
-    RATE_AUTH_WINDOW, RATE_PAIRING, RATE_PAIRING_WINDOW,
+    AuthRequest, AuthResponse, Challenge, Id, Transport, AUTH_REQUEST_TTL_DEFAULT,
 };
 use rba_protocol::verifier;
 use tokio::sync::{mpsc, oneshot, Notify};
 
+use crate::admission::Admission;
 use crate::audit::{AuditLog, Event};
 use crate::registry::{DevicePolicy, DeviceStatus, HostIdentity, Registry};
+
+fn enrollment_error(_: rba_enrollment::Error) -> ProtocolError { ProtocolError::SignatureInvalid }
 
 /// A currently connected device.
 #[derive(Clone, Debug)]
@@ -90,36 +91,6 @@ impl AuthOutcome {
     }
 }
 
-/// Shared prompt budgets, independent of transport and requested service.
-/// Only admitted attempts consume these budgets; rejected requests do not
-/// prolong the cooldown or grow the timestamp queues.
-struct PromptBudget {
-    accounts: RateLimiter,
-    devices: RateLimiter,
-}
-
-impl PromptBudget {
-    fn new() -> Self {
-        Self {
-            accounts: RateLimiter::new(Limit::new(3, 60)),
-            devices: RateLimiter::new(Limit::new(3, 60)),
-        }
-    }
-
-    fn admit(&mut self, account: &str, device: &str, now: u64) -> Result<()> {
-        self.accounts.prune(now);
-        self.devices.prune(now);
-        if !self.accounts.peek(account, now) || !self.devices.peek(device, now) {
-            let retry = self.accounts.retry_after(account, now)
-                .max(self.devices.retry_after(device, now));
-            return Err(ProtocolError::RateLimited(retry));
-        }
-        self.accounts.check_and_record(account, now);
-        self.devices.check_and_record(device, now);
-        Ok(())
-    }
-}
-
 pub struct Engine {
     pub host: HostIdentity,
     pub registry: Mutex<Registry>,
@@ -128,16 +99,10 @@ pub struct Engine {
     devices: Mutex<HashMap<Id, DeviceHandle>>,
     /// Where a connection task delivers a received message for in-flight work.
     pending_auth: Mutex<HashMap<Id, oneshot::Sender<Message>>>,
-    pending_pairing: Mutex<Option<oneshot::Sender<PairingSubmit>>>,
     pairing: Mutex<Option<ActivePairing>>,
     last_pairing: Mutex<Option<CompletedPairing>>,
-    rate_pairing: Mutex<RateLimiter>,
-    /// One limiter per transport, because the limits differ (§11). Keyed by
-    /// `Transport` so a request cannot dodge the limit by switching transport.
-    rate_auth: Mutex<HashMap<Transport, RateLimiter>>,
-    prompt_budget: Mutex<PromptBudget>,
-    /// Optional path for persistent rate-limit state.
-    rate_limit_path: Option<std::path::PathBuf>,
+    /// All rate-limit dimensions share one admission transaction.
+    admission: Mutex<Admission>,
     /// Advertised host label, shown on the device.
     pub host_name: String,
     /// Hands out a unique id per connection, so a stale teardown can be told apart
@@ -156,16 +121,12 @@ pub enum PairingPhase {
 }
 
 struct ActivePairing {
-    session: PairingSession,
-    /// Operator-chosen code, if any.
-    chosen: Option<String>,
-    /// Which endpoint must type the derived code.
+    session_id: Id,
+    /// Locally generated or locally entered password, never sent on the wire.
+    code: Option<rba_enrollment::PairingCode>,
     code_entry: CodeEntry,
-    /// Code both sides derived, available once the device has submitted.
-    derived: Option<String>,
-    /// Challenge-response code (32 hex chars, per-session, replay-resistant).
-    challenge_response: Option<String>,
     phase: PairingPhase,
+    connection_claimed: bool,
     /// Flipped by the host-side human gate, not by the final device acknowledgement.
     confirmed: Arc<AtomicBool>,
     notify: Arc<Notify>,
@@ -177,8 +138,17 @@ struct ActivePairing {
     owner: String,
 }
 
+struct PendingEnrollment {
+    submit: PairingSubmit,
+    cleanup_tokens: Vec<[u8; 32]>,
+    token_hash: String,
+    owner: String,
+}
+
 struct CompletedPairing {
     session_id: Id,
+    expires_at: u64,
+    pending: Option<PendingEnrollment>,
     /// The local principal that opened the session; only it may observe or
     /// acknowledge the completion.
     peer_key: String,
@@ -202,7 +172,13 @@ impl Engine {
         audit: AuditLog,
         host_name: String,
     ) -> Arc<Engine> {
-        Self::with_rate_limit_path(host, registry, audit, host_name, None)
+        Self::with_admission(
+            host,
+            registry,
+            audit,
+            host_name,
+            Admission::open(None).expect("in-memory admission requires no filesystem"),
+        )
     }
 
     pub fn with_rate_limit_path(
@@ -210,39 +186,19 @@ impl Engine {
         registry: Registry,
         audit: AuditLog,
         host_name: String,
-        rate_limit_path: Option<std::path::PathBuf>,
+        rate_limit_path: &std::path::Path,
+    ) -> Result<Arc<Engine>> {
+        let admission = Admission::open(Some(rate_limit_path))?;
+        Ok(Self::with_admission(host, registry, audit, host_name, admission))
+    }
+
+    fn with_admission(
+        host: HostIdentity,
+        registry: Registry,
+        audit: AuditLog,
+        host_name: String,
+        admission: Admission,
     ) -> Arc<Engine> {
-        // Load persisted rate limits if available.
-        let (rate_pairing, rate_auth) = if let Some(ref path) = rate_limit_path {
-            let pairing_path = path.join("pairing.ratelimit");
-            let auth_path = path.join("auth.ratelimit");
-            let rp =
-                RateLimiter::load(&pairing_path, Limit::new(RATE_PAIRING, RATE_PAIRING_WINDOW));
-            let mut ra = HashMap::new();
-            ra.insert(
-                Transport::Wifi,
-                RateLimiter::load(&auth_path, Limit::new(RATE_AUTH, RATE_AUTH_WINDOW)),
-            );
-            ra.insert(
-                Transport::Ble,
-                RateLimiter::for_auth_transport(Transport::Ble),
-            );
-            (rp, ra)
-        } else {
-            (
-                RateLimiter::new(Limit::new(RATE_PAIRING, RATE_PAIRING_WINDOW)),
-                HashMap::from([
-                    (
-                        Transport::Wifi,
-                        RateLimiter::for_auth_transport(Transport::Wifi),
-                    ),
-                    (
-                        Transport::Ble,
-                        RateLimiter::for_auth_transport(Transport::Ble),
-                    ),
-                ]),
-            )
-        };
         Arc::new(Engine {
             host,
             next_conn: std::sync::atomic::AtomicU64::new(1),
@@ -251,31 +207,11 @@ impl Engine {
             audit,
             devices: Mutex::new(HashMap::new()),
             pending_auth: Mutex::new(HashMap::new()),
-            pending_pairing: Mutex::new(None),
             pairing: Mutex::new(None),
             last_pairing: Mutex::new(None),
-            rate_pairing: Mutex::new(rate_pairing),
-            rate_auth: Mutex::new(rate_auth),
-            prompt_budget: Mutex::new(PromptBudget::new()),
-            rate_limit_path,
+            admission: Mutex::new(admission),
             host_name,
         })
-    }
-
-    /// Persist rate-limit state to disk so it survives daemon restarts.
-    pub fn save_rate_limits(&self) {
-        if let Some(ref path) = self.rate_limit_path {
-            let _ = std::fs::create_dir_all(path);
-            if let Ok(rp) = self.rate_pairing.lock() {
-                let _ = rp.save(&path.join("pairing.ratelimit"));
-            }
-            // Save wifi limiter (the primary transport).
-            if let Ok(map) = self.rate_auth.lock() {
-                if let Some(rl) = map.get(&Transport::Wifi) {
-                    let _ = rl.save(&path.join("auth.ratelimit"));
-                }
-            }
-        }
     }
 
     pub fn audit(&self) -> &AuditLog {
@@ -390,6 +326,17 @@ impl Engine {
             .unwrap_or(false)
     }
 
+    /// Assign an open pairing attempt to exactly one transport connection.
+    pub fn claim_pairing_connection(&self) -> Option<Id> {
+        let mut guard = self.pairing.lock().ok()?;
+        let active = guard.as_mut()?;
+        if active.connection_claimed || active.expires_at <= rba_protocol::unix_now() {
+            return None;
+        }
+        active.connection_claimed = true;
+        Some(active.session_id)
+    }
+
     /// True when `peer_key` is the caller that opened the live pairing session.
     ///
     /// Pairing codes and confirmation belong to one local principal. Another
@@ -463,39 +410,19 @@ impl Engine {
             .unwrap_or_default()
     }
 
-    /// Routes a `PAIRING_SUBMIT` to the waiting pairing task.
-    ///
-    /// Called before any device identity is known, since the submission is what
-    /// *establishes* which device is connecting.
-    pub fn deliver_pairing(&self, submit: PairingSubmit) {
-        if let Ok(mut slot) = self.pending_pairing.lock() {
-            if let Some(tx) = slot.take() {
-                let _ = tx.send(submit);
+    /// Delivers a message received from a device to whoever is waiting for it.
+    pub fn deliver(&self, device_id: &Id, msg: Message) {
+        if let Ok(mut pending) = self.pending_auth.lock() {
+            if let Some(tx) = pending.remove(device_id) {
+                let _ = tx.send(msg);
                 return;
             }
         }
-        self.audit
-            .write(&Event::new("pairing_submit_unexpected").denied("NOT_PAIRED"));
-    }
-
-    /// Delivers a message received from a device to whoever is waiting for it.
-    pub fn deliver(&self, device_id: &Id, msg: Message) {
-        match msg {
-            Message::PairingSubmit(submit) => self.deliver_pairing(submit),
-            other => {
-                if let Ok(mut p) = self.pending_auth.lock() {
-                    if let Some(tx) = p.remove(device_id) {
-                        let _ = tx.send(other);
-                        return;
-                    }
-                }
-                self.audit.write(
-                    &Event::new("unsolicited_message")
-                        .denied("CONTEXT_MISMATCH")
-                        .device_id(device_id_hex(device_id)),
-                );
-            }
-        }
+        self.audit.write(
+            &Event::new("unsolicited_message")
+                .denied("CONTEXT_MISMATCH")
+                .device_id(device_id_hex(device_id)),
+        );
     }
 
     // -- pairing -------------------------------------------------------------
@@ -506,31 +433,32 @@ impl Engine {
     /// sessions whose codes could be confused.
     pub fn begin_pairing(
         self: &Arc<Self>,
-        code: Option<String>,
         owner: String,
         peer_key: String,
     ) -> Result<(Option<String>, u64)> {
-        self.begin_pairing_with_mode(code, CodeEntry::Device, owner, peer_key)
+        self.begin_pairing_with_mode(CodeEntry::Device, owner, peer_key)
     }
 
     /// Opens a pairing session with an explicit code-entry direction and owner.
     pub fn begin_pairing_with_mode(
         self: &Arc<Self>,
-        code: Option<String>,
         code_entry: CodeEntry,
         owner: String,
         peer_key: String,
     ) -> Result<(Option<String>, u64)> {
-        let now = rba_protocol::unix_now();
-        {
-            let mut rp = self.rate_pairing.lock().expect("rate mutex");
-            if !rp.check_and_record(&peer_key, now) {
-                let retry = rp.retry_after(&peer_key, now);
-                self.audit
-                    .write(&Event::new("pairing_rate_limited").denied("RATE_LIMITED"));
-                return Err(ProtocolError::RateLimited(retry));
+        let now = {
+            let mut admission = self.admission.lock().map_err(|_| {
+                ProtocolError::Internal("admission mutex poisoned".into())
+            })?;
+            let now = rba_protocol::unix_now();
+            if let Err(e) = admission.pairing(&peer_key, now) {
+                self.audit.write(
+                    &Event::new("pairing_admission_denied").denied(e.code().as_str()),
+                );
+                return Err(e);
             }
-        }
+            now
+        };
         if let Ok(mut guard) = self.pairing.lock() {
             if let Some(active) = guard.as_ref() {
                 if active.expires_at > now {
@@ -540,37 +468,26 @@ impl Engine {
                     )));
                 }
             }
+            let mut staged = self.last_pairing.lock()
+                .map_err(|_| ProtocolError::Internal("pairing completion mutex poisoned".into()))?;
+            if staged.as_ref().is_some_and(|p| p.pending.is_some() && p.expires_at > now) {
+                return Err(ProtocolError::BadRequest("a pairing is awaiting device confirmation".into()));
+            }
             let session_id = Id::random()?;
-            let host_nonce = rba_protocol::crypto::random_array()?;
-            // The session holds an ephemeral ECDH key. Nothing is derived and no
-            // code exists until the device's `PAIRING_SUBMIT` arrives with its
-            // own ephemeral key, so there is no provisional public-nonce code.
-            let session = PairingSession::new_with_mode(session_id, host_nonce, code_entry);
-            let chosen: Option<String> = match code {
-                Some(c) => {
-                    if c.len() != rba_protocol::types::PAIRING_CODE_DIGITS
-                        || !c.chars().all(|x| x.is_ascii_digit())
-                    {
-                        return Err(ProtocolError::BadRequest(
-                            "pairing code must be exactly six ASCII digits".into(),
-                        ));
-                    }
-                    Some(c)
-                }
-                // No operator-chosen code: both sides derive one from the two
-                // nonces and the operator compares the screens.
-                None => None,
-            };
+            // Only the displaying endpoint generates a fresh random password.
+            let password = if code_entry == CodeEntry::Device {
+                Some(rba_enrollment::PairingCode::generate().map_err(enrollment_error)?)
+            } else { None };
+            let display = password.as_ref().map(|c| String::from_utf8_lossy(c.as_ascii()).into_owned());
             let ttl = rba_protocol::types::PAIRING_TTL;
             let expires_at = now + ttl;
-            *self.last_pairing.lock().map_err(|_| ProtocolError::Internal("pairing completion mutex poisoned".into()))? = None;
+            *staged = None;
             *guard = Some(ActivePairing {
-                session,
-                chosen: chosen.clone(),
+                session_id,
+                code: password,
                 code_entry,
-                derived: None,
-                challenge_response: None,
                 phase: PairingPhase::AwaitingDevice,
+                connection_claimed: false,
                 confirmed: Arc::new(AtomicBool::new(false)),
                 notify: Arc::new(Notify::new()),
                 started_at: now,
@@ -579,7 +496,7 @@ impl Engine {
                 owner,
             });
             self.audit.write(&Event::new("pairing_started"));
-            Ok((chosen, expires_at))
+            Ok((display, expires_at))
         } else {
             Err(ProtocolError::Internal("pairing mutex poisoned".into()))
         }
@@ -599,26 +516,31 @@ impl Engine {
         })
     }
 
-    /// The code to show the operator, when this mode displays it.
-    ///
-    /// Before the device submits this is the operator-chosen code; afterwards it
-    /// is the code derived from the transcript-bound ECDH secret. In
-    /// [`CodeEntry::Host`] mode the host
-    /// must not display this value: the device displays it. The caller decides
-    /// Challenge-response pairing code.
-    ///
-    /// The code is a 32-character hex string derived from a per-session challenge
-    /// and the ECDH shared secret. The user enters this code to complete pairing.
-    /// Works for both command-line entry (ADB-style) and QR code display.
-    ///
-    /// The code is bound to the session and cannot be reused (replay resistance).
+    /// Return only non-secret metadata for the owner of a pairing attempt.
+    pub fn pairing_status_for(&self, peer_key: &str, administrative: bool) -> Result<Option<serde_json::Value>> {
+        let g = self.pairing.lock().map_err(|_| ProtocolError::Internal("pairing mutex poisoned".into()))?;
+        let Some(a) = g.as_ref() else { return Ok(None); };
+        if a.expires_at <= rba_protocol::unix_now() { return Ok(None); }
+        if !administrative && a.peer_key != peer_key {
+            return Err(ProtocolError::ContextMismatch("pairing belongs to another caller".into()));
+        }
+        Ok(Some(serde_json::json!({
+            "active": true, "expires_at": a.expires_at,
+            "phase": format!("{:?}", a.phase).to_lowercase(),
+            "code_entry": a.code_entry.as_str(),
+            "seconds_remaining": a.expires_at.saturating_sub(rba_protocol::unix_now()),
+        })))
+    }
+
+    /// In-process fixture helper; never exposed through the control API.
     pub fn pairing_code(&self) -> Option<(String, u64)> {
-        self.pairing.lock().ok().and_then(|g| {
-            g.as_ref().map(|a| {
-                let code = a.challenge_response.clone().unwrap_or_default();
-                (code, a.expires_at)
-            })
-        })
+        let g = self.pairing.lock().ok()?;
+        let a = g.as_ref()?;
+        if a.expires_at <= rba_protocol::unix_now() { return None; }
+        let code = if a.code_entry == CodeEntry::Device {
+            a.code.as_ref().map(|c| String::from_utf8_lossy(c.as_ascii()).into_owned()).unwrap_or_default()
+        } else { String::new() };
+        Some((code, a.expires_at))
     }
 
     /// Which endpoint is required to type the derived code.
@@ -641,93 +563,73 @@ impl Engine {
     ///
     /// Kept for callers that do not need to supply a code; the real work is in
     /// [`Engine::confirm_pairing_with_code`].
-    pub fn confirm_pairing(&self) -> Result<()> {
-        self.confirm_pairing_with_code(None)
+    pub fn confirm_pairing(&self, peer_key: &str) -> Result<()> {
+        self.confirm_pairing_with_code(peer_key, None)
     }
 
-    /// Records the operator's confirmation, verifying the code when the host is
-    /// the endpoint that must type it.
-    ///
-    /// In [`CodeEntry::Device`] mode the host displays the code and the device
-    /// verifies the typed value, so no code is needed here. In
-    /// [`CodeEntry::Host`] mode the device displays the code, and the host MUST
-    /// prove it was typed by supplying it. A wrong value cancels the session
-    /// immediately: one comparison attempt per exchange.
-    pub fn confirm_pairing_with_code(&self, entered_code: Option<&str>) -> Result<()> {
+    /// Host-entry mode accepts one local password submission. The PAKE peer
+    /// confirmation, not a locally derived comparison, decides whether it is right.
+    pub fn confirm_pairing_with_code(&self, peer_key: &str, entered_code: Option<&str>) -> Result<()> {
         let notify = {
-            let mut g = self
-                .pairing
-                .lock()
-                .map_err(|_| ProtocolError::Internal("poisoned".into()))?;
+            let mut g = self.pairing.lock().map_err(|_| ProtocolError::Internal("poisoned".into()))?;
             let a = g.as_mut().ok_or(ProtocolError::NotPaired)?;
-            if a.phase == PairingPhase::AwaitingDevice {
-                return Err(ProtocolError::BadRequest(
-                    "no device has submitted a pairing request yet".into(),
-                ));
+            if a.peer_key != peer_key { return Err(ProtocolError::ContextMismatch("pairing belongs to another caller".into())); }
+            if a.expires_at <= rba_protocol::unix_now() || a.confirmed.load(Ordering::SeqCst) {
+                return Err(ProtocolError::NotPaired);
             }
-            if a.code_entry == CodeEntry::Host {
-                let expected = a.derived.as_deref().ok_or_else(|| {
-                    ProtocolError::Internal("pairing code is not available yet".into())
-                })?;
-                let entered = entered_code.ok_or_else(|| {
-                    ProtocolError::BadRequest(
-                        "the host must enter the code shown on the device".into(),
-                    )
-                })?;
-                if entered.len() != expected.len()
-                    || !rba_protocol::crypto::ct_eq_slice(entered.as_bytes(), expected.as_bytes())
-                {
-                    // A mismatch is terminal: no retry inside the same exchange.
-                    // Retrying would turn the six-digit check into an online
-                    // guessing oracle and keep a half-open session alive.
-                    let _ = g.take();
-                    self.audit
-                        .write(&Event::new("pairing_code_mismatch").denied("CONTEXT_MISMATCH"));
-                    return Err(ProtocolError::ContextMismatch(
-                        "the entered pairing code does not match; pairing cancelled".into(),
-                    ));
+            match a.code_entry {
+                CodeEntry::Host => {
+                    if a.phase != PairingPhase::AwaitingConfirmation { return Err(ProtocolError::NotPaired); }
+                    let code = entered_code.ok_or_else(|| ProtocolError::BadRequest("enter the device's code".into()))?;
+                    a.code = Some(rba_enrollment::PairingCode::parse(code.as_bytes()).map_err(enrollment_error)?);
                 }
-                self.audit.write(&Event::new("pairing_code_verified"));
+                CodeEntry::Device => {
+                    if entered_code.is_some() { return Err(ProtocolError::BadRequest("the device enters the code".into())); }
+                }
             }
             a.phase = PairingPhase::Confirmed;
             a.confirmed.store(true, Ordering::SeqCst);
             Arc::clone(&a.notify)
         };
         notify.notify_waiters();
-        self.audit.write(&Event::new("pairing_confirmed"));
         Ok(())
     }
 
-    fn take_pairing_if_active(&self, now: u64) -> Result<ActivePairing> {
-        let mut guard = self
-            .pairing
-            .lock()
-            .map_err(|_| ProtocolError::Internal("poisoned".into()))?;
-        let active = guard.take().ok_or(ProtocolError::NotPaired)?;
-        if active.expires_at < now {
-            return Err(ProtocolError::Expired);
-        }
-        Ok(active)
-    }
-
     pub fn cancel_pairing(&self) {
-        if let Ok(mut g) = self.pairing.lock() {
-            *g = None;
-        }
-        if let Ok(mut last) = self.last_pairing.lock() { *last = None; }
+        // Used by in-process tests and administrative shutdown.
+        let _ = self.cancel_pairing_for("", true);
     }
 
-    /// Records the device's final `PAIRING_CONFIRMED`.
-    ///
-    /// The session id must match the host-side pairing that just completed, so a
-    /// device cannot acknowledge a session it did not participate in. This is a
-    /// statement by the device that it persisted its record; the host cannot
-    /// verify that claim, but it is the only signal that the pairing is complete
-    /// on both sides.
+    pub fn cancel_pairing_for(&self, peer_key: &str, administrative: bool) -> Result<()> {
+        let mut active = self.pairing.lock()
+            .map_err(|_| ProtocolError::Internal("pairing mutex poisoned".into()))?;
+        let mut staged = self.last_pairing.lock()
+            .map_err(|_| ProtocolError::Internal("pairing mutex poisoned".into()))?;
+        let owner = active.as_ref().map(|p| p.peer_key.as_str())
+            .or_else(|| staged.as_ref().filter(|p| p.pending.is_some()).map(|p| p.peer_key.as_str()));
+        if !administrative && owner.is_some_and(|owner| owner != peer_key) {
+            return Err(ProtocolError::ContextMismatch("pairing belongs to another caller".into()));
+        }
+        *active = None;
+        if staged.as_ref().is_some_and(|p| !p.acknowledged) {
+            *staged = None;
+        }
+        Ok(())
+    }
+
+    /// Discard only the attempt owned by a closing connection, never a newer one.
+    pub fn cancel_pairing_attempt(&self, session_id: &Id) {
+        if let Ok(mut active) = self.pairing.lock() {
+            if active.as_ref().is_some_and(|p| p.session_id == *session_id) {
+                *active = None;
+            }
+            self.discard_pairing_result(session_id);
+        }
+    }
+
+    /// Commit only after the device has confirmed the exact pairing session.
     pub fn acknowledge_pairing(&self, session_id: &Id) -> Result<()> {
-        let mut guard = self
-            .last_pairing
-            .lock()
+        let mut guard = self.last_pairing.lock()
             .map_err(|_| ProtocolError::Internal("pairing mutex poisoned".into()))?;
         let completed = guard.as_mut().ok_or(ProtocolError::NotPaired)?;
         if completed.session_id != *session_id {
@@ -735,8 +637,42 @@ impl Engine {
                 "PAIRING_CONFIRMED does not match the completed session".into(),
             ));
         }
+        let now = rba_protocol::unix_now();
+        if completed.expires_at <= now {
+            completed.pending = None;
+            return Err(ProtocolError::Expired);
+        }
+        let enrollment = completed.pending.take().ok_or(ProtocolError::NotPaired)?;
+        let policy = DevicePolicy::for_user(enrollment.owner.clone());
+        let revoked = self.registry.lock()
+            .map_err(|_| ProtocolError::Internal("registry mutex poisoned".into()))?
+            .commit_enrollment(&enrollment.submit, &enrollment.cleanup_tokens, now, &enrollment.token_hash, &policy)?;
+        for id in revoked {
+            self.audit.write(&Event {
+                kind: "pairing_cleanup",
+                device_id: Some(id.to_hex()),
+                ..Event::new("pairing_cleanup")
+            }.success());
+        }
         completed.acknowledged = true;
+        self.audit.write(&Event {
+            kind: "paired",
+            device_id: Some(enrollment.submit.device_id.to_hex()),
+            device_name: Some(enrollment.submit.device_name),
+            username: Some(enrollment.owner),
+            detail: Some("explicit basic enrollment grant".into()),
+            ..Event::new("paired")
+        }.success());
         Ok(())
+    }
+
+    /// Discard an unfinished enrollment if its result connection closes.
+    pub fn discard_pairing_result(&self, session_id: &Id) {
+        if let Ok(mut guard) = self.last_pairing.lock() {
+            if guard.as_ref().is_some_and(|p| p.session_id == *session_id && !p.acknowledged) {
+                *guard = None;
+            }
+        }
     }
 
     /// Whether the device has acknowledged the last completed pairing, for the
@@ -747,7 +683,7 @@ impl Engine {
             .lock()
             .ok()?
             .as_ref()
-            .filter(|p| p.peer_key == peer_key)
+            .filter(|p| p.peer_key == peer_key && (p.acknowledged || (p.pending.is_some() && p.expires_at > rba_protocol::unix_now())))
             .map(|p| p.acknowledged)
     }
 
@@ -761,244 +697,77 @@ impl Engine {
             .map(|a| a.expires_at.saturating_sub(now))
     }
 
-    /// Drives the connection half of a pairing exchange.
-    ///
-    /// The session was already opened by an explicit `rba pair`
-    /// ([`Engine::begin_pairing`]); this sends `PAIRING_START` on the arriving
-    /// connection, waits for `PAIRING_SUBMIT`, verifies it, and returns the
-    /// `PAIRING_RESULT` the transport must send back.
+    /// The code is never compared or transmitted. The host waits for the
+    /// device share, obtains the local password once, and requires a valid
+    /// reciprocal confirmation on this connection before staging trust.
     pub async fn drive_pairing(
-        self: &Arc<Self>,
-        tx: &mpsc::UnboundedSender<Frame>,
-        timeout_secs: u64,
+        self: &Arc<Self>, session_id: Id, tx: &mpsc::UnboundedSender<Frame>,
+        resp_rx: oneshot::Receiver<PairingSubmit>, proof_rx: oneshot::Receiver<PairingProof>,
+        certificate_sha256: [u8; 32], timeout_secs: u64,
     ) -> Result<PairingResult> {
-        let code = {
-            let g = self
-                .pairing
-                .lock()
-                .map_err(|_| ProtocolError::Internal("poisoned".into()))?;
-            g.as_ref()
-                .ok_or(ProtocolError::NotPaired)?
-                .chosen
-                .clone()
-                .unwrap_or_default()
-        };
-        let start_frame = self.pairing_start_frame(&code, rba_protocol::unix_now())?;
-        tx.send(start_frame)
-            .map_err(|_| ProtocolError::Internal("device connection closed".into()))?;
-
-        let (resp_tx, resp_rx) = oneshot::channel();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        tx.send(self.pairing_start_frame(session_id, rba_protocol::unix_now())?)
+            .map_err(|_| ProtocolError::NotPaired)?;
+        let submit = tokio::time::timeout_at(deadline, resp_rx).await.map_err(|_| ProtocolError::Expired)?
+            .map_err(|_| ProtocolError::NotPaired)?;
+        if submit.session_id != session_id { return Err(ProtocolError::NotPaired); }
         {
-            let mut slot = self
-                .pending_pairing
-                .lock()
-                .map_err(|_| ProtocolError::Internal("poisoned".into()))?;
-            *slot = Some(resp_tx);
+            let mut g = self.pairing.lock().map_err(|_| ProtocolError::Internal("poisoned".into()))?;
+            let a = g.as_mut().filter(|a| a.session_id == session_id && a.connection_claimed).ok_or(ProtocolError::NotPaired)?;
+            if !a.confirmed.load(Ordering::SeqCst) { a.phase = PairingPhase::AwaitingConfirmation; }
         }
-        let received =
-            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), resp_rx).await;
-        if let Ok(mut slot) = self.pending_pairing.lock() {
-            *slot = None;
-        }
-        let submit = match received {
-            Err(_) => {
-                self.cancel_pairing();
-                return Err(ProtocolError::Expired);
-            }
-            Ok(Err(_)) => {
-                self.cancel_pairing();
-                return Err(ProtocolError::Internal("device connection closed".into()));
-            }
-            Ok(Ok(s)) => s,
-        };
-
-        // Derive the shared secret and publish the code. The selected mode decides
-        // which endpoint displays it and which endpoint must type it. Nothing is
-        // verified or persisted until the operator confirmation gate.
-        {
-            // Complete the ephemeral ECDH exchange with the device's keys and
-            // publish the transcript-bound code. The same session is reused by
-            // `complete_pairing`, so the displayed code and the MACs cover
-            // exactly the keys that will be enrolled.
-            let mut g = self
-                .pairing
-                .lock()
-                .map_err(|_| ProtocolError::Internal("poisoned".into()))?;
-            let a = g.as_mut().ok_or(ProtocolError::NotPaired)?;
-            a.session.derive_with_device_ephemeral(
-                &self.host.host_id,
-                &submit.device_id,
-                &self.host.public_key(),
-                &submit.device_pubkey,
-                submit.device_nonce,
-                submit.device_eph_pubkey,
-            )?;
-            a.derived = Some(a.session.code()?);
-            a.phase = PairingPhase::AwaitingConfirmation;
-        }
-        self.audit.write(&Event::new("pairing_code_ready"));
-
-        // Block until the operator confirms, the session expires, or we time out.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-        loop {
-            let notified = {
-                let g = self
-                    .pairing
-                    .lock()
-                    .map_err(|_| ProtocolError::Internal("poisoned".into()))?;
-                let a = g.as_ref().ok_or(ProtocolError::NotPaired)?;
+        let (password, context) = loop {
+            let notify = {
+                let mut g = self.pairing.lock().map_err(|_| ProtocolError::Internal("poisoned".into()))?;
+                let a = g.as_mut().filter(|a| a.session_id == session_id).ok_or(ProtocolError::NotPaired)?;
+                if a.expires_at <= rba_protocol::unix_now() { return Err(ProtocolError::Expired); }
                 if a.confirmed.load(Ordering::SeqCst) {
-                    break;
-                }
-                if a.expires_at < rba_protocol::unix_now() {
-                    self.cancel_pairing();
-                    return Err(ProtocolError::Expired);
+                    let password = a.code.take().ok_or(ProtocolError::NotPaired)?;
+                    let context = rba_enrollment::Context {
+                        session_id: session_id.0, host_id: self.host.host_id.0, device_id: submit.device_id.0,
+                        host_public_key: *self.host.public_key().as_bytes(), device_public_key: *submit.device_pubkey.as_bytes(),
+                        host_certificate_sha256: certificate_sha256, expires_at: a.expires_at,
+                        code_entry: match a.code_entry { CodeEntry::Device => rba_enrollment::CodeEntry::DeviceTypes, CodeEntry::Host => rba_enrollment::CodeEntry::HostTypes },
+                    };
+                    break (password, context);
                 }
                 Arc::clone(&a.notify)
             };
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                self.cancel_pairing();
-                return Err(ProtocolError::Expired);
-            }
-            let _ = tokio::time::timeout(
-                remaining.min(std::time::Duration::from_millis(250)),
-                notified.notified(),
-            )
-            .await;
-        }
-
-        self.complete_pairing(submit)
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() { return Err(ProtocolError::Expired); }
+            let _ = tokio::time::timeout(remaining.min(std::time::Duration::from_millis(250)), notify.notified()).await;
+        };
+        let (host_share, exchange) = {
+            let mut rng = rand_core_10::UnwrapErr(getrandom_04::SysRng);
+            rba_enrollment::start_host(password, &context, &mut rng).map_err(enrollment_error)?
+        };
+        let unconfirmed = exchange.finish(&submit.share).map_err(enrollment_error)?;
+        let challenge = PairingChallenge { session_id, share: host_share.try_into().map_err(|_| ProtocolError::SignatureInvalid)?,
+            confirmation: unconfirmed.confirmation().try_into().map_err(|_| ProtocolError::SignatureInvalid)? };
+        tx.send(Message::PairingChallenge(challenge).to_frame()).map_err(|_| ProtocolError::NotPaired)?;
+        let proof = tokio::time::timeout_at(deadline, proof_rx).await.map_err(|_| ProtocolError::Expired)?
+            .map_err(|_| ProtocolError::NotPaired)?;
+        if proof.session_id != session_id { return Err(ProtocolError::NotPaired); }
+        let _confirmed = unconfirmed.verify_peer(&proof.confirmation).map_err(enrollment_error)?;
+        self.stage_enrollment(submit, proof.cleanup_tokens)
     }
 
-    /// Verifies a submitted pairing and, only on success, persists the device.
-    ///
-    /// Ordering matters: the MAC is verified *before* anything is written, so a
-    /// failed submission cannot leave a registry entry behind.
-    pub fn complete_pairing(&self, mut submit: PairingSubmit) -> Result<PairingResult> {
-        let now = rba_protocol::unix_now();
-        let active = self.take_pairing_if_active(now)?;
-        if active.phase != PairingPhase::Confirmed {
-            // Unreachable through `drive_pairing`, but the invariant is worth
-            // stating: nothing is persisted without operator confirmation.
-            return Err(ProtocolError::Internal(
-                "pairing was not confirmed by the operator".into(),
-            ));
+    /// Stage only after the private PAKE path has verified the peer's confirmation.
+    fn stage_enrollment(&self, submit: PairingSubmit, cleanup_tokens: Vec<[u8; 32]>) -> Result<PairingResult> {
+        let mut pairing = self.pairing.lock().map_err(|_| ProtocolError::Internal("pairing mutex poisoned".into()))?;
+        if !pairing.as_ref().is_some_and(|p| p.session_id == submit.session_id && p.connection_claimed) {
+            return Err(ProtocolError::NotPaired);
         }
-
-        if submit.session_id != active.session.session_id {
-            self.audit
-                .write(&Event::new("pairing_rejected").denied("CONTEXT_MISMATCH"));
-            return Err(ProtocolError::ContextMismatch(
-                "pairing submit does not match the open session".into(),
-            ));
-        }
-
-        // The owner was fixed when the local operator opened the session. The
-        // device cannot influence it, and a different local caller cannot take
-        // the session over.
-        let owner = active.owner.clone();
-        let peer_key = active.peer_key.clone();
-        let session_id = active.session.session_id;
-        let mut session = active.session;
-        session.derive_with_device_ephemeral(
-            &self.host.host_id,
-            &submit.device_id,
-            &self.host.public_key(),
-            &submit.device_pubkey,
-            submit.device_nonce,
-            submit.device_eph_pubkey,
-        )?;
-        if let Some(chosen) = &active.chosen {
-            if &session.code()? != chosen {
-                // When the operator selected a code, the device must have derived
-                // exactly that value. A mismatch means the code comparison the
-                // operator relied on could not have succeeded.
-                self.audit
-                    .write(&Event::new("pairing_rejected").denied("CONTEXT_MISMATCH"));
-                return Err(ProtocolError::ContextMismatch(
-                    "pairing confirmation code does not match".into(),
-                ));
-            }
-        }
-
-        let expected = session.device_mac(
-            &self.host.host_id,
-            &submit.device_id,
-            &self.host.public_key(),
-            &submit.device_pubkey,
-        )?;
-        if !rba_protocol::crypto::ct_eq_slice(&submit.mac, &expected) {
-            self.audit
-                .write(&Event::new("pairing_mac_invalid").denied("SIGNATURE_INVALID"));
-            return Err(ProtocolError::SignatureInvalid);
-        }
-
-        let host_mac = session.host_mac(
-            &self.host.host_id,
-            &submit.device_id,
-            &self.host.public_key(),
-            &submit.device_pubkey,
-        )?;
-
-        // A new pairing can carry cleanup tokens from older pairings. These are
-        // bearer capabilities, not proof of same-installation identity: each token
-        // lets us find and revoke exactly the old record it belongs to. Process
-        // them only after the new pairing's MAC verified, and before upserting the
-        // new record, so a new key can replace an old one.
+        let active = pairing.take().ok_or(ProtocolError::NotPaired)?;
+        if active.expires_at <= rba_protocol::unix_now() || active.phase != PairingPhase::Confirmed { return Err(ProtocolError::Expired); }
+        let session_id = active.session_id;
         let revocation_token: [u8; 32] = rba_protocol::crypto::random_array()?;
-        let revocation_token_hash = hex::encode(rba_protocol::crypto::sha256(&revocation_token));
-        let mut reg = self.registry.lock().expect("registry mutex");
-        for token in &submit.cleanup_tokens {
-            let hash = hex::encode(rba_protocol::crypto::sha256(token));
-            if let Some(revoked) = reg.revoke_by_token_hash(&hash)? {
-                self.audit.write(
-                    &Event {
-                        kind: "pairing_cleanup",
-                        device_id: Some(revoked.to_hex()),
-                        ..Event::new("pairing_cleanup")
-                    }
-                    .success(),
-                );
-            }
-        }
-        // Only now is anything persisted.
-        let policy = DevicePolicy::for_user(owner.clone());
-        reg.upsert_paired_full(
-            submit.device_id,
-            &submit.device_name,
-            &submit.device_pubkey,
-            now,
-            Some(&revocation_token_hash),
-            &policy,
-        )
-        .map_err(|e| {
-            self.audit
-                .write(&Event::new("pairing_rejected").denied("CONTEXT_MISMATCH"));
-            e
-        })?;
-        drop(reg);
-        *self.last_pairing.lock().map_err(|_| ProtocolError::Internal("pairing completion mutex poisoned".into()))? = Some(CompletedPairing { session_id, peer_key, acknowledged: false });
-
-        self.audit.write(
-            &Event {
-                kind: "paired",
-                device_id: Some(submit.device_id.to_hex()),
-                device_name: Some(submit.device_name.clone()),
-                username: Some(owner),
-                detail: Some("explicit basic enrollment grant".into()),
-                ..Event::new("paired")
-            }
-            .success(),
-        );
-
-        submit.mac = [0u8; 32];
-        Ok(PairingResult {
-            session_id: submit.session_id,
-            status: 0,
-            host_mac: Some(host_mac),
-            revocation_token: Some(revocation_token),
-        })
+        let token_hash = hex::encode(rba_protocol::crypto::sha256(&revocation_token));
+        *self.last_pairing.lock().map_err(|_| ProtocolError::Internal("pairing completion mutex poisoned".into()))? = Some(CompletedPairing {
+            session_id, peer_key: active.peer_key, expires_at: active.expires_at,
+            pending: Some(PendingEnrollment { submit, cleanup_tokens, token_hash, owner: active.owner }), acknowledged: false,
+        });
+        Ok(PairingResult { session_id, status: 0, revocation_token: Some(revocation_token) })
     }
 
     /// Revokes the record matching a device-held revocation token.
@@ -1029,22 +798,23 @@ impl Engine {
     }
 
     /// Builds the `PAIRING_START` frame for an open session.
-    pub fn pairing_start_frame(&self, code: &str, now: u64) -> Result<Frame> {
+    fn pairing_start_frame(&self, session_id: Id, now: u64) -> Result<Frame> {
         let guard = self
             .pairing
             .lock()
             .map_err(|_| ProtocolError::Internal("poisoned".into()))?;
-        let active = guard.as_ref().ok_or(ProtocolError::NotPaired)?;
+        let active = guard.as_ref().filter(|p| p.session_id == session_id && p.connection_claimed)
+            .ok_or(ProtocolError::NotPaired)?;
+        if active.expires_at <= now {
+            return Err(ProtocolError::Expired);
+        }
         let start = PairingStart {
-            session_id: active.session.session_id,
+            session_id: active.session_id,
             host_id: self.host.host_id,
             host_pubkey: self.host.public_key(),
             host_key_id: self.host.public_key().key_id_hex(),
-            code: code.to_owned(),
             code_entry: active.code_entry,
-            expires_at: active.expires_at.max(now),
-            host_nonce: active.session.host_nonce,
-            host_eph_pubkey: active.session.host_eph_public,
+            expires_at: active.expires_at,
         };
         Ok(Message::PairingStart(start).to_frame())
     }
@@ -1068,7 +838,6 @@ impl Engine {
         let service = service.to_owned();
         let operation = operation.to_owned();
         let device_selector = device_selector.map(|s| s.to_owned());
-        let now = rba_protocol::unix_now();
         let scope = crate::authz::Scope::parse(&purpose, &service, &operation)
             .map_err(|reason| ProtocolError::BadRequest(format!("invalid scope: {reason:?}")))?;
 
@@ -1109,34 +878,32 @@ impl Engine {
             return Err(ProtocolError::NotPaired);
         };
 
-        // Check the transport limit before reserving the shared prompt budgets.
-        // Keep the transport lock until both shared budgets have been admitted;
-        // a denied request must not consume any of the three budgets.
-        {
-            let mut map = self.rate_auth.lock().expect("rate mutex");
-            let limiter = map
-                .entry(handle.transport)
-                .or_insert_with(|| RateLimiter::for_auth_transport(handle.transport));
-            let key = device_id.to_hex();
-            limiter.prune(now);
-            let admission = if !limiter.peek(&key, now) {
-                Err(ProtocolError::RateLimited(limiter.retry_after(&key, now)))
-            } else {
-                self.prompt_budget.lock().expect("prompt budget mutex")
-                    .admit(&username, &key, now)
-            };
-            if let Err(e) = admission {
+        // Persist all admission dimensions together before exposing a challenge.
+        // Sample the clock under the lock so concurrently arriving requests
+        // cannot appear to roll time backwards.
+        let now = {
+            let mut admission = self.admission.lock().map_err(|_| {
+                ProtocolError::Internal("admission mutex poisoned".into())
+            })?;
+            let now = rba_protocol::unix_now();
+            if let Err(e) =
+                admission.authenticate(&username, &device_id.to_hex(), handle.transport, now)
+            {
                 self.audit.write(
-                    &Event::new("auth_rate_limited")
-                        .denied("RATE_LIMITED")
-                        .device_id(key)
+                    &Event::new("auth_admission_denied")
+                        .denied(e.code().as_str())
+                        .device_id(device_id.to_hex())
                         .username(&username)
-                        .purpose(&purpose),
+                        .purpose(&purpose)
+                        .service(&service)
+                        .operation(&operation)
+                        .transport(handle.transport.as_str())
+                        .local_uid(local_uid),
                 );
                 return Err(e);
             }
-            limiter.check_and_record(&key, now);
-        }
+            now
+        };
 
         // Fresh identifiers for every attempt.
         let request_id = Id::random()?;
@@ -1632,25 +1399,14 @@ impl Engine {
                 .count();
             (paired, connected)
         };
-        let pairing = if viewer.is_none() || self.pairing_opened_by(peer_key) {
-            self.pairing_code()
-        } else {
-            None
-        };
+        let pairing = self.pairing_status_for(peer_key, viewer.is_none()).ok().flatten();
         serde_json::json!({
             "host_id": self.host.host_id.to_hex(),
             "host_key_id": self.host.public_key().key_id_hex(),
             "host_name": self.host_name,
             "paired_devices": paired_devices,
             "connected_devices": connected_devices,
-            // The code itself is only obtainable via the pairing_code command, so a
-            // status dump never puts it into a log or a terminal scrollback.
-            "pairing": pairing.map(|(_code, expires)| serde_json::json!({
-                "active": true,
-                "expires_at": expires,
-                "seconds_remaining": expires.saturating_sub(rba_protocol::unix_now()),
-                "code_entry": self.pairing_code_entry().map(|m| m.as_str()),
-            })),
+            "pairing": pairing,
         })
     }
 
@@ -1712,13 +1468,7 @@ mod tests {
         registry
             .upsert_paired_for_user(device_id, "Pixel", &device_key.public_key(), 100, "alice")
             .expect("pair");
-        let engine = Engine::with_rate_limit_path(
-            host,
-            registry,
-            AuditLog::null(),
-            "test-host".into(),
-            None,
-        );
+        let engine = Engine::new(host, registry, AuditLog::null(), "test-host".into());
         (
             engine,
             host_id,
@@ -1817,32 +1567,5 @@ mod tests {
             .expect("registers");
         assert!(engine.force_disconnect_device(&device_id));
         assert!(engine.connected_devices().is_empty());
-    }
-}
-
-#[cfg(test)]
-mod prompt_budget_tests {
-    use super::*;
-
-    #[test]
-    fn account_budget_is_shared_across_devices() {
-        let mut budget = PromptBudget::new();
-        for device in ["a", "b", "c"] {
-            assert!(budget.admit("alice", device, 100).is_ok());
-        }
-        assert!(matches!(budget.admit("alice", "d", 101), Err(ProtocolError::RateLimited(_))));
-        assert!(budget.admit("bob", "d", 101).is_ok());
-    }
-
-    #[test]
-    fn device_budget_is_shared_across_accounts_and_rejections_do_not_extend_it() {
-        let mut budget = PromptBudget::new();
-        for account in ["alice", "bob", "carol"] {
-            assert!(budget.admit(account, "a", 100).is_ok());
-        }
-        for _ in 0..100 {
-            assert!(matches!(budget.admit("dave", "a", 159), Err(ProtocolError::RateLimited(1))));
-        }
-        assert!(budget.admit("dave", "a", 160).is_ok());
     }
 }

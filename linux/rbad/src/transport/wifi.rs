@@ -257,7 +257,8 @@ pub async fn serve(
     config: Config,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
-    let tls_config = Arc::new(tls::server_config(&config)?);
+    let (tls_config, fingerprint) = tls::server_config_with_fingerprint(&config)?;
+    let tls_config = Arc::new(tls_config);
     let listener = TcpListener::bind(config.bind_addr)
         .await
         .map_err(|e| ProtocolError::Internal(format!("bind {}: {e}", config.bind_addr)))?;
@@ -296,7 +297,7 @@ pub async fn serve(
                     match handshake {
                         Ok(Ok(tls_stream)) => {
                             let peer_label = peer.to_string();
-                            let conn = crate::transport::open(engine.clone(), tls_stream, Transport::Wifi, peer_label);
+                            let conn = crate::transport::open(engine.clone(), tls_stream, Transport::Wifi, peer_label, Some(fingerprint));
                             if let Err(e) = conn.run(pairing_timeout).await {
                                 let ev = crate::audit::Event::new("session_error")
                                     .denied(e.code().as_str())

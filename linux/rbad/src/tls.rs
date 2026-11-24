@@ -67,6 +67,10 @@ fn generate(
 /// The certificate is kept on disk as PEM, which is inspectable with ordinary
 /// tooling, and converted to DER here because that is what rustls consumes.
 pub fn server_config(config: &Config) -> Result<rustls::ServerConfig> {
+    server_config_with_fingerprint(config).map(|v| v.0)
+}
+
+pub fn server_config_with_fingerprint(config: &Config) -> Result<(rustls::ServerConfig, [u8; 32])> {
     let (cert_pem, key) = load_or_create_host_tls_material(config)?;
     let mut cursor = std::io::Cursor::new(&cert_pem);
     let certs: Vec<rustls::pki_types::CertificateDer<'static>> = rustls_pemfile::certs(&mut cursor)
@@ -77,6 +81,7 @@ pub fn server_config(config: &Config) -> Result<rustls::ServerConfig> {
             "host certificate file contains no certificates".into(),
         ));
     }
+    let fingerprint = rba_protocol::crypto::sha256(certs[0].as_ref());
     let key =
         rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(key));
     let verifier = rustls::server::WebPkiClientVerifier::no_client_auth();
@@ -85,7 +90,7 @@ pub fn server_config(config: &Config) -> Result<rustls::ServerConfig> {
         .with_client_cert_verifier(verifier)
         .with_single_cert(certs, key)
         .map_err(|e| ProtocolError::Internal(format!("TLS config: {e}")))?;
-    Ok(cfg)
+    Ok((cfg, fingerprint))
 }
 
 /// Accepts a TLS connection from a device.

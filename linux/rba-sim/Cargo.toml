@@ -16,6 +16,9 @@ path = "src/main.rs"
 
 [dependencies]
 rba-protocol.workspace = true
+rba-enrollment = { path = "../../crates/rba-enrollment" }
+rand_core_10 = { package = "rand_core", version = "0.10" }
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["sys_rng"] }
 p256.workspace = true
 hex.workspace = true
 serde.workspace = true

@@ -49,7 +49,6 @@ class ConformanceTest {
             "messages.json",
             "signing-transcript.json",
             "signatures.json",
-            "pairing.json",
         )) {
             val f = File(dir, name)
             assertTrue(f.isFile, "missing vector file $name")

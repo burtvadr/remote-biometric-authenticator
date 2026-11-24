@@ -239,6 +239,7 @@ async fn run(mut args: Args) -> Result<()> {
     }
 
     let stream = connect(&args).await?;
+    let certificate_sha256 = stream.get_ref().1.peer_certificates().and_then(|v| v.first()).map(|cert| rba_protocol::crypto::sha256(cert.as_ref())).ok_or(ProtocolError::NotPaired)?;
     let mut dev = Device::new(
         device,
         stream,
@@ -275,7 +276,20 @@ async fn run(mut args: Args) -> Result<()> {
     };
     match (args.command.as_str(), second) {
         ("pair", Message::PairingStart(start)) => {
-            dev.pair(&start, true).await?;
+            let code = match start.code_entry {
+                rba_protocol::pairing::CodeEntry::Device => {
+                    eprintln!("Enter pairing code from the host:");
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input).map_err(|_| ProtocolError::NotPaired)?;
+                    rba_enrollment::PairingCode::parse(input.trim().as_bytes()).map_err(|_| ProtocolError::NotPaired)?
+                }
+                rba_protocol::pairing::CodeEntry::Host => {
+                    let code = rba_enrollment::PairingCode::generate().map_err(|_| ProtocolError::NotPaired)?;
+                    println!("Code: {}", String::from_utf8_lossy(code.as_ascii()));
+                    code
+                }
+            };
+            dev.pair(&start, code, certificate_sha256).await?;
             // Only acknowledge after the host record is durable on this side.
             save_hosts(&hosts_path, &dev.hosts)?;
             dev.confirm_pairing(start.session_id).await?;

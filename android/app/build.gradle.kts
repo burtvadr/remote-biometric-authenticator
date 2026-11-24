@@ -98,3 +98,18 @@ dependencies {
     androidTestImplementation("androidx.compose.ui:ui-test-junit4")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
+
+// Build the same portable enrollment crate used by the host. cargo-ndk uses
+// the Android NDK, not the build machine's native compiler.
+val enrollmentManifest = rootProject.file("../crates/rba-enrollment-jni/Cargo.toml")
+val enrollmentLibs = layout.buildDirectory.dir("generated/enrollment/jniLibs")
+val buildEnrollmentNative by tasks.registering(Exec::class) {
+    workingDir(rootProject.file(".."))
+    inputs.dir(rootProject.file("../crates/rba-enrollment"))
+    inputs.dir(rootProject.file("../crates/rba-enrollment-jni"))
+    outputs.dir(enrollmentLibs)
+    commandLine("cargo", "ndk", "-p", "28", "-t", "arm64-v8a", "-t", "armeabi-v7a", "-t", "x86_64",
+        "-o", enrollmentLibs.get().asFile.absolutePath, "build", "--release", "--manifest-path", enrollmentManifest.absolutePath)
+}
+android.sourceSets.getByName("main").jniLibs.srcDir(enrollmentLibs)
+tasks.named("preBuild").configure { dependsOn(buildEnrollmentNative) }

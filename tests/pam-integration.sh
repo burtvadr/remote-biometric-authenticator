@@ -70,7 +70,7 @@ pair_device() {
     "$BIN/rba" --socket "$RBA_SOCKET" pair --owner "$(id -un)" >"$WORK/pair.log" 2>&1 &
     local pair_pid=$!
     sleep 1
-    timeout 60 "$BIN/rba-sim" pair --host "127.0.0.1:$PORT" --name "Pixel 9" \
+    sed -n 's/^Code: \([0-9]\{6\}\).*/\1/p' "$WORK/pair.log" | timeout 60 "$BIN/rba-sim" pair --host "127.0.0.1:$PORT" --name "Pixel 9" \
         --daemon "$BIN/rbad" --daemon-arg --state-dir --daemon-arg "$WORK/state" \
         >"$WORK/sim-pair.log" 2>&1
     wait "$pair_pid" || return 1

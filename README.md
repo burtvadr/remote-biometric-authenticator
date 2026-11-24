@@ -93,13 +93,11 @@ on a physical device in the foreground and in the background.
 * **Transport is not identity.** Wi-Fi and BLE carry identical frames. Which link
   is used changes at most the freshness window.
 
-Known limitations are listed in [`docs/threat-model.md`](docs/threat-model.md),
-including the one that matters most: the pairing code is a six-digit short
-authentication string over an ephemeral ECDH transcript, not a PAKE. A key
-substitution changes the derived code on each endpoint, but an active attacker
-still has about a `2^20` window per live, single-use pairing session. Both
-ephemeral private keys are discarded, so a recorded transcript does not reveal
-the pairing secret to a later key compromise.
+The SPAKE2 enrollment integration is a candidate pending full Rust, native
+Android and physical device verification. Manual six-digit pairing remains the
+default; no QR or camera is required. See [pairing](docs/pairing.md),
+[SEC-026](docs/SEC-026-SPAKE2.md) and the [threat model](docs/threat-model.md).
+Old enrollments are not retroactively upgraded; re-enroll for the new assurance.
 
 ## Repository layout
 

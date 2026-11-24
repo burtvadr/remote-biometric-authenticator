@@ -227,7 +227,7 @@ start_daemon
 asuser "$BIN/rba" --socket "$SOCKET" pair --timeout 45000 >"$WORK/pair.log" 2>&1 &
 PAIR=$!
 sleep 1
-asuser timeout 45 "$BIN/rba-sim" pair --host "127.0.0.1:$PORT" --name "Pixel 9" \
+sed -n 's/^Code: \([0-9]\{6\}\).*/\1/p' "$WORK/pair.log" | asuser timeout 45 "$BIN/rba-sim" pair --host "127.0.0.1:$PORT" --name "Pixel 9" \
     --daemon "$BIN/rbad" --daemon-arg --state-dir --daemon-arg "$WORK/state" \
     >"$WORK/simpair.log" 2>&1
 wait $PAIR || exit 1

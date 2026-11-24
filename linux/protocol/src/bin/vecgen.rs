@@ -26,7 +26,7 @@ use rba_protocol::cbor;
 use rba_protocol::crypto::{self, PrivateKey};
 use rba_protocol::frame::{Frame, HEADER_LEN, MAGIC};
 use rba_protocol::messages::Message;
-use rba_protocol::pairing::{PairingConfirmed, PairingResult, PairingSession, PairingStart, PairingSubmit};
+use rba_protocol::pairing::{PairingChallenge, PairingConfirmed, PairingProof, PairingResult, PairingStart, PairingSubmit};
 use rba_protocol::types::{
     AuthReject, AuthRequest, AuthResponse, Challenge, ErrorMsg, Id, SessionHello, SessionHelloAck,
     AUTH_REQUEST_TTL_DEFAULT,
@@ -493,13 +493,10 @@ fn main() {
                     host_id: det_id(0x22),
                     host_pubkey: host_sk.public_key(),
                     host_key_id: host_sk.public_key().key_id_hex(),
-                    code: "".into(),
                     code_entry: rba_protocol::pairing::CodeEntry::Device,
                     // PairingStart::from_payload checks the window against the
                     // current clock, so this vector is checked as raw CBOR only.
                     expires_at: 1_700_000_120,
-                    host_nonce: [0x88; 32],
-                    host_eph_pubkey: eph_public(&det_eph(0x77)),
                 })
                 .to_payload()
             ),
@@ -514,10 +511,7 @@ fn main() {
                     device_name: "Pixel 9".into(),
                     device_pubkey: device_pk.clone(),
                     device_key_id: device_pk.key_id_hex(),
-                    device_nonce: [0x99; 32],
-                    device_eph_pubkey: eph_public(&det_eph(0x66)),
-                    mac: [0u8; 32],
-                    cleanup_tokens: Vec::new(),
+                    share: eph_public(&det_eph(0x66)),
                 })
                 .to_payload()
             ),
@@ -529,12 +523,15 @@ fn main() {
                 &Message::PairingResult(PairingResult {
                     session_id: det_id(0x99),
                     status: 0,
-                    host_mac: Some([0u8; 32]),
                     revocation_token: Some([0xAA; 32]),
                 })
                 .to_payload()
             ),
         }),
+        json!({ "name": "pairing_challenge", "msg_type": 5,
+            "payload_hex": hexs(&Message::PairingChallenge(PairingChallenge { session_id: det_id(0x99), share: eph_public(&det_eph(0x77)), confirmation: [0x11; 32] }).to_payload()) }),
+        json!({ "name": "pairing_proof", "msg_type": 6,
+            "payload_hex": hexs(&Message::PairingProof(PairingProof { session_id: det_id(0x99), confirmation: [0x22; 32], cleanup_tokens: vec![[0x33; 32]] }).to_payload()) }),
         json!({
             "name": "pairing_confirmed",
             "msg_type": 4,
@@ -678,97 +675,6 @@ fn main() {
                 "signing_input_sha256": hexs(&crypto::sha256(&signed)),
             },
             "verification_cases": verify_cases,
-        }),
-    );
-
-    // ---------------------------------------------------------------------
-    // 6. Pairing transcript vectors
-    // ---------------------------------------------------------------------
-    let host_id = det_id(0x22);
-    let host_pk = host_sk.public_key();
-    let device_id = det_id(0x33);
-    let host_eph_sk = det_eph(0x77);
-    let device_eph_sk = det_eph(0x66);
-    let host_eph_pub = eph_public(&host_eph_sk);
-    let device_eph_pub = eph_public(&device_eph_sk);
-
-    let mut session =
-        PairingSession::with_host_ephemeral(det_id(0x99), [0x88; 32], host_eph_sk.clone());
-    session
-        .derive_with_device_ephemeral(
-            &host_id,
-            &device_id,
-            &host_pk,
-            &device_pk,
-            [0x99; 32],
-            device_eph_pub,
-        )
-        .expect("derive");
-    let code = session.code().expect("code");
-    let device_mac = session
-        .device_mac(&host_id, &device_id, &host_pk, &device_pk)
-        .expect("mac");
-    let host_mac = session
-        .host_mac(&host_id, &device_id, &host_pk, &device_pk)
-        .expect("mac");
-
-    let impostor = PrivateKey::from_bytes(&[0x99; 32]).expect("valid key");
-    let mut wrong_device =
-        PairingSession::with_host_ephemeral(det_id(0x99), [0x88; 32], det_eph(0x77));
-    wrong_device
-        .derive_with_device_ephemeral(
-            &host_id,
-            &device_id,
-            &host_pk,
-            &impostor.public_key(),
-            [0x99; 32],
-            device_eph_pub,
-        )
-        .expect("derive");
-    let impostor_mac = wrong_device
-        .device_mac(&host_id, &device_id, &host_pk, &impostor.public_key())
-        .expect("mac");
-
-    write_json(
-        &out_dir.join("pairing.json"),
-        &json!({
-            "spec": "PROTOCOL.md §6",
-            "description": "Pairing transcript. Both sides derive the same ephemeral ECDH secret bound to the full transcript; the code and MACs prove it.",
-            "host_id": hexs(host_id.as_bytes()),
-            "device_id": hexs(det_id(0x33).as_bytes()),
-            "session": {
-                "session_id": hexs(det_id(0x99).as_bytes()),
-                "host_nonce": hexs(&[0x88u8; 32]),
-                "device_nonce": hexs(&[0x99u8; 32]),
-            },
-            "host_ephemeral": {
-                "private_scalar_hex": hexs(&host_eph_sk.to_bytes()),
-                "public_key_hex": hexs(&host_eph_pub),
-            },
-            "device_ephemeral": {
-                "private_scalar_hex": hexs(&device_eph_sk.to_bytes()),
-                "public_key_hex": hexs(&device_eph_pub),
-            },
-            "code_entry": "device",
-            "code": code,
-            "host_key": {
-                "public_key_hex": hexs(host_pk.as_bytes()),
-                "key_id_hex": host_pk.key_id_hex(),
-            },
-            "device_key": {
-                "public_key_hex": hexs(device_pk.as_bytes()),
-                "key_id_hex": device_pk.key_id_hex(),
-            },
-            "device_mac_hex": hexs(&device_mac),
-            "host_mac_hex": hexs(&host_mac),
-            "must_differ": [
-                {
-                    "name": "substituted_device_key",
-                    "mac_hex": hexs(&impostor_mac),
-                    "expect_valid": false,
-                    "reason": "an attacker substituting its own device key cannot produce the MAC the host will accept"
-                }
-            ]
         }),
     );
 

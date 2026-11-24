@@ -10,7 +10,6 @@ use rba_protocol::cbor;
 use rba_protocol::crypto::{self, PrivateKey, PublicKey};
 use rba_protocol::frame::Frame;
 use rba_protocol::messages::Message;
-use rba_protocol::pairing::PairingSession;
 use rba_protocol::types::{AuthRequest, Challenge, Id};
 use serde_json::Value;
 
@@ -288,76 +287,14 @@ fn a_signature_from_the_wrong_key_is_refused() {
 }
 
 #[test]
-fn pairing_vectors_reproduce_the_code_and_macs() {
-    let v = load("pairing.json");
-    let session_id = Id::from_slice(&unhex(v["session"]["session_id"].as_str().unwrap())).unwrap();
-    let mut host_nonce = [0u8; 32];
-    host_nonce.copy_from_slice(&unhex(v["session"]["host_nonce"].as_str().unwrap()));
-    let mut device_nonce = [0u8; 32];
-    device_nonce.copy_from_slice(&unhex(v["session"]["device_nonce"].as_str().unwrap()));
-
-    let host_pk = PublicKey::from_bytes(&unhex(v["host_key"]["public_key_hex"].as_str().unwrap()))
-        .expect("host public key");
-    let device_pk =
-        PublicKey::from_bytes(&unhex(v["device_key"]["public_key_hex"].as_str().unwrap()))
-            .expect("device public key");
-    let host_id = Id::from_slice(&unhex(v["host_id"].as_str().unwrap())).unwrap();
-    let device_id = Id::from_slice(&unhex(v["device_id"].as_str().unwrap())).unwrap();
-
-    let mut host_eph = [0u8; 65];
-    host_eph.copy_from_slice(&unhex(
-        v["host_ephemeral"]["public_key_hex"].as_str().unwrap(),
-    ));
-    let mut device_eph = [0u8; 65];
-    device_eph.copy_from_slice(&unhex(
-        v["device_ephemeral"]["public_key_hex"].as_str().unwrap(),
-    ));
-
-    let host_eph_sk = p256::SecretKey::from_slice(&unhex(
-        v["host_ephemeral"]["private_scalar_hex"].as_str().unwrap(),
-    ))
-    .expect("host ephemeral scalar");
-    let mut session = PairingSession::with_host_ephemeral(session_id, host_nonce, host_eph_sk);
-    assert_eq!(session.host_eph_public, host_eph);
-    session
-        .derive_with_device_ephemeral(
-            &host_id,
-            &device_id,
-            &host_pk,
-            &device_pk,
-            device_nonce,
-            device_eph,
-        )
-        .unwrap();
-
-    assert_eq!(session.code().unwrap(), v["code"].as_str().unwrap());
-    assert_eq!(
-        hex::encode(
-            session
-                .device_mac(&host_id, &device_id, &host_pk, &device_pk)
-                .unwrap()
-        ),
-        v["device_mac_hex"].as_str().unwrap()
-    );
-    assert_eq!(
-        hex::encode(
-            session
-                .host_mac(&host_id, &device_id, &host_pk, &device_pk)
-                .unwrap()
-        ),
-        v["host_mac_hex"].as_str().unwrap()
-    );
-
-    for case in v["must_differ"].as_array().unwrap() {
-        let mac = unhex(case["mac_hex"].as_str().unwrap());
-        let expected = session.device_mac(&host_id, &device_id, &host_pk, &device_pk);
-        if let Ok(expected) = expected {
-            assert!(
-                !crypto::ct_eq_slice(&mac, &expected),
-                "{}: a substituted key must not produce the accepted MAC",
-                case["name"]
-            );
-        }
+fn pairing_wire_vectors_roundtrip() {
+    let v = load("messages.json");
+    for name in ["pairing_submit", "pairing_challenge", "pairing_proof", "pairing_result"] {
+        let entry = v["messages"].as_array().unwrap().iter().find(|e| e["name"] == name).unwrap();
+        let payload = unhex(entry["payload_hex"].as_str().unwrap());
+        let frame = Frame::new(entry["msg_type"].as_u64().unwrap() as u16, payload.clone());
+        let message = Message::from_frame(&frame).unwrap();
+        assert_eq!(message.to_payload(), payload, "{name}");
     }
 }
 

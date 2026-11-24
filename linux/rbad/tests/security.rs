@@ -23,6 +23,12 @@ use rbad::engine::{AuthContext, AuthOutcome, PairingPhase};
 use rbad::registry::{DeviceStatus, HostIdentity, Registry};
 use rbad::{audit::AuditLog, engine::Engine, transport};
 
+const TEST_CERTIFICATE: [u8; 32] = [0x42; 32];
+
+fn host_display_code(engine: &Engine) -> rba_enrollment::PairingCode {
+    rba_enrollment::PairingCode::parse(engine.pairing_code().expect("host code").0.as_bytes()).unwrap()
+}
+
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn new_engine() -> Arc<Engine> {
@@ -30,12 +36,11 @@ fn new_engine() -> Arc<Engine> {
         host_id: Id::random().expect("host id"),
         key: rba_protocol::crypto::PrivateKey::generate().expect("keygen"),
     };
-    Engine::with_rate_limit_path(
+    Engine::new(
         host,
         Registry::in_memory(),
         AuditLog::null(),
         "test-host".into(),
-        None,
     )
 }
 
@@ -51,12 +56,11 @@ fn recording_engine(tag: &str) -> (Arc<Engine>, std::path::PathBuf) {
         host_id: Id::random().expect("host id"),
         key: rba_protocol::crypto::PrivateKey::generate().expect("keygen"),
     };
-    let engine = Engine::with_rate_limit_path(
+    let engine = Engine::new(
         host,
         Registry::in_memory(),
         log,
         "test-host".into(),
-        None,
     );
     (engine, path)
 }
@@ -97,17 +101,17 @@ impl Fixture {
 
         engine
             .begin_pairing_with_mode(
-                None,
                 CodeEntry::Device,
                 "alice".into(),
                 "test".into(),
             )
             .expect("pairing opens");
+        let password = host_display_code(&engine);
 
         let (host_side, device_side) = tokio::io::duplex(64 * 1024);
         let engine_conn = engine.clone();
         let conn = tokio::spawn(async move {
-            let c = transport::open(engine_conn, host_side, Transport::Wifi, "test".into());
+            let c = transport::open(engine_conn, host_side, Transport::Wifi, "test".into(), Some(TEST_CERTIFICATE));
             c.run(10).await
         });
         let device2 = device.clone();
@@ -129,7 +133,7 @@ impl Fixture {
             let Some(Message::PairingStart(start)) = dev.recv().await.unwrap() else {
                 return Err("no PAIRING_START".to_string());
             };
-            let result = dev.pair(&start, true).await.map_err(|e| e.to_string())?;
+            let result = dev.pair(&start, password, TEST_CERTIFICATE).await.map_err(|e| e.to_string())?;
             staged_tx.send(()).map_err(|_| "staging observer closed".to_string())?;
             confirm_rx.await.map_err(|_| "confirmation observer closed".to_string())?;
             dev.confirm_pairing(result.session_id).await.map_err(|e| e.to_string())?;
@@ -138,7 +142,7 @@ impl Fixture {
 
         // Act as the operator: wait for the comparable code, then confirm.
         wait_for_phase(&engine, PairingPhase::AwaitingConfirmation).await;
-        engine.confirm_pairing().expect("confirmation accepted");
+        engine.confirm_pairing("test").expect("confirmation accepted");
 
         tokio::time::timeout(TEST_TIMEOUT, staged_rx).await.unwrap().unwrap();
         assert!(engine.list_devices(None).is_empty(), "the host must not publish a credential before acknowledgement");
@@ -226,7 +230,7 @@ async fn connect(f: &Fixture, behaviour: Behaviour) -> LivePair {
 
     let engine_conn = f.engine.clone();
     let host = tokio::spawn(async move {
-        let c = transport::open(engine_conn, host_side, Transport::Wifi, "test".into());
+        let c = transport::open(engine_conn, host_side, Transport::Wifi, "test".into(), Some(TEST_CERTIFICATE));
         let _ = c.run(60).await;
     });
 
@@ -695,17 +699,41 @@ async fn an_unprivileged_caller_cannot_authenticate_as_another_user() {
 async fn pairing_cannot_be_started_by_a_second_caller_while_one_is_open() {
     let engine = new_engine();
     engine
-        .begin_pairing(None, "alice".into(), "caller-a".into())
+        .begin_pairing("alice".into(), "caller-a".into())
         .expect("first opens");
     let err = engine
-        .begin_pairing(None, "alice".into(), "caller-b".into())
+        .begin_pairing("alice".into(), "caller-b".into())
         .expect_err("pairing must never be permanent or doubled up");
     assert_eq!(err.code(), ErrorCode::BadRequest);
     // Once expired or cancelled, a new session is allowed.
     engine.cancel_pairing();
     engine
-        .begin_pairing(None, "alice".into(), "caller-b".into())
+        .begin_pairing("alice".into(), "caller-b".into())
         .expect("new session");
+}
+
+#[tokio::test]
+async fn stale_pairing_teardown_cannot_cancel_a_new_session() {
+    let engine = new_engine();
+    engine
+        .begin_pairing("alice".into(), "caller-a".into())
+        .unwrap();
+    let old = engine.claim_pairing_connection().unwrap();
+    assert!(engine.claim_pairing_connection().is_none());
+    engine.cancel_pairing_for("caller-a", false).unwrap();
+
+    engine
+        .begin_pairing("alice".into(), "caller-b".into())
+        .unwrap();
+    let new = engine.claim_pairing_connection().unwrap();
+    assert_ne!(old, new);
+    engine.cancel_pairing_attempt(&old);
+    assert!(engine.pairing_active());
+    assert!(engine.pairing_opened_by("caller-b"));
+    assert!(engine.cancel_pairing_for("caller-a", false).is_err());
+    assert!(engine.claim_pairing_connection().is_none());
+    engine.cancel_pairing_attempt(&new);
+    assert!(!engine.pairing_active());
 }
 
 #[tokio::test]
@@ -714,7 +742,7 @@ async fn pairing_is_rate_limited() {
     let mut ok = 0;
     for _ in 0..12 {
         if engine
-            .begin_pairing(None, "alice".into(), "same-peer".into())
+            .begin_pairing("alice".into(), "same-peer".into())
             .is_ok()
         {
             ok += 1;
@@ -745,14 +773,16 @@ async fn host_entry_mode_requires_the_correct_code_before_persisting() {
     let engine = new_engine();
     let device = Arc::new(DeviceKey::generate("host-entry").unwrap());
     engine
-        .begin_pairing_with_mode(None, CodeEntry::Host, "alice".into(), "test".into())
+        .begin_pairing_with_mode(CodeEntry::Host, "alice".into(), "test".into())
         .expect("pairing opens");
     assert_eq!(engine.pairing_code_entry(), Some(CodeEntry::Host));
 
+    let password = rba_enrollment::PairingCode::generate().unwrap();
+    let correct = String::from_utf8_lossy(password.as_ascii()).into_owned();
     let (host_side, device_side) = tokio::io::duplex(64 * 1024);
     let engine_conn = engine.clone();
     let conn = tokio::spawn(async move {
-        let c = transport::open(engine_conn, host_side, Transport::Wifi, "test".into());
+        let c = transport::open(engine_conn, host_side, Transport::Wifi, "test".into(), Some(TEST_CERTIFICATE));
         c.run(10).await
     });
     let device2 = device.clone();
@@ -772,38 +802,23 @@ async fn host_entry_mode_requires_the_correct_code_before_persisting() {
         let Some(Message::PairingStart(start)) = dev.recv().await.unwrap() else {
             return;
         };
-        let _ = dev.pair(&start, true).await;
+        assert!(dev.pair(&start, password, TEST_CERTIFICATE).await.is_err());
     });
 
     wait_for_phase(&engine, PairingPhase::AwaitingConfirmation).await;
-    let correct = engine.pairing_code().expect("derived code").0;
     let wrong = format!(
         "{:06}",
         (correct.parse::<u32>().expect("six-digit code") + 1) % 1_000_000
     );
 
-    let err = engine
-        .confirm_pairing_with_code(Some(&wrong))
-        .expect_err("a wrong host-entered code must be refused");
-    assert_eq!(err.code(), ErrorCode::ContextMismatch);
-    assert!(
-        engine.list_devices(None).is_empty(),
-        "a wrong code must not create a device record"
-    );
-    assert!(
-        engine.pairing_code().is_none(),
-        "a wrong code must cancel the pairing session, not leave it open for retries"
-    );
-    let retry = engine
-        .confirm_pairing_with_code(Some(&correct))
-        .expect_err("a retry in the same exchange must be refused");
-    assert_eq!(retry.code(), ErrorCode::NotPaired);
-
-    // The connection and simulator are still waiting for a result; cancel them.
-    conn.abort();
-    sim.abort();
-    let _ = conn.await;
-    let _ = sim.await;
+    // Submission is only local intent; a wrong PAKE password is detected by
+    // reciprocal cryptographic confirmation, not a derived-code comparison.
+    engine.confirm_pairing_with_code("test", Some(&wrong)).unwrap();
+    tokio::time::timeout(TEST_TIMEOUT, sim).await.unwrap().unwrap();
+    tokio::time::timeout(TEST_TIMEOUT, conn).await.unwrap().unwrap().unwrap();
+    assert!(engine.list_devices(None).is_empty());
+    assert!(engine.pairing_code().is_none());
+    assert!(engine.confirm_pairing_with_code("test", Some(&correct)).is_err());
 }
 
 #[tokio::test]
@@ -811,13 +826,14 @@ async fn pairing_without_operator_confirmation_never_persists_anything() {
     let engine = new_engine();
     let device = Arc::new(DeviceKey::generate("unconfirmed").unwrap());
     engine
-        .begin_pairing(None, "alice".into(), "test".into())
+        .begin_pairing("alice".into(), "test".into())
         .expect("pairing opens");
+    let password = host_display_code(&engine);
 
     let (host_side, device_side) = tokio::io::duplex(64 * 1024);
     let engine_conn = engine.clone();
     let conn = tokio::spawn(async move {
-        let c = transport::open(engine_conn, host_side, Transport::Wifi, "test".into());
+        let c = transport::open(engine_conn, host_side, Transport::Wifi, "test".into(), Some(TEST_CERTIFICATE));
         c.run(3).await
     });
     let device2 = device.clone();
@@ -837,7 +853,7 @@ async fn pairing_without_operator_confirmation_never_persists_anything() {
         let Some(Message::PairingStart(start)) = dev.recv().await.unwrap() else {
             return;
         };
-        let _ = dev.pair(&start, true).await;
+        let _ = dev.pair(&start, password, TEST_CERTIFICATE).await;
     });
 
     // The code becomes available, but nobody confirms: the session must expire
@@ -858,11 +874,12 @@ async fn disconnect_or_wrong_receipt_never_commits_enrollment() {
     for wrong_id in [false, true] {
         let engine = new_engine();
         let key = Arc::new(DeviceKey::generate("incomplete").unwrap());
-        engine.begin_pairing(None, "alice".into(), "test".into()).unwrap();
+        engine.begin_pairing("alice".into(), "test".into()).unwrap();
+        let password = host_display_code(&engine);
         let (host_side, device_side) = tokio::io::duplex(64 * 1024);
         let host_engine = engine.clone();
         let host = tokio::spawn(async move {
-            transport::open(host_engine, host_side, Transport::Wifi, "test".into()).run(10).await
+            transport::open(host_engine, host_side, Transport::Wifi, "test".into(), Some(TEST_CERTIFICATE)).run(10).await
         });
         let (staged_tx, staged_rx) = tokio::sync::oneshot::channel();
         let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
@@ -877,7 +894,7 @@ async fn disconnect_or_wrong_receipt_never_commits_enrollment() {
             let Some(Message::PairingStart(start)) = dev.recv().await.unwrap() else {
                 panic!("missing pairing start");
             };
-            let result = dev.pair(&start, true).await.unwrap();
+            let result = dev.pair(&start, password, TEST_CERTIFICATE).await.unwrap();
             staged_tx.send(result.session_id).unwrap();
             finish_rx.await.unwrap();
             if wrong_id {
@@ -888,7 +905,7 @@ async fn disconnect_or_wrong_receipt_never_commits_enrollment() {
             // In the other case drop the connection without acknowledging.
         });
         wait_for_phase(&engine, PairingPhase::AwaitingConfirmation).await;
-        engine.confirm_pairing().unwrap();
+        engine.confirm_pairing("test").unwrap();
         tokio::time::timeout(TEST_TIMEOUT, staged_rx).await.unwrap().unwrap();
         assert!(engine.list_devices(None).is_empty());
         assert_eq!(engine.pairing_acknowledged_by("test"), Some(false));

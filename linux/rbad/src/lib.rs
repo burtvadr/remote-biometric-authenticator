@@ -11,6 +11,7 @@
 //!
 //! Every authentication path terminates in a deny-by-default decision.
 
+mod admission;
 pub mod audit;
 pub mod authz;
 pub mod config;
@@ -54,7 +55,8 @@ impl Daemon {
             .with_echo(echo_audit);
         let name = config.host_name.clone().unwrap_or_else(host_name);
         let rate_path = config.state_dir.join("ratelimits");
-        let engine = Engine::with_rate_limit_path(host, registry, audit, name, Some(rate_path));
+        let engine = Engine::with_rate_limit_path(host, registry, audit, name, &rate_path)
+            .map_err(|e| format!("cannot open admission state: {e}"))?;
         Ok(Daemon { config, engine })
     }
 
@@ -77,7 +79,7 @@ impl Daemon {
         let name = config.host_name.clone().unwrap_or_else(host_name);
         Ok(Daemon {
             config,
-            engine: Engine::with_rate_limit_path(host, registry, AuditLog::null(), name, None),
+            engine: Engine::new(host, registry, AuditLog::null(), name),
         })
     }
 
@@ -86,13 +88,7 @@ impl Daemon {
         let key = rba_protocol::crypto::PrivateKey::generate().expect("OS randomness is required");
         let host = HostIdentity::for_tests(key, rba_protocol::types::Id::random().expect("random"));
         let audit = AuditLog::null();
-        let engine = Engine::with_rate_limit_path(
-            host,
-            Registry::in_memory(),
-            audit,
-            "test-host".into(),
-            None,
-        );
+        let engine = Engine::new(host, Registry::in_memory(), audit, "test-host".into());
         Daemon { config, engine }
     }
 }

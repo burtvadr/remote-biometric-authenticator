@@ -21,7 +21,7 @@ use rba_protocol::errors::{ProtocolError, Result};
 use rba_protocol::frame::{AsyncFrameWriter, AsyncFrames, Frame};
 use rba_protocol::messages::Message;
 use rba_protocol::pairing::{
-    PairingConfirmed, PairingResult, PairingSession, PairingStart, PairingSubmit,
+    CodeEntry, PairingConfirmed, PairingProof, PairingResult, PairingStart, PairingSubmit,
 };
 use rba_protocol::types::{AuthRequest, AuthResponse, Id, SessionHelloAck, CHALLENGE_LEN};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -347,131 +347,36 @@ where
         self.send(&Message::SessionHelloAck(ack)).await
     }
 
-    /// Completes pairing: shows the code, submits the device's transcript
-    /// commitment, and verifies the host's reciprocal commitment.
-    pub async fn pair(
-        &mut self,
-        start: &PairingStart,
-        auto_confirm: bool,
-    ) -> Result<PairingResult> {
-        if start.code.is_empty() {
-            println!(
-                "[rba] Pairing requested by Linux host {}",
-                &start.host_id.to_hex()[..8]
-            );
-        } else {
-            println!(
-                "[rba] Pairing requested; the operator chose the code {}",
-                start.code
-            );
-        }
-
-        let device_nonce: [u8; CHALLENGE_LEN] = crypto::random_array()?;
-        let session = PairingSession::new_device(
-            start.session_id,
-            start.host_nonce,
-            start.host_eph_pubkey,
-            &start.host_id,
-            &start.host_pubkey,
-            &self.device.device_id,
-            &self.device.public_key(),
-            device_nonce,
-            start.code_entry,
-        )?;
-
-        // Both screens show a code derived from the same ephemeral ECDH secret
-        // and full transcript, including both long-term public keys.
-        let code = session.code()?;
-        if !start.code.is_empty() && start.code != code {
-            // The operator pre-selected a code and the device disagrees, so the
-            // comparison the operator intended cannot succeed. Refuse.
-            println!(
-                "[rba] code mismatch: host chose {}, device derived {code}",
-                start.code
-            );
-            return Err(ProtocolError::ContextMismatch(
-                "device-derived code differs from the operator-chosen code".into(),
-            ));
-        }
-        println!("[rba] Compare this code on both screens: {code}");
-        if !auto_confirm {
-            println!("[rba] (simulator auto-approving; a real app shows a confirmation dialog)");
-        }
-
-        let mac = session.device_mac(
-            &start.host_id,
-            &self.device.device_id,
-            &start.host_pubkey,
-            &self.device.public_key(),
-        )?;
-        let submit = PairingSubmit {
-            session_id: start.session_id,
-            device_id: self.device.device_id,
-            device_name: self.device.device_name.clone(),
-            device_pubkey: self.device.public_key(),
-            device_key_id: self.device.key_id_hex(),
-            device_nonce,
-            device_eph_pubkey: session
-                .device_eph_public
-                .ok_or_else(|| ProtocolError::Internal("device ephemeral key missing".into()))?,
-            mac,
-            cleanup_tokens: Vec::new(),
+    /// Exercise the production PAKE implementation, with a code supplied via
+    /// the local operator/test harness and an independently observed TLS pin.
+    pub async fn pair(&mut self, start: &PairingStart, code: rba_enrollment::PairingCode, certificate_sha256: [u8; 32]) -> Result<PairingResult> {
+        let context = rba_enrollment::Context {
+            session_id: start.session_id.0, host_id: start.host_id.0, device_id: self.device.device_id.0,
+            host_public_key: *start.host_pubkey.as_bytes(), device_public_key: *self.device.public_key().as_bytes(),
+            host_certificate_sha256: certificate_sha256, expires_at: start.expires_at,
+            code_entry: match start.code_entry { CodeEntry::Device => rba_enrollment::CodeEntry::DeviceTypes, CodeEntry::Host => rba_enrollment::CodeEntry::HostTypes },
         };
+        let (share, exchange) = {
+            let mut rng = rand_core_10::UnwrapErr(getrandom_04::SysRng);
+            rba_enrollment::start_device(code, &context, &mut rng).map_err(|_| ProtocolError::SignatureInvalid)?
+        };
+        let submit = PairingSubmit { session_id: start.session_id, device_id: self.device.device_id,
+            device_name: self.device.device_name.clone(), device_pubkey: self.device.public_key(), device_key_id: self.device.key_id_hex(),
+            share: share.try_into().map_err(|_| ProtocolError::SignatureInvalid)? };
         self.send(&Message::PairingSubmit(submit)).await?;
-
-        let Some(msg) = self.recv().await? else {
-            return Err(ProtocolError::Internal("host closed during pairing".into()));
+        let challenge = match self.recv().await? {
+            Some(Message::PairingChallenge(c)) if c.session_id == start.session_id => c,
+            _ => return Err(ProtocolError::NotPaired),
         };
-        let result = match msg {
-            Message::PairingResult(r) => r,
-            Message::Error(e) => {
-                return Err(ProtocolError::BadRequest(format!(
-                    "host refused pairing: {} ({})",
-                    e.message, e.code
-                )))
-            }
-            other => {
-                return Err(ProtocolError::BadRequest(format!(
-                    "expected PAIRING_RESULT, got {}",
-                    other.name()
-                )))
-            }
+        let tag = rba_enrollment::finish_device(exchange, &challenge.share, &challenge.confirmation).map_err(|_| ProtocolError::SignatureInvalid)?;
+        self.send(&Message::PairingProof(PairingProof { session_id: start.session_id,
+            confirmation: tag.try_into().map_err(|_| ProtocolError::SignatureInvalid)?, cleanup_tokens: Vec::new() })).await?;
+        let result = match self.recv().await? {
+            Some(Message::PairingResult(r)) if r.session_id == start.session_id && r.status == 0 && r.revocation_token.is_some() => r,
+            _ => return Err(ProtocolError::NotPaired),
         };
-
-        if result.session_id != start.session_id {
-            return Err(ProtocolError::ContextMismatch("pairing result is for another session".into()));
-        }
-        if result.status != 0 {
-            return Err(ProtocolError::BadRequest(
-                "host rejected the pairing".into(),
-            ));
-        }
-        let host_mac = result
-            .host_mac
-            .ok_or_else(|| ProtocolError::BadRequest("PAIRING_RESULT without host_mac".into()))?;
-
-        // The reciprocal commitment proves the host derived the same secret, so
-        // the code the operator compared really did cover this exchange.
-        let expected = session.host_mac(
-            &start.host_id,
-            &self.device.device_id,
-            &start.host_pubkey,
-            &self.device.public_key(),
-        )?;
-        if !crypto::ct_eq_slice(&host_mac, &expected) {
-            return Err(ProtocolError::SignatureInvalid);
-        }
-
-        self.hosts.push(KnownHost {
-            host_id: start.host_id,
-            public_key: start.host_pubkey.clone(),
-            key_id: start.host_key_id.clone(),
-        });
-        println!(
-            "[rba] Host {} verified (key {}); awaiting enrollment receipt.",
-            &start.host_id.to_hex()[..8],
-            start.host_pubkey.short_fingerprint()
-        );
+        self.hosts.push(KnownHost { host_id: start.host_id, public_key: start.host_pubkey.clone(), key_id: start.host_key_id.clone() });
+        println!("[rba] Host verified; awaiting enrollment receipt.");
         Ok(result)
     }
 

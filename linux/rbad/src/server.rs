@@ -185,30 +185,15 @@ async fn dispatch(
 
         ControlRequest::Status => ControlResponse::ok(engine.status(viewer.as_deref(), &peer_key)),
 
-        ControlRequest::PairingCode => {
-            if !engine.pairing_active() {
-                return ControlResponse::ok(serde_json::json!({ "active": false }));
-            }
-            if !engine.pairing_opened_by(&peer_key) {
-                return ControlResponse::err(
-                    "PERMISSION_DENIED",
-                    "this pairing session was opened by another user",
-                );
-            }
-            match engine.pairing_code() {
-                Some((code, expires_at)) => ControlResponse::ok(serde_json::json!({
-                    "active": true,
-                    "code": code,
-                    "expires_at": expires_at,
-                    "phase": format!("{:?}", engine.pairing_phase()).to_lowercase(),
-                    "code_entry": engine.pairing_code_entry().map(|m| m.as_str()),
-                })),
-                None => ControlResponse::ok(serde_json::json!({ "active": false })),
+        ControlRequest::PairingStatus => {
+            match engine.pairing_status_for(&peer_key, false) {
+                Ok(Some(status)) => ControlResponse::ok(status),
+                Ok(None) => ControlResponse::ok(serde_json::json!({ "active": false })),
+                Err(e) => ControlResponse::from_protocol_error(&e),
             }
         }
 
         ControlRequest::Pair {
-            code,
             code_entry,
             timeout_ms: _,
             owner,
@@ -252,9 +237,9 @@ async fn dispatch(
                 }
                 (Some(me), None) => me.to_owned(),
             };
-            match engine.begin_pairing_with_mode(code, mode, owner, peer_key) {
+            match engine.begin_pairing_with_mode(mode, owner, peer_key) {
                 Ok((chosen, expires_at)) => ControlResponse::ok(serde_json::json!({
-                    "chosen_code": chosen,
+                    "display_code": chosen,
                     "expires_at": expires_at,
                     "seconds_remaining": expires_at.saturating_sub(rba_protocol::unix_now()),
                     "phase": "awaiting_device",
@@ -275,7 +260,7 @@ async fn dispatch(
                     "this pairing session was opened by another user",
                 );
             }
-            match engine.confirm_pairing_with_code(code.as_deref()) {
+            match engine.confirm_pairing_with_code(&peer_key, code.as_deref()) {
                 Ok(()) => ControlResponse::ok(serde_json::json!({ "confirmed": true })),
                 Err(e) => ControlResponse::from_protocol_error(&e),
             }
@@ -426,35 +411,13 @@ pub async fn run(
     let wifi = transport::wifi::serve(engine.clone(), config.clone(), shutdown.clone());
     let ctl = serve_control(engine.clone(), config, shutdown.clone());
 
-    // Periodically persist rate-limit state so it survives a crash, not just
-    // a graceful shutdown.
-    let saver_engine = engine.clone();
-    let mut saver_shutdown = shutdown;
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        loop {
-            tokio::select! {
-                _ = interval.tick() => saver_engine.save_rate_limits(),
-                _ = saver_shutdown.changed() => {
-                    if *saver_shutdown.borrow() {
-                        saver_engine.save_rate_limits();
-                        return;
-                    }
-                }
-            }
-        }
-    });
-
-    let result = tokio::select! {
+    tokio::select! {
         r = wifi => {
             let _ = &mdns;
             r
         }
         r = ctl => r,
-    };
-    // Persist rate-limit state on shutdown so limits survive restarts.
-    engine.save_rate_limits();
-    result
+    }
 }
 
 /// The transports this build supports, for `status` output.

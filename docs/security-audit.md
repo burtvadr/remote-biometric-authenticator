@@ -212,13 +212,16 @@ Kotlin `PairingSession.code()` mirrors it; vectors were regenerated.
 
 ### SEC-003 — Broad `common-auth` deployment creates an MFA-fatigue surface
 
-**Proposed partial remediation:** Add transport-independent sliding-window prompt
-budgets of three admitted attempts per 60 seconds for each authorized account
-and each registered device. Reject over-budget attempts before challenge dispatch;
-rejected attempts do not extend the cooldown. The additional budgets are currently
-in-memory. Number matching, restart persistence, transaction context and runtime
-regression verification remain open. SEC-003 must not be closed on this change alone.
-
+**Current implementation candidate (snapshot `2583bbf`):** A single admission
+transaction checks account, device and transport budgets before dispatch. All
+five counters (including pairing, Wi-Fi and BLE) are persisted together before
+an admitted request can create a session or expose a challenge. The old
+periodic/shutdown save paths are removed. Corrupt state prevents daemon startup;
+write failures prevent further admission, and a second daemon cannot share the
+admission store concurrently. Limits are unchanged. See
+[`SESSION_ADMISSION.md`](SESSION_ADMISSION.md) for guarantees and tests. Number
+matching, trusted transaction context and Rust/runtime verification remain open.
+SEC-003 must not be closed on this change alone.
 
 **Severity:** High  
 **Status:** Confirmed  
@@ -436,9 +439,10 @@ resources; a production bind exposes the port on every interface; a restart
 clears rate-limit state. Protocol authentication still fails closed, but
 availability and defence in depth are weaker than the design claims.
 
-**Remediation (partial).** Rate limiter state is now persisted to disk
-(`/var/lib/rba/ratelimits/`) and reloaded on daemon start, so limits survive
-restarts. State is saved on graceful shutdown and every 60 seconds.
+**Remediation (partial).** The admission candidate replaces periodic saves with
+one durable snapshot before every admitted pairing/authentication attempt.
+See `SESSION_ADMISSION.md`. Network-level pre-authentication resource limits and
+parser fuzzing remain separate; the new admission store does not implement them.
 
 **Recommendation.**
 
@@ -798,8 +802,8 @@ and stalling connections. The wide bind exposed the listener on every interface.
 - TLS remains server-authenticated only; the device is authenticated by the
   protocol signature, not by a client certificate.
 
-**Residual risk.** Parser fuzzing and a persistent per-peer/per-user rate limiter
-are still open under SEC-007. The systemd unit still needs a firewall or a
+**Residual risk.** Parser fuzzing and pre-authentication network-resource
+rate limiting remain open under SEC-007. The systemd unit still needs a firewall or a
 specific interface address in deployments where the LAN is untrusted.
 
 **Evidence.** `wifi::MAX_WIFI_CONNECTIONS`, `wifi::TLS_HANDSHAKE_TIMEOUT`,
@@ -876,3 +880,45 @@ separate test checks three prompts and rejection of the fourth. The existing
 unchanged. The JVM Kotlin vector runner passed 132 checks against the updated
 fixtures. Rust compilation, Rust tests, Android app build and physical phone
 pairing remain to be verified.
+
+
+### Phase A follow-up — pairing lifecycle regression in snapshot `2583bbf`
+
+The snapshot's engine reverted connection-owned pairing and staged enrollment,
+while its transport, registry, and tests retained the newer interfaces. It also
+introduced a `challenge_response` field that was initialized to `None` and never
+populated. The actual Rust and Kotlin pairing codecs still implement the
+six-digit SAS construction; a commit title or an unused field is not evidence of
+SEC-026 remediation.
+
+Repair candidate: restore the previously implemented connection-owned submission,
+session-scoped cancellation, derived-code display, and registry commit only
+following device acknowledgement. Keep the new durable admission implementation
+and its limits. Remove the unused challenge-response field and shared submission
+slot. Add a stale-connection cancellation regression test alongside the existing
+pending-enrollment and wrong-receipt tests. Rust compilation and all runtime
+verification remain pending. SEC-026 is open; this is lifecycle restoration,
+not a new enrollment protocol. SEC-005 remains open as well.
+
+### SEC-026 — portable SPAKE2 candidate (not integrated)
+
+A standalone P-256 SPAKE2 component with explicit confirmation and regression
+fixtures is available in `crates/rba-enrollment/`. See
+[`SEC-026-SPAKE2.md`](SEC-026-SPAKE2.md) for the dependency evaluation and
+integration gates. The active daemon and Android pairing protocol are unchanged;
+SEC-026 remains open. Compilation, dependency review, RFC known-answer tests,
+end-to-end integration and physical Android verification remain pending.
+
+
+### SEC-026 — SPAKE2 integration follow-up
+
+**Status:** Open; integration candidate. The Rust daemon, simulator and Android
+client now route enrollment through the shared RFC 9382 P-256 component and
+mandatory v2 enrollment suite. The former SAS wire flow and crypto are removed
+from active sources. The Android native bridge owns single-use state; the host
+checks the actual TLS certificate binding and stages the registry until the
+matching final acknowledgement. Both manual code directions remain supported.
+Kotlin wire checks passed (136); Rust/NDK builds and physical device tests
+remain unverified here. Independent dependency and application-profile review,
+lockfile resolution and fault-path testing remain release gates. Existing
+credentials must be re-enrolled to gain SPAKE2 enrollment assurance.

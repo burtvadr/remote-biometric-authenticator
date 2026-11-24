@@ -137,6 +137,8 @@ pub fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
+    // The rename itself must be durable before the caller publishes success.
+    std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 

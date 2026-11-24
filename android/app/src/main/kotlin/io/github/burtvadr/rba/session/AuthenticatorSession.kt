@@ -17,7 +17,9 @@ import io.github.burtvadr.rba.protocol.Limits
 import io.github.burtvadr.rba.protocol.Message
 import io.github.burtvadr.rba.protocol.PairingConfirmed
 import io.github.burtvadr.rba.protocol.PairingResult
-import io.github.burtvadr.rba.protocol.PairingSession
+import io.github.burtvadr.rba.protocol.PairingChallenge
+import io.github.burtvadr.rba.protocol.PairingProof
+import java.nio.ByteBuffer
 import io.github.burtvadr.rba.protocol.PairingStart
 import io.github.burtvadr.rba.protocol.PairingSubmit
 import io.github.burtvadr.rba.protocol.ProtocolException
@@ -138,37 +140,24 @@ class AuthenticatorSession(
 
     private val pendingRevocations = PendingRevocations(context)
 
-    /** Pairing state that must survive between `PAIRING_START` and `PAIRING_RESULT`. */
     private data class PendingPairing(
-        val session: PairingSession,
-        val hostId: Id,
-        val hostPublicKey: ByteArray,
+        val offer: PairingStart,
         val hostName: String,
-        val code: String,
-        val codeEntry: CodeEntry,
+        val certificate: X509Certificate,
+        val deviceKey: ByteArray,
+        var exchange: NativeEnrollment.Exchange? = null,
+        var proof: ByteArray? = null,
+        var proofSent: Boolean = false,
     )
-
     private var pendingPairing: PendingPairing? = null
-
-    /**
-     * A pairing whose reciprocal MAC has verified, waiting for the operator to
-     * finish the human gate on this screen.
-     *
-     * Deliberately not written to [HostStore] yet. The MAC proves the host derived
-     * the same transcript; the operator action proves a human read the code.
-     * Device-entry mode requires typing the host's code. Host-entry mode requires
-     * an explicit Allow after the host typed this screen's code.
-     */
-    private data class ConfirmedPairing(
-        val sessionId: Id,
-        val host: KnownHost,
-        val code: String,
-        val hostName: String,
-        val codeEntry: CodeEntry,
-    )
-
-    private var pendingConfirmation: ConfirmedPairing? = null
+    private data class ConfirmedPairing(val sessionId: Id, val host: KnownHost, val hostName: String)
     private var pendingAcknowledgement: ConfirmedPairing? = null
+
+    private fun clearPairing() {
+        pendingPairing?.exchange?.close()
+        pendingPairing?.proof?.fill(0)
+        pendingPairing = null
+    }
 
     /** Clears a parked confirmation that the operator never settles. */
     private var confirmationTimeout: Job? = null
@@ -442,36 +431,17 @@ class AuthenticatorSession(
     @Synchronized
     fun transportLost(reason: String) {
         transportSink = null
-        val pairing = pendingPairing
-        pendingPairing = null
+        val pairing = pendingPairing != null || pendingAcknowledgement != null
+        clearPairing()
         val request = pendingRequest
         pendingRequest = null
         approvedRequestId = null
         signingOperation = null
-        // A confirmation belongs to the connection that produced it. If that
-        // connection is gone, the host may already consider itself paired while
-        // this device has not stored the pin; keeping the pending record would let
-        // a later tap trust a link nobody can reason about any more.
-        val awaitingConfirmation =
-            pendingConfirmation != null &&
-                (_state.value is SessionState.PairingAwaitingConfirmation ||
-                    _state.value is SessionState.PairingAwaitingApproval)
-        val awaitingAcknowledgement = pendingAcknowledgement != null
         pendingAcknowledgement = null
-        pendingConfirmation = null
         confirmationTimeout?.cancel()
         confirmationTimeout = null
-        when {
-            request != null ->
-                _state.value = SessionState.Denied(request.requestId.toHex(), reason)
-
-            pairing != null && (_state.value is SessionState.PairingAwaitingCode ||
-                _state.value is SessionState.PairingAwaitingHostCode) ->
-                _state.value = SessionState.Failed(reason)
-
-            awaitingConfirmation || awaitingAcknowledgement ->
-                _state.value = SessionState.Failed(reason)
-        }
+        if (request != null) _state.value = SessionState.Denied(request.requestId.toHex(), reason)
+        else if (pairing) _state.value = SessionState.Failed(reason)
     }
 
     /** Installed by the active transport adapter. */
@@ -482,253 +452,137 @@ class AuthenticatorSession(
     // Pairing
     // -----------------------------------------------------------------------
 
-    /**
-     * Completes the device half of pairing.
-     *
-     * The code is derived from an ephemeral ECDH secret bound to the full
-     * transcript, so it can only be computed after the host's ephemeral key has
-     * arrived. The selected `code_entry` mode decides which endpoint displays it;
-     * nothing is persisted until the reciprocal MAC verifies and the human gate is
-     * satisfied.
-     *
-     * @param hostName the operator-visible host label, when discovery supplied one.
-     */
+    /** Begin a single exchange on the actual TLS connection, never a claimed pin. */
     @Synchronized
-    fun handlePairingStart(start: PairingStart, hostName: String): SessionState {
+    fun handlePairingStart(start: PairingStart, hostName: String, certificate: X509Certificate): SessionState {
+        if (pendingPairing != null || pendingAcknowledgement != null) return abortPairing("another pairing is active")
         return try {
-            if (pendingConfirmation != null || pendingAcknowledgement != null) {
-                // Refuse the newcomer without disturbing the confirmation already on
-                // screen; fail() would replace the operator's pending decision.
-                return _state.value
-            }
             val now = System.currentTimeMillis() / 1000
-            if (start.expiresAt < now) {
-                return fail("the pairing session has expired; start pairing again")
-            }
-            if (start.hostPublicKey.size != Limits.PUBKEY_LEN) {
-                return fail("host public key is malformed")
-            }
-            if (Hex.encode(sha256(start.hostPublicKey)) != start.hostKeyId) {
-                return fail("the host key identifier does not match its public key")
-            }
-            // A host identity is permanent. Re-pairing the same id with a different
-            // key must be refused rather than silently replacing the record.
-            hosts.get(start.hostId)?.let { existing ->
-                if (!existing.publicKeyBytes.contentEquals(start.hostPublicKey)) {
-                    return fail("this host is already paired with a different key")
+            require(start.expiresAt > now && start.expiresAt <= now + Limits.PAIRING_TTL)
+            require(Hex.encode(sha256(start.hostPublicKey)) == start.hostKeyId)
+            hosts.get(start.hostId)?.let { require(it.publicKeyBytes.contentEquals(start.hostPublicKey)) }
+            val publicKey = key.publicKeyBytes() ?: return abortPairing("device key unavailable")
+            val pending = PendingPairing(start, hostName.ifBlank { "Host" }, certificate, publicKey)
+            pendingPairing = pending
+            confirmationTimeout?.cancel()
+            confirmationTimeout = scope.launch {
+                delay((start.expiresAt - now) * 1000L)
+                synchronized(this@AuthenticatorSession) {
+                    if (pendingPairing === pending) abortPairing("pairing expired")
                 }
             }
-
-            val deviceNonce = ByteArray(Limits.CHALLENGE_LEN).also {
-                java.security.SecureRandom().nextBytes(it)
+            if (start.codeEntry == CodeEntry.DEVICE) {
+                _state.value = SessionState.PairingAwaitingConfirmation(pending.hostName)
+            } else {
+                val code = NativeEnrollment.generateCode()
+                val display = String(code, Charsets.US_ASCII)
+                startExchange(pending, code)
+                _state.value = SessionState.PairingAwaitingHostCode(pending.hostName, display)
             }
-            val publicKeyBytes = key.publicKeyBytes()
-                ?: return fail("the device key is unavailable; re-enrolment may have invalidated it")
-            val devicePublicKeyId = Hex.encode(sha256(publicKeyBytes))
-
-            // The code is derived from an ephemeral ECDH secret bound to the full
-            // transcript, including both long-term public keys. A substituted key
-            // therefore produces a different code on each endpoint.
-            val session = PairingSession(
-                start.sessionId,
-                start.hostNonce,
-                start.hostEphPublicKey,
-                start.codeEntry,
-            )
-            session.derive(
-                start.hostId,
-                deviceId,
-                start.hostPublicKey,
-                publicKeyBytes,
-                deviceNonce,
-            )
-
-            val code = session.code()
-            // When the operator pre-selected a code, both sides must derive the same
-            // value; a mismatch means the comparison they intended cannot succeed.
-            if (start.code.isNotEmpty() && start.code != code) {
-                return fail("the code derived by this device does not match the chosen code")
-            }
-
-            val mac = session.deviceMac(
-                start.hostId, deviceId, start.hostPublicKey, publicKeyBytes,
-            )
-            val submit = PairingSubmit(
-                sessionId = start.sessionId,
-                deviceId = deviceId,
-                deviceName = deviceName,
-                devicePublicKey = publicKeyBytes,
-                deviceKeyId = devicePublicKeyId,
-                deviceNonce = deviceNonce,
-                deviceEphPublicKey = session.deviceEphemeralPublicKey,
-                mac = mac,
-                cleanupTokens = pendingRevocations.tokens(start.hostId),
-            )
-
-            val hostLabel = hostName.ifBlank { "Host" }
-            pendingPairing = PendingPairing(
-                session = session,
-                hostId = start.hostId,
-                hostPublicKey = start.hostPublicKey,
-                hostName = hostLabel,
-                code = code,
-                codeEntry = start.codeEntry,
-            )
-            val state = when (start.codeEntry) {
-                CodeEntry.DEVICE -> SessionState.PairingAwaitingCode(hostLabel)
-                CodeEntry.HOST -> SessionState.PairingAwaitingHostCode(hostLabel, code)
-            }
-            _state.value = state
-            send(Message.PairingSubmitMessage(submit).toFrame())
-            state
-        } catch (e: Exception) {
-            pendingPairing = null
-            fail(e.message ?: "pairing failed")
-        }
+            _state.value
+        } catch (_: Exception) { abortPairing("could not start secure enrollment") }
+          catch (_: LinkageError) { abortPairing("native enrollment library unavailable") }
     }
 
-    /**
-     * Verifies the host's reciprocal MAC.
-     *
-     * Verification does **not** persist anything. Device-entry mode then requires
-     * the operator to type the code shown on the host; host-entry mode shows
-     * this device's code and still requires an explicit Allow.
-     */
+    private fun startExchange(p: PendingPairing, code: ByteArray) {
+        check(p.exchange == null && p.proof == null && !p.proofSent)
+        val context = ByteBuffer.allocate(219)
+            .put(p.offer.sessionId.bytes).put(p.offer.hostId.bytes).put(deviceId.bytes)
+            .put(p.offer.hostPublicKey).put(p.deviceKey).put(sha256(p.certificate.encoded))
+            .putLong(p.offer.expiresAt).put(if (p.offer.codeEntry == CodeEntry.DEVICE) 0.toByte() else 1.toByte()).array()
+        val exchange = NativeEnrollment.Exchange.start(code, context)
+        p.exchange = exchange
+        val submit = PairingSubmit(p.offer.sessionId, deviceId, deviceName, p.deviceKey, Hex.encode(sha256(p.deviceKey)), exchange.share)
+        check(transportSink?.invoke(Message.PairingSubmitMessage(submit).toFrame()) == true)
+    }
+
     @Synchronized
-    fun handlePairingResult(
-        result: PairingResult,
-        pinnedCertificate: X509Certificate?,
-    ): SessionState {
-        val pairing = pendingPairing ?: return fail("no pairing is in progress")
-        // One result per attempt: even a malformed or rejected result consumes the
-        // context, so it cannot be retried against a later session.
-        pendingPairing = null
+    fun handlePairingChallenge(challenge: PairingChallenge): SessionState {
+        val p = pendingPairing ?: return abortPairing("unexpected enrollment challenge")
         return try {
-            if (result.sessionId != pairing.session.sessionId) {
-                return fail("the pairing result is for a different session")
+            require(challenge.sessionId == p.offer.sessionId && p.offer.expiresAt > System.currentTimeMillis() / 1000)
+            val exchange = p.exchange ?: return abortPairing("no active exchange")
+            p.exchange = null
+            p.proof = exchange.confirm(challenge.share, challenge.confirmation)
+            if (p.offer.codeEntry == CodeEntry.DEVICE) sendProof(p)
+            else {
+                // The displayed password is no longer needed; the second UI
+                // gate approves the authenticated host, not another code.
+                _state.value = SessionState.PairingAwaitingApproval(p.hostName, "")
             }
-            if (result.status != 0L) {
-                return fail("the host rejected the pairing")
-            }
-            val hostMac = result.hostMac ?: return fail("the host did not confirm pairing")
-            val devicePublicKey = key.publicKeyBytes() ?: return fail("device key unavailable")
-            val expected = pairing.session.hostMac(
-                pairing.hostId, deviceId, pairing.hostPublicKey, devicePublicKey,
-            )
-            if (!io.github.burtvadr.rba.protocol.constantTimeEquals(hostMac, expected)) {
-                // The host did not prove it derived the same secret, so the code the
-                // operator compared did not authenticate this exchange.
-                return fail("pairing confirmation failed")
-            }
-            hosts.get(pairing.hostId)?.let { existing ->
-                if (!existing.publicKeyBytes.contentEquals(pairing.hostPublicKey)) {
-                    return fail("this host is already paired with a different key")
+            _state.value
+        } catch (_: Exception) { abortPairing("pairing confirmation failed") }
+    }
+
+    private fun sendProof(p: PendingPairing) {
+        val proof = p.proof ?: error("host not verified")
+        check(!p.proofSent)
+        p.proof = null
+        p.proofSent = true
+        try {
+            val message = PairingProof(p.offer.sessionId, proof, pendingRevocations.tokens(p.offer.hostId))
+            check(transportSink?.invoke(Message.PairingProofMessage(message).toFrame()) == true)
+        } finally { proof.fill(0) }
+        _state.value = SessionState.PairingFinalizing(p.hostName)
+    }
+
+    @Synchronized
+    fun confirmPairing(enteredCode: String? = null): Boolean {
+        val p = pendingPairing ?: return false
+        return try {
+            if (p.offer.expiresAt <= System.currentTimeMillis() / 1000) error("expired")
+            when {
+                p.offer.codeEntry == CodeEntry.DEVICE && _state.value is SessionState.PairingAwaitingConfirmation -> {
+                    val code = enteredCode.orEmpty()
+                    require(code.length == 6 && code.all { it in '0'..'9' })
+                    startExchange(p, code.toByteArray(Charsets.US_ASCII))
+                    _state.value = SessionState.PairingAwaitingCode(p.hostName)
                 }
+                p.offer.codeEntry == CodeEntry.HOST && _state.value is SessionState.PairingAwaitingApproval -> sendProof(p)
+                else -> return false
             }
-            val pending = ConfirmedPairing(
-                sessionId = result.sessionId,
-                host = KnownHost(
-                    hostId = pairing.hostId,
-                    keyId = Hex.encode(sha256(pairing.hostPublicKey)),
-                    publicKeyBytes = pairing.hostPublicKey,
-                    pinnedCertificate = pinnedCertificate,
-                    hostName = pairing.hostName,
-                    revocationToken = result.revocationToken,
-                ),
-                code = pairing.code,
-                hostName = pairing.hostName,
-                codeEntry = pairing.codeEntry,
-            )
-            pendingConfirmation = pending
+            true
+        } catch (_: Exception) { abortPairing("pairing failed"); false }
+          catch (_: LinkageError) { abortPairing("native enrollment library unavailable"); false }
+    }
+
+    @Synchronized
+    fun handlePairingResult(result: PairingResult): SessionState {
+        val p = pendingPairing ?: return abortPairing("unexpected pairing result")
+        return try {
+            require(p.proofSent && result.sessionId == p.offer.sessionId && result.status == 0L)
+            require(p.offer.expiresAt > System.currentTimeMillis() / 1000)
+            val token = result.revocationToken ?: return abortPairing("missing revocation token")
+            val host = KnownHost(hostId = p.offer.hostId, keyId = p.offer.hostKeyId,
+                publicKeyBytes = p.offer.hostPublicKey, pinnedCertificate = p.certificate,
+                hostName = p.hostName, revocationToken = token)
+            val pending = ConfirmedPairing(result.sessionId, host, p.hostName)
+            // Durable phone storage precedes the acknowledgement; the host
+            // commits only after that acknowledgement and sends a receipt.
+            check(hosts.putDurably(host))
+            clearPairing()
+            _hosts.value = hosts.all()
+            pendingAcknowledgement = pending
             confirmationTimeout?.cancel()
+            check(transportSink?.invoke(Message.PairingConfirmedMessage(PairingConfirmed(result.sessionId)).toFrame()) == true)
             confirmationTimeout = scope.launch {
                 delay(PAIRING_CONFIRMATION_TIMEOUT_MS)
                 synchronized(this@AuthenticatorSession) {
-                    if (pendingConfirmation === pending) {
-                        pendingConfirmation = null
-                        fail("pairing confirmation timed out")
-                        pairingSettledListener?.invoke()
-                    }
+                    if (pendingAcknowledgement === pending) abortPairing("host did not confirm pairing; pair again")
                 }
             }
-            val state = when (pairing.codeEntry) {
-                CodeEntry.DEVICE -> SessionState.PairingAwaitingConfirmation(pairing.hostName)
-                CodeEntry.HOST -> SessionState.PairingAwaitingApproval(
-                    pairing.hostName,
-                    pairing.code,
-                )
-            }
-            _state.value = state
-            state
-        } catch (e: Exception) {
-            fail(e.message ?: "pairing verification failed")
-        }
+            _state.value = SessionState.PairingFinalizing(p.hostName)
+            _state.value
+        } catch (_: Exception) { abortPairing("pairing could not be completed") }
     }
 
-    /**
-     * Settles the human gate and persists the host.
-     *
-     * [enteredCode] is required in [CodeEntry.DEVICE] mode and must match the
-     * code shown on the host. In [CodeEntry.HOST] mode the host already
-     * typed this device's code, so the device's explicit approval is the remaining
-     * gate and [enteredCode] is ignored.
-     *
-     * This is the only place a pairing becomes persistent.
-     */
-    @Synchronized
-    fun confirmPairing(enteredCode: String? = null): Boolean {
-        if (pendingAcknowledgement != null) return false
-        val pending = pendingConfirmation ?: run {
-            fail("no pairing is awaiting confirmation")
-            return false
-        }
-        if (pending.codeEntry == CodeEntry.DEVICE) {
-            val normalized = enteredCode.orEmpty().filter { it.isDigit() }
-            if (normalized.length != pending.code.length ||
-                !io.github.burtvadr.rba.protocol.constantTimeEquals(
-                    normalized.toByteArray(Charsets.US_ASCII),
-                    pending.code.toByteArray(Charsets.US_ASCII),
-                )
-            ) {
-                // One comparison per pairing exchange. A retry would be an online
-                // guessing oracle, so a wrong code cancels the whole attempt.
-                rejectPairing()
-                fail("incorrect pairing code; pairing cancelled")
-                return false
-            }
-        }
-        pendingConfirmation = null
+    private fun abortPairing(reason: String): SessionState {
+        clearPairing()
+        pendingAcknowledgement = null
         confirmationTimeout?.cancel()
         confirmationTimeout = null
-        val sink = transportSink
-        if (sink == null || !runCatching { hosts.putDurably(pending.host) }.getOrDefault(false)) {
-            fail("pairing could not be stored or the connection was lost")
-            pairingSettledListener?.invoke()
-            return false
-        }
-        // The locally trusted record is durable even if the final receipt is
-        // lost. Publish it so subsequent connections always use its pin.
-        _hosts.value = hosts.all()
-        pendingAcknowledgement = pending
-        _state.value = SessionState.PairingFinalizing(pending.hostName)
-        val frame = Message.PairingConfirmedMessage(PairingConfirmed(pending.sessionId)).toFrame()
-        if (!sink(frame)) {
-            pendingAcknowledgement = null
-            fail("pairing acknowledgement could not be queued; pair again")
-            pairingSettledListener?.invoke()
-            return false
-        }
-        confirmationTimeout = scope.launch {
-            delay(PAIRING_CONFIRMATION_TIMEOUT_MS)
-            synchronized(this@AuthenticatorSession) {
-                if (pendingAcknowledgement === pending) {
-                    pendingAcknowledgement = null
-                    fail("host did not confirm pairing; pair again")
-                    pairingSettledListener?.invoke()
-                }
-            }
-        }
-        return true
+        pairingSettledListener?.invoke()
+        return fail(reason)
     }
 
     /** Accept the receipt only on the original link and for the pending session. */
@@ -748,16 +602,7 @@ class AuthenticatorSession(
 
     /** The operator rejected the pairing, or closed the confirmation. */
     @Synchronized
-    fun rejectPairing(): SessionState {
-        if (pendingAcknowledgement != null) return _state.value
-        pendingConfirmation = null
-        pendingPairing = null
-        confirmationTimeout?.cancel()
-        confirmationTimeout = null
-        // Close the pairing link; the host will discard the staged enrollment.
-        pairingSettledListener?.invoke()
-        return fail("pairing was not confirmed")
-    }
+    fun rejectPairing(): SessionState = abortPairing("pairing was not confirmed")
 
     /**
      * Clears a terminal result after the operator has read it.

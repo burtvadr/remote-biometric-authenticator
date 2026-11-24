@@ -22,7 +22,7 @@ impl Limit {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RateLimiter {
     limit: Limit,
     events: HashMap<String, VecDeque<u64>>,
@@ -48,8 +48,8 @@ impl RateLimiter {
 
     /// Records an event for `key` and reports whether it is permitted.
     ///
-    /// A rejected event is still recorded for over-limit keys so that a client
-    /// hammering the endpoint cannot reset the window by retrying.
+    /// Only admitted events are recorded. Denials neither extend the cooldown
+    /// nor grow the timestamp queue. The caller supplies nondecreasing time.
     pub fn check_and_record(&mut self, key: &str, now: u64) -> bool {
         // `None` means `now` is inside the very first window, so no recorded
         // event can have aged out yet. Using `saturating_sub` here would treat
@@ -65,7 +65,9 @@ impl RateLimiter {
             }
         }
         let allowed = (q.len() as u32) < self.limit.max_events;
-        q.push_back(now);
+        if allowed {
+            q.push_back(now);
+        }
         allowed
     }
 
@@ -89,7 +91,7 @@ impl RateLimiter {
                     Some(c) => q.iter().copied().find(|t| *t > c),
                 };
                 match oldest_live {
-                    Some(t) => (t + self.limit.window_secs).saturating_sub(now),
+                    Some(t) => t.saturating_add(self.limit.window_secs).saturating_sub(now),
                     None => 0,
                 }
             }
@@ -139,18 +141,17 @@ impl RateLimiter {
     /// Serialise the recorded events to a line-oriented string.
     ///
     /// Format: first line is `limit <max> <window>`; subsequent lines are
-    /// `<key> <ts1> <ts2> ...`. Empty queues are omitted. Returns an empty
-    /// string when there is nothing to persist.
+    /// `<key> <ts1> <ts2> ...`. Empty queues are omitted. Keys must be
+    /// nonempty tokens without whitespace. The header is always present.
     pub fn to_lines(&self) -> String {
         let mut out = String::new();
-        if self.events.is_empty() {
-            return out;
-        }
         out.push_str(&format!(
             "limit {} {}\n",
             self.limit.max_events, self.limit.window_secs
         ));
-        for (key, q) in &self.events {
+        let mut entries: Vec<_> = self.events.iter().collect();
+        entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        for (key, q) in entries {
             if q.is_empty() {
                 continue;
             }
@@ -164,56 +165,41 @@ impl RateLimiter {
         out
     }
 
-    /// Restore recorded events from a line-oriented string produced by
-    /// [`RateLimiter::to_lines`]. Returns `None` if the format is invalid.
-    pub fn from_lines(s: &str, fallback_limit: Limit) -> Option<RateLimiter> {
+    /// Strictly restore a snapshot using the configured limit, never a limit
+    /// chosen by persisted data. Corrupt or obsolete snapshots must not reset
+    /// the budget silently. `last_admitted` bounds every recorded timestamp.
+    pub fn from_lines(s: &str, expected: Limit, last_admitted: u64) -> Option<RateLimiter> {
         let mut lines = s.lines();
-        let first = lines.next()?;
-        let mut parts = first.split_whitespace();
+        let mut parts = lines.next()?.split_whitespace();
         if parts.next()? != "limit" {
             return None;
         }
         let max: u32 = parts.next()?.parse().ok()?;
         let window: u64 = parts.next()?.parse().ok()?;
-        if parts.next().is_some() {
+        if parts.next().is_some() || Limit::new(max, window) != expected
+            || max == 0 || window == 0 {
             return None;
         }
-        let limit = Limit::new(max, window);
-        let mut rl = RateLimiter::new(limit);
+        let mut rl = RateLimiter::new(expected);
         for line in lines {
-            if line.is_empty() {
-                continue;
-            }
             let mut parts = line.split_whitespace();
             let key = parts.next()?.to_owned();
             let mut q = VecDeque::new();
             for ts in parts {
-                q.push_back(ts.parse().ok()?);
+                let ts: u64 = ts.parse().ok()?;
+                if ts > last_admitted || q.back().is_some_and(|last| *last > ts)
+                    || q.len() >= max as usize {
+                    return None;
+                }
+                q.push_back(ts);
             }
-            if !q.is_empty() {
-                rl.events.insert(key, q);
+            if q.is_empty() || rl.events.insert(key, q).is_some() {
+                return None;
             }
         }
-        // If the stored limit differs from what the caller expects, keep the
-        // stored one but validate it's sane.
-        let _ = fallback_limit;
         Some(rl)
     }
 
-    /// Load from a file, or return a fresh limiter if the file doesn't exist
-    /// or is corrupt.
-    pub fn load(path: &std::path::Path, limit: Limit) -> RateLimiter {
-        if !path.exists() {
-            return RateLimiter::new(limit);
-        }
-        let raw = std::fs::read_to_string(path).unwrap_or_default();
-        RateLimiter::from_lines(&raw, limit).unwrap_or_else(|| RateLimiter::new(limit))
-    }
-
-    /// Save to a file.
-    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
-        std::fs::write(path, self.to_lines())
-    }
 }
 
 #[cfg(test)]
@@ -236,11 +222,11 @@ mod tests {
         assert!(rl.check_and_record("a", 0));
         assert!(rl.check_and_record("a", 5));
         assert!(!rl.check_and_record("a", 6));
-        // At t = 11 the t=0 event has aged out, but t=5 and the *denied* t=6
-        // are still inside the window, so the limit is still reached.
-        assert!(!rl.check_and_record("a", 11));
-        // Once every recorded event has aged out, requests are allowed again.
-        assert!(rl.check_and_record("a", 16));
+        // At t = 11 the admitted event at t=0 has aged out. Denial at t=6
+        // did not move the cooldown.
+        assert!(rl.check_and_record("a", 11));
+        assert!(!rl.check_and_record("a", 12));
+        assert!(rl.check_and_record("a", 15));
     }
 
     #[test]
@@ -252,16 +238,30 @@ mod tests {
     }
 
     #[test]
-    fn denied_events_still_count_so_retrying_cannot_reset() {
+    fn denied_events_do_not_extend_cooldown_or_grow_state() {
         let mut rl = RateLimiter::new(Limit::new(1, 60));
         assert!(rl.check_and_record("a", 0));
-        for t in 1..100 {
-            assert!(!rl.check_and_record("a", t));
+        for _ in 0..1000 {
+            assert!(!rl.check_and_record("a", 59));
         }
-        // Still saturated: the window is full of recorded (mostly denied) events.
-        assert!(!rl.check_and_record("a", 120));
-        // Only once every recorded event has aged out does it recover.
-        assert!(rl.check_and_record("a", 200));
+        assert_eq!(rl.retry_after("a", 59), 1);
+        assert_eq!(rl.events.get("a").unwrap().len(), 1);
+        assert!(rl.check_and_record("a", 60));
+    }
+
+    #[test]
+    fn snapshot_rejects_corruption_and_limit_changes() {
+        let limit = Limit::new(2, 60);
+        let mut rl = RateLimiter::new(limit);
+        assert!(rl.check_and_record("alice", 100));
+        let text = rl.to_lines();
+        let restored = RateLimiter::from_lines(&text, limit, 100).unwrap();
+        assert_eq!(restored.to_lines(), text);
+        assert!(RateLimiter::from_lines(&text, Limit::new(3, 60), 100).is_none());
+        for bad in ["", "limit 2 60\na 101\n", "limit 2 60\na 100 99\n",
+                    "limit 2 60\na 99\na 100\n", "limit 2 60\na 99 100 100\n"] {
+            assert!(RateLimiter::from_lines(bad, limit, 100).is_none());
+        }
     }
 
     #[test]

@@ -42,6 +42,7 @@ release: ## Build optimised Rust components
 .PHONY: test
 test: ## Run all Rust tests (protocol, daemon, security, vectors)
 	cd linux && $(CARGO) test
+	$(CARGO) test --manifest-path crates/rba-enrollment/Cargo.toml
 
 .PHONY: test-protocol
 test-protocol: ## Run only the protocol crate tests

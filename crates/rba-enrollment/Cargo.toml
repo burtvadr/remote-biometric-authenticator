@@ -1,0 +1,22 @@
+[package]
+name = "rba-enrollment"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "0BSD"
+description = "Portable, explicitly confirmed SPAKE2 enrollment for RBA"
+publish = false
+
+[dependencies]
+pakery-core = "=0.6.2"
+pakery-crypto = { version = "=0.6.2", default-features = false, features = ["std", "p256", "spake2"] }
+pakery-spake2 = "=0.6.2"
+rand_core = "0.10"
+getrandom = { version = "0.4", features = ["sys_rng"] }
+sha2 = "0.10"
+zeroize = "1.9"
+
+[dev-dependencies]
+pakery-spake2 = { version = "=0.6.2", features = ["test-utils"] }
+getrandom = { version = "0.4", features = ["sys_rng"] }
+hex = "0.4"

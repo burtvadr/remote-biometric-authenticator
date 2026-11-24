@@ -39,7 +39,7 @@ class VectorRunner(private val vectorsDir: File) {
         authRequestTranscript()
         signedFieldCoverage()
         signatures()
-        pairingTranscript()
+        pairingWire()
 
         return if (failures.isEmpty()) {
             Result(checks, failures)
@@ -314,57 +314,16 @@ class VectorRunner(private val vectorsDir: File) {
         check("sig.cross_key", !verifiesAgainstHost, "a signature verified against the wrong key")
     }
 
-    private fun pairingTranscript() {
-        val doc = loadJson("pairing.json")
-        val session = doc.obj("session")
-        val hostPub = Hex.decode(doc.obj("host_key").text("public_key_hex"))
-        val devicePub = Hex.decode(doc.obj("device_key").text("public_key_hex"))
-        val hostId = Id(Hex.decode(doc.text("host_id")))
-        val deviceId = Id(Hex.decode(doc.text("device_id")))
-
-        val hostEph = Hex.decode(doc.obj("host_ephemeral").text("public_key_hex"))
-        val s = PairingSession.withDeviceEphemeralScalar(
-            sessionId = Id(Hex.decode(session.text("session_id"))),
-            hostNonce = Hex.decode(session.text("host_nonce")),
-            hostEphPublicKey = hostEph,
-            scalar = Hex.decode(doc.obj("device_ephemeral").text("private_scalar_hex")),
-            publicKey = Hex.decode(doc.obj("device_ephemeral").text("public_key_hex")),
-            codeEntry = CodeEntry.fromWire(doc.text("code_entry")),
-        )
-        s.derive(
-            hostId = hostId,
-            deviceId = deviceId,
-            hostPub = hostPub,
-            devicePub = devicePub,
-            deviceNonce = Hex.decode(session.text("device_nonce")),
-        )
-
-        check("pairing.code", s.code() == doc.text("code"), "derived code differs from the Rust side")
-        check(
-            "pairing.device_mac",
-            Hex.encode(s.deviceMac(hostId, deviceId, hostPub, devicePub)) == doc.text("device_mac_hex"),
-            "device MAC differs",
-        )
-        check(
-            "pairing.host_mac",
-            Hex.encode(s.hostMac(hostId, deviceId, hostPub, devicePub)) == doc.text("host_mac_hex"),
-            "host MAC differs",
-        )
-        // Device and host confirmations use different domain separators.
-        check(
-            "pairing.macs_differ",
-            !constantTimeEquals(s.deviceMac(hostId, deviceId, hostPub, devicePub), s.hostMac(hostId, deviceId, hostPub, devicePub)),
-        )
-
-        for (case in doc.objects("must_differ")) {
-            val mac = Hex.decode(case.text("mac_hex"))
-            val accepted = s.deviceMac(hostId, deviceId, hostPub, devicePub)
-            check(
-                "${case.text("name")}.rejected",
-                !constantTimeEquals(mac, accepted),
-                "a substituted key produced the accepted MAC",
-            )
+    private fun pairingWire() {
+        val doc = loadJson("messages.json")
+        for (name in listOf("pairing_submit", "pairing_challenge", "pairing_proof", "pairing_result")) {
+            val entry = doc.objects("messages").first { it.text("name") == name }
+            val payload = Hex.decode(entry.text("payload_hex"))
+            val message = Message.fromFrame(Frame(msgType = entry.number("msg_type").toInt(), payload = payload))
+            check("$name.codec", message.toPayload().contentEquals(payload))
         }
+        val old = Cbor.encode(Cbor.ofMap("code" to Cbor.text("123456")))
+        check("legacy_pairing.rejected", runCatching { PairingStart.fromPayload(old) }.isFailure)
     }
 
     // -----------------------------------------------------------------------

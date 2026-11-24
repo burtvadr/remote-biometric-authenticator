@@ -171,6 +171,8 @@ a broken peer rather than a normal condition.
 | 2 | `PAIRING_SUBMIT` | device → host | §6.2 |
 | 3 | `PAIRING_RESULT` | host → device | §6.3 |
 | 4 | `PAIRING_CONFIRMED` | device → host, then host → device | §6.3.1 |
+| 5 | `PAIRING_CHALLENGE` | host → device | §6.4 |
+| 6 | `PAIRING_PROOF` | device → host | §6.4 |
 | 10 | `SESSION_HELLO` | host → device | §7.1 |
 | 11 | `SESSION_HELLO_ACK` | device → host | §7.2 |
 | 12 | `AUTH_REQUEST` | host → device | §8.1 |
@@ -183,252 +185,95 @@ Unassigned codes MUST be answered with `ERROR` / `UNSUPPORTED_VERSION`.
 
 ---
 
-## 6. Pairing
+## 6. Pairing (SPAKE2 enrollment profile v2)
 
-Pairing establishes mutual, authenticated knowledge of both public keys and is
-gated on an out-of-band six-digit code: one endpoint displays it, and the operator
-types it on the other. Discovery alone never authorises anything.
+The user selects `code_entry`: `device` (default) displays a code at the host,
+while `host` displays it at the authenticator. The displaying endpoint generates
+six uniformly random ASCII digits using the OS CSPRNG. Leading zeros are
+significant. The other endpoint accepts the code by local human input. The
+password MUST NOT appear in any network frame, argv or audit event. No camera
+or high-entropy manual token is required.
 
-A pairing session selects the entry direction with `code_entry`:
+Enrollment requires TLS with a known actual peer certificate (not a claimed
+fingerprint). Discovery confers no trust. Each admitted session permits exactly
+one connection and one SPAKE2 attempt; a wrong code, wrong confirmation,
+invalid message, timeout or cancellation terminates that attempt. A fresh
+admitted session is required for retry. The old SAS enrollment profile is not
+accepted. Existing already-paired credentials are not retroactively attested by
+this change; re-enroll them to obtain SPAKE2 enrollment assurance.
 
-* `device` (the default): the Linux host displays the code and the device requires
-  the operator to type it. The device never displays it.
-* `host`: the device displays the code and the Linux host requires the operator to
-  type it. The host never displays it. The device still requires an explicit Allow
-  before it stores the host.
+### 6.1 `PAIRING_START` (host → device)
 
-A pairing session is single-use and expires (`PAIRING_TTL`, §11). The host MUST
-refuse to begin pairing unless an operator has explicitly started a pairing
-session (`rba pair`). There MUST NOT be a permanent pairing mode.
-
-```text
-host                                   device
- │  PAIRING_START  {session_id,          │
- │                  host_id, host_pubkey,│
- │                  code?, code_entry,   │
- │                  expires_at,           │
- │                  host_nonce,           │
- │                  host_eph_pubkey}      │
- ├──────────────────────────────────────►│  generate device ECDH key
- │                                       │  derive ECDH secret + transcript
- │                                       │  device: never display the code
- │                                       │  host: display the code
- │  PAIRING_SUBMIT {session_id,          │
- │                   device_id,           │
- │                   device_name,         │
- │                   device_pubkey,       │
- │                   device_key_id,       │
- │                   device_nonce,        │
- │                   device_eph_pubkey,   │
- │                   mac}                 │
- │◄──────────────────────────────────────┤
- │  derive the same p, derive the code   │
- │  device: display the code             │
- │  host: ask the operator for the       │
- │  device's code and verify it            │
- │  verify mac against the session secret│
- │  persist device                       │
- │  PAIRING_RESULT {session_id,           │
- │                   status, host_mac}    │
- ├──────────────────────────────────────►│  verify host_mac
- │                                       │  device: type the host's code
- │                                       │  host: show code, require Allow
- │                                       │  persist only after the human gate
-```
-
-### 6.0 Why the code is derived, not transported
-
-The six-digit code is a function of an ephemeral ECDH secret bound to the whole
-transcript. The host cannot derive it before the device contributes its ephemeral
-public key, and the device must not reveal its nonce before it knows the operator
-is pairing deliberately. So the exchange is necessarily two rounds, and the code
-is computed on both sides rather than sent.
-
-Because the host's ephemeral private key is generated fresh for each session and
-discarded after derivation, an on-path attacker who records the messages cannot
-compute the secret, and cannot make a substituted key produce the same code on
-both endpoints without finding a collision in the six-digit value.
-
-An operator may pre-select a code with `rba pair --code 123456`. In that
-case the host sends it in `PAIRING_START`, the device checks its own derived code
-against it and fails immediately on a mismatch, and the host verifies the same
-equality before persisting. This turns the human check into one code, entered on
-the endpoint that did not choose it.
-
-When no code is pre-selected, the endpoint named by `code_entry` MUST display the
-derived code and the other endpoint MUST require the operator to type it. The
-displaying endpoint MUST NOT accept a bare confirmation tap in place of the other
-endpoint's typed code. There is no unattended pairing path.
-
-### 6.1 `PAIRING_START`
+Exact canonical CBOR map:
 
 | Key | Type | Constraint |
 |---|---|---|
+| `suite` | tstr | `spake2-p256-sha256-v2` |
 | `session_id` | bstr | 16 bytes |
 | `host_id` | bstr | 16 bytes |
-| `host_pubkey` | bstr | 65 bytes, §3.1 |
-| `host_key_id` | tstr | 64 lowercase hex chars |
-| `code` | tstr | six ASCII digits, or empty when the operator chose none |
-| `code_entry` | tstr | `device` (default when absent) or `host`; which endpoint types the code |
-| `expires_at` | uint | Unix seconds |
-| `host_nonce` | bstr | 32 bytes |
-| `host_eph_pubkey` | bstr | 65 bytes; ephemeral P-256 public key for this pairing |
+| `host_pubkey` | bstr | §3.1, 65 bytes |
+| `host_key_id` | tstr | §3.2, derived from `host_pubkey` |
+| `code_entry` | tstr | `device` or `host` |
+| `expires_at` | uint | Unix seconds, at most 120 seconds ahead |
 
-### 6.2 `PAIRING_SUBMIT`
+### 6.2 `PAIRING_SUBMIT` (device → host)
 
-| Key | Type | Constraint |
-|---|---|---|
-| `session_id` | bstr | 16 bytes, MUST equal the `PAIRING_START` value |
-| `device_id` | bstr | 16 bytes |
-| `device_name` | tstr | 1–64 chars, operator-visible label |
-| `device_pubkey` | bstr | 65 bytes |
-| `device_key_id` | tstr | 64 hex chars |
-| `device_nonce` | bstr | 32 bytes |
-| `device_eph_pubkey` | bstr | 65 bytes; ephemeral P-256 public key for this pairing |
-| `mac` | bstr | 32 bytes, §6.4 |
-| `cleanup_tokens` | array of bstr | Optional; each 32 bytes. Older pairings this device asks the host to revoke, §6.6 |
+Exact map: `suite` (same value), `session_id` (16-byte bstr), `device_id`
+(16-byte bstr), `device_name` (tstr, display only), `device_pubkey` (65-byte
+bstr), `device_key_id` (tstr, derived from device key), `share` (65-byte bstr,
+RFC 9382 uncompressed P-256 party B share). The authenticator sends this only
+when it has its local code. The host checks the device ID and key ID against
+the connection acknowledgement. No password or revocation token is included.
 
-### 6.3 `PAIRING_RESULT`
+### 6.3 `PAIRING_RESULT` (host → device)
 
-| Key | Type | Constraint |
-|---|---|---|
-| `session_id` | bstr | 16 bytes |
-| `status` | uint | `0` = accepted for confirmation, `1` = rejected |
-| `host_mac` | bstr | 32 bytes, present only when `status == 0` |
-| `revocation_token` | bstr | 32 bytes, present when `status == 0`; bearer capability for §6.5 |
+Exact map: `session_id` (16-byte bstr), `status` (uint: 0 success, 1 failure),
+and `revocation_token` (32-byte bstr, required only for success, otherwise
+absent). A success is a staged enrollment offer, not active host trust. It is
+sent only after verification of the device's PAKE proof on this connection.
 
 ### 6.3.1 `PAIRING_CONFIRMED`
 
-| Key | Type | Constraint |
-|---|---|---|
-| `session_id` | bstr | 16 bytes, exact pairing session identifier |
+Exact map: `session_id` (16-byte bstr). After validating the result and durably
+persisting its local host record, the authenticator sends this message on the
+same connection. The host commits the registry and replies with the same
+message as a receipt. The authenticator reports completion only after receipt.
+The host CLI reports completion only after commit. A disconnected pending
+record MUST NOT be activated. Loss after commit but before receipt may require
+explicit re-enrollment or revocation; there is no implicit trust recovery.
 
-The device MUST send this single-field canonical map only after the reciprocal
-MAC and the human gate have succeeded and the host record has been durably
-stored. It MUST be sent on the connection that delivered the successful
-`PAIRING_RESULT`, before closing that connection for a pinned reconnect. The
-host MUST reject acknowledgements for a different session or connection, and
-MUST NOT report pairing complete to its CLI until the acknowledgement arrives.
-The host MUST stage the enrollment until the device acknowledgement, then commit
-its registry and echo the same message as a receipt on the same connection.
-Only the receipt completes the device UI. The device acknowledgement is not
-itself authentication proof. A lost final receipt can leave completion
-uncertain; the operator may re-pair. This is not a distributed atomic commit.
+### 6.4 SPAKE2 exchange and confirmation (normative)
 
-### 6.4 Pairing confirmation (normative)
+Use RFC 9382 P-256/SHA-256/HKDF-SHA256/HMAC-SHA256. Host is party A and
+client is party B regardless of which endpoint displays the password. Use
+host ID and device ID as identities A and B. The RBA-specific random-code
+password scalar is SHA-512 of `RBA-ENROLLMENT-SPAKE2-PASSWORD-V2` followed by
+one NUL byte and the six ASCII digits, reduced modulo the P-256 group order
+using the library. This is not a reusable-password profile.
 
-The purpose of this construction is to bind the *whole pairing transcript* to the
-code the operator entered. Without it, an off-path attacker could relay a
-substitute device key to a device and a substitute host key to the host, and the
-operator would have entered a code that authenticates neither.
+The confirmation associated data is the ASCII domain
+`RBA-ENROLLMENT-SPAKE2-P256-SHA256-V2` followed by one NUL byte and, in order:
+session ID, host ID, device ID (16 bytes each), host and device public keys
+(65 bytes each), SHA-256 of the actual TLS server certificate DER (32 bytes),
+expiry (8-byte unsigned big-endian), and entry direction (one byte: 0 device,
+1 host). Both endpoints independently obtain these values. The host's share
+and confirmation are computed after the submit and local code input.
 
-```text
-transcript = session_id || host_id || device_id
-           || host_pubkey || device_pubkey
-           || host_nonce || device_nonce
-           || host_eph_pubkey || device_eph_pubkey
-           || code_entry_byte
+`PAIRING_CHALLENGE` (type 5, host → device) is an exact map containing
+`session_id` (16-byte bstr), `share` (65-byte uncompressed P-256 party A
+share), and `confirmation` (32-byte RFC confirmation tag).
 
-code_entry_byte = 0x00 for `code_entry = device`
-                = 0x01 for `code_entry = host`
-
-ecdh_secret = X-coordinate of (host_eph_private * device_eph_pubkey)
-            = X-coordinate of (device_eph_private * host_eph_pubkey)
-
-pairing_secret = HKDF-SHA-256(
-        ikm  = ecdh_secret,
-        salt = "RBA-PAIR-SALT-V1",
-        info = "RBA-PAIR-TRANSCRIPT-V2" || transcript,
-        len  = 32)
-
-p = HMAC-SHA-256(key = pairing_secret, msg =
-          "RBA-PAIR-V1" || 0x00 || transcript)
-
-code   = decimal, zero-padded to 6 digits, from rejection sampling:
-         for each 32-bit big-endian word v in p:
-             if v < 4_294_000_000: code = v mod 1_000_000; stop
-         if no word qualifies:
-             p_1 = HMAC-SHA-256(key = p,
-                     msg = "RBA-PAIR-CODE-V1" || 0x00 || u64_be(1))
-             repeat with p_1, p_2, ...
-mac_d  = HMAC-SHA-256(key = p, msg =
-          "RBA-DEVICE-CONFIRM-V1" || 0x00 || transcript)
-mac_h  = HMAC-SHA-256(key = p, msg =
-          "RBA-HOST-CONFIRM-V1" || 0x00 || transcript)
-```
-
-Both endpoints MUST reject an ephemeral public key that is not a valid P-256
-point. The ephemeral private key MUST be generated by a CSPRNG for every pairing
-session, MUST NOT be reused, and MUST be zeroized after `pairing_secret` is
-derived.
-
-The code MUST use rejection sampling as above. A one-byte truncation would
-reduce the space to `000000`–`000255`; a bare modulo reduction over a non-multiple
-of `1_000_000` would be biased. Rejection sampling makes every six-digit value
-exactly equally likely. The probability of a code in `000xxx` is therefore 0.1%.
-The expansion is reached with probability about `6e-30`.
-
-Requirements:
-
-* The host MUST verify `mac_d` before persisting anything (§11.4 ordering).
-  When `code_entry = device`, it MUST display the derived code and MUST obtain
-  explicit positive confirmation from its operator before persisting. When
-  `code_entry = host`, it MUST NOT display the code, MUST require its operator to
-  type the code shown on the device, and MUST verify that entry before persisting;
-  a wrong entry MUST be rejected, MUST NOT be converted into a default or a
-  successful pairing, and MUST cancel the session. There is no retry within the
-  same exchange.
-* The device MUST verify `host_mac` before persisting the host key. When
-  `code_entry = device`, it MUST NOT display the code, MUST require the operator
-  to type the code displayed by the host, and MUST persist only on an exact match.
-  A wrong entry MUST be rejected without persisting and MUST discard the pending
-  result; the operator must start a new pairing session. When `code_entry = host`,
-  the device MAY display the code for the host
-  operator to type, but it MUST still require an explicit **Allow** before
-  persisting.
-* **Cancel**, the back gesture, expiry, timeout, or loss of the pairing link MUST
-  discard the pending result. There MUST NOT be a default-allow, silent, or
-  unattended confirmation path.
-* The host stages its record when it sends `PAIRING_RESULT` with `status = 0`.
-  The new credential MUST NOT authenticate until the device confirms that its
-  human gate and local persistence succeeded. The host then commits its
-  registry and sends the receipt in §6.3.1. The two sides persist independently.
-* The host MUST generate a fresh 32-byte `revocation_token` for every successful
-  pairing, return it only over the pinned TLS channel, and store only its SHA-256
-  hash with the device record. The token MUST NOT be logged. The device MUST store
-  it with the host record and MUST NOT treat it as an authentication credential.
-* Pending `cleanup_tokens` in `PAIRING_SUBMIT` MUST be processed only after
-  `mac_d` verifies and before the new record is persisted. Each token revokes
-  exactly the record whose token hash matches. A token MUST NOT be treated as
-  evidence that the new installation is the same device; it only authorises the
-  old pairing's cleanup.
-* `code`, `mac`, `mac_d`, `host_mac` and `revocation_token` MUST NOT be written
-  to logs.
-* Both `host_nonce` and `device_nonce` MUST be fresh CSPRNG output for every
-  pairing attempt. Reuse breaks the transcript binding.
-* Pairing carries **no long-term key material**; only long-lived public keys are
-  retained after success.
-* There is no code path that pairs a device without an operator having started a
-  pairing session. A host MUST refuse `PAIRING_START`-equivalent operations while
-  no session is open, and MUST NOT fall back to "trust whatever connected".
-
-**Limitations, stated honestly.** The six-digit code is a short authentication
-string (SAS), not a PAKE. An active attacker who terminates the exchange on both
-sides derives a different ECDH secret on each side, so the codes differ; to make
-them match it must find two ephemeral keys whose six-digit values collide. That
-costs about `2^20` work per live session, and pairing sessions are single-use,
-time-limited and rate-limited. This is the standard SAS trade-off, not a hidden
-weakness.
-
-The construction provides forward secrecy for the pairing transcript: both
-ephemeral private keys are zeroized, so recording the exchange and later
-obtaining either long-term private key does not reveal `pairing_secret`. It does
-not protect against an operator who approves a code they did not actually
-compare, or against a compromised endpoint that lies about what it displays. Use
-an authenticating transport (TLS, as on Wi-Fi) where available; for BLE, pairing
-SHOULD be performed over Wi-Fi.
-
----
+The authenticator verifies the host's RFC confirmation before releasing its
+own. In host-entry mode the authenticator additionally requires an explicit
+human Allow. `PAIRING_PROOF` (type 6, device → host) is an exact map containing
+`session_id` (16-byte bstr), `confirmation` (32-byte RFC confirmation tag),
+and `cleanup_tokens` (array of at most 64 32-byte bstr). The host verifies the
+peer confirmation before staging enrollment. The TLS connection is bound by
+the independently obtained certificate hash and the PAKE confirmation.
+Neither endpoint may release an enrollment credential before verifying its
+peer; no application session key is exported to Kotlin. Enrollment state is
+single-use and discarded on completion or failure. The ECDSA authentication
+protocol remains unchanged.
 
 ### 6.5 `UNPAIR` (device → host)
 
@@ -449,9 +294,9 @@ notification that lets the host clean its side.
 ### 6.6 Pending cleanup on re-pair
 
 A device that could not deliver `UNPAIR` MAY retain the token and send it in
-`cleanup_tokens` on the next `PAIRING_SUBMIT` for the same host. The host MUST
-process those tokens only after the new submit's `mac` verifies and before it
-persists the new record. Each valid token revokes exactly the old record it
+`cleanup_tokens` in the next `PAIRING_PROOF` for the same host. The host MUST
+process those tokens only after PAKE confirmation and device acknowledgement,
+as part of the same commit as the new record. Each valid token revokes exactly the old record it
 belongs to; invalid tokens are ignored and audited, not used as a reason to
 break an otherwise valid pairing.
 
@@ -749,20 +594,14 @@ MUST NOT have one busy machine consume the whole budget, and an attacker MUST NO
 able to exhaust a device's budget by flooding it from a host the user has never
 paired.
 
-### 11.4 Ordering requirement (host, on `PAIRING_SUBMIT`)
+### 11.4 Ordering requirement (host, on `PAIRING_PROOF`)
 
-1. Verify `mac_d` against the session secret (§6.4).
-2. Process `cleanup_tokens`: revoke every old record whose stored token hash
-   matches. Invalid tokens are ignored and audited.
-3. Check the device is not already known with a different key among records that
-   remain paired.
-4. Check `device_id` is not already registered to a different key among records
-   that remain paired.
-5. **Only then** persist the device record and increment pairing rate limit.
-
-Verification precedes persistence. A failed `mac_d` MUST NOT create a registry
-entry, not even a "pending" one, and MUST NOT revoke anything through
-`cleanup_tokens`.
+Verify the single-use PAKE confirmation before staging anything. After the
+matching `PAIRING_CONFIRMED`, apply cleanup tokens and check key/ID conflicts
+in the registry transaction. Commit the new credential and its explicit
+principal grant atomically, or fail without changing the active registry.
+Admission is reserved durably before the exchange. Failed proof MUST NOT
+activate or revoke any credential.
 
 ---
 
@@ -771,6 +610,16 @@ entry, not even a "pending" one, and MUST NOT revoke anything through
 Hosts MUST rate limit pairing attempts and authentication attempts and MUST count
 malformed frames, unsupported versions, and signature failures. Exceeding a limit
 MUST produce `RATE_LIMITED` and MUST NOT prompt the user.
+
+Host prompt admission also applies a shared per-account and per-device budget
+of three admitted authentication attempts per 60 seconds, independent of service
+and transport. The transport and prompt budgets MUST be reserved together before
+challenge dispatch. A denied reservation MUST NOT extend the cooldown or consume
+another budget. Already admitted attempts count even when the eventual outcome
+is rejection, timeout or disconnection. This admission control is separate from
+pre-authentication resource controls for malformed network traffic. Persistent
+host deployments MUST commit the reservation before dispatch and deny admission
+if the state cannot be committed safely.
 
 Devices MUST hold at most one open prompt, MUST refuse a second concurrent
 request for the same session, and MUST NOT auto-fire prompts on receipt of a
@@ -890,8 +739,7 @@ Anyone with the logs MUST NOT be able to reconstruct a credential. Since
 signature, invalid signature, wrong device, wrong host, wrong user, wrong
 purpose, wrong operation, wrong service, expired request, future `issued_at`,
 replayed request, malformed frame, unsupported version, unknown message,
-non-canonical CBOR (each of R1–R8), canonical-encoding edge cases, pairing MAC
-computation, and the signing-input digest.
+non-canonical CBOR (each of R1–R8), canonical-encoding edge cases, enrollment message encoding, and the signing-input digest.
 
 Both implementations MUST pass all vectors. A vector file records the
 canonical `sig_input` and its SHA-256 digest so that an implementation can be
@@ -904,5 +752,5 @@ checked for byte-exact agreement without reproducing the ECDSA operation.
 * `protocol_version` is a single integer, currently `1`.
 * A receiver MUST reject any version it does not implement. It MUST NOT attempt
   a best-effort parse.
-* Breaking changes get a new integer. Adding optional fields requires updating
+* The enrollment subprotocol has its own mandatory suite identifier (`spake2-p256-sha256-v2`); older enrollment maps and suites are rejected. The unchanged authentication framing and signing profile retain integer 1. Breaking changes to those formats get a new integer. Adding optional fields requires updating
   this document, both implementations, and the vectors atomically.

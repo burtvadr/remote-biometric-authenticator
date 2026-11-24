@@ -137,7 +137,7 @@ for _ in $(seq 1 60); do [ -S "$SOCKET" ] && break; sleep 0.2; done
 asuser "$B/rba" --socket "$SOCKET" pair --yes --timeout 45000 >"$W/pair.log" 2>&1 &
 PAIR=$!
 sleep 1
-asuser timeout 45 "$B/rba-sim" pair --host "127.0.0.1:$PORT" --name "Pixel 9" \
+sed -n 's/^Code: \([0-9]\{6\}\).*/\1/p' "$W/pair.log" | asuser timeout 45 "$B/rba-sim" pair --host "127.0.0.1:$PORT" --name "Pixel 9" \
     --daemon "$B/rbad" --daemon-arg --state-dir --daemon-arg "$W/state" >"$W/simpair.log" 2>&1
 wait $PAIR
 ok "paired"

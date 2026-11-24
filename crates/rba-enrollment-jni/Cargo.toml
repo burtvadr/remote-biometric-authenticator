@@ -1,0 +1,17 @@
+[package]
+name = "rba-enrollment-jni"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "0BSD"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rba-enrollment = { path = "../rba-enrollment" }
+jni = "=0.21.1"
+rand_core = "0.10"
+getrandom = { version = "0.4", features = ["sys_rng"] }
+zeroize = "1.9"

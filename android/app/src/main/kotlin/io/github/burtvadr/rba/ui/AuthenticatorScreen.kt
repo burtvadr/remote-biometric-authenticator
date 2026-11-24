@@ -1394,6 +1394,7 @@ private fun PairingHostCodePanel(
             textAlign = TextAlign.Center,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        if (code.isNotEmpty()) {
         Box(
             modifier = Modifier
                 .background(
@@ -1408,6 +1409,7 @@ private fun PairingHostCodePanel(
                 fontFamily = FontFamily.Monospace,
                 fontWeight = FontWeight.Bold,
             )
+        }
         }
         Text("Host: $hostName", style = MaterialTheme.typography.bodySmall)
         if (onAllow != null && onCancel != null) {

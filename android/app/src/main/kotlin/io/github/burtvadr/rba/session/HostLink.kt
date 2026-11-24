@@ -313,43 +313,26 @@ class HostLink(
                 val frame = transport.receive() ?: break
                 when (val message = Message.fromFrame(frame)) {
                     is Message.PairingStartMessage -> {
-                        if (message.v.hostId != hello.hostId) {
+                        if (message.v.hostId != hello.hostId || message.v.hostKeyId != hello.hostKeyId) {
                             // A pairing offer must name the host that opened this
                             // connection. Its session id is the independent pairing
                             // session, not the transport's SESSION_HELLO id.
                             Log.w(TAG, "pairing offer does not match the open session")
                             break
                         }
-                        session.handlePairingStart(message.v, candidate.instanceName)
+                        val certificate = transport.peerCertificate() ?: break
+                        pairingParked = true
+                        val outcome = session.handlePairingStart(message.v, candidate.instanceName, certificate)
+                        if (outcome is SessionState.Failed) break
+                        served = true
+                    }
+
+                    is Message.PairingChallengeMessage -> {
+                        if (!pairingParked || session.handlePairingChallenge(message.v) is SessionState.Failed) break
                     }
 
                     is Message.PairingResultMessage -> {
-                        val certificate = transport.peerCertificate()
-                        if (certificate == null) {
-                            // Without a pin, every later authentication would be
-                            // reachable by a relay. Refuse to record a host we cannot
-                            // pin.
-                            session.transportLost("the host did not present a TLS certificate")
-                            return false
-                        }
-                        val outcome = session.handlePairingResult(message.v, certificate)
-                        when (outcome) {
-                            // Keep this socket open through the human gate and
-                            // host receipt; only then reconnect with the pin.
-                            is SessionState.PairingAwaitingConfirmation,
-                            is SessionState.PairingAwaitingApproval,
-                            -> {
-                                served = true
-                                pairingParked = true
-                            }
-
-                            is SessionState.PairingConfirmed -> {
-                                served = true
-                                break
-                            }
-
-                            else -> Unit
-                        }
+                        if (!pairingParked || session.handlePairingResult(message.v) is SessionState.Failed) break
                     }
 
                     is Message.PairingConfirmedMessage -> {
@@ -359,7 +342,7 @@ class HostLink(
                     }
 
                     is Message.AuthRequestMessage -> {
-                        if (message.v.hostId != hello.hostId) {
+                        if (message.v.hostId != hello.hostId || message.v.hostKeyId != hello.hostKeyId) {
                             // The request must carry the identity that opened this
                             // connection. Its session id is per-request, not the
                             // transport's SESSION_HELLO id.

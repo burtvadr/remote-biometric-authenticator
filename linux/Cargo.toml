@@ -5,7 +5,7 @@ members = ["protocol", "rbad", "rba-sim", "rba", "pam-rba", "polkit-agent"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.88"
 license = "Apache-2.0"
 
 [workspace.dependencies]
