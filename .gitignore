@@ -2,6 +2,9 @@
 /linux/target/
 **/*.rs.bk
 
+# Distribution artifacts (APKs and their checksums)
+/dist/
+
 # Gradle / Android build output
 /build/
 /android/.gradle/
