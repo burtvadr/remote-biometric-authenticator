@@ -166,7 +166,7 @@ are separate until the protocol confirms both.
 $ rba pair
 Waiting for device... (120s)
 Code: 123456  type this on the device
-Host side complete; finish on the device.
+Paired.
 ```
 
 - One bounded session, one progress line, one code line, one result. No box art
@@ -175,9 +175,9 @@ Host side complete; finish on the device.
 - Default code entry is `device`: the host shows the code, the device types it.
 - `--code-entry host` reverses the direction, like `adb pair`: the device shows
   the code and the terminal prompts `Enter pairing code:`.
-- The CLI does not print `Paired` until the device has confirmed. Until a
-  `PAIRING_CONFIRMED` message exists it says `Host side complete; finish on the
-  device` and leaves the final state to `rba devices`.
+- The CLI does not print `Paired` until the device has persisted its record and
+  sent `PAIRING_CONFIRMED`. A timeout, rejection or Ctrl-C exits non-zero and
+  leaves no trusted pairing behind.
 - `--transport adb` uses ADB only as a pipe. ADB's own pairing code is never used
   as the rba trust code.
 - The device is bound to the account that pairs it. `--owner` defaults to the

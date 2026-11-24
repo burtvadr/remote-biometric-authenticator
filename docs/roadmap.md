@@ -447,18 +447,17 @@ Required behavior:
 - [x] Do not publish the Tailscale interface over mDNS by default for local
   pairing. Added `--mdns-interface` to restrict advertisement to a named
   interface.
-- [ ] Enumerate every resolved host address and try them in a defined order, with
-  a short per-address timeout. The default order should be **LAN first**, then
-  Tailscale, unless policy says otherwise.
-- [ ] Surface diagnostics: the device should log which address/network it chose
-  and why, and `rba status`/`devices` should show the host's listen
-  addresses.
+- [x] Enumerate every resolved host address and try them in a defined order, with
+  a short per-address timeout. The default order is **LAN first**, then
+  Tailscale: `WifiTransport.connect()` resolves every A/AAAA record, binds LAN
+  attempts to Wi-Fi, leaves VPN addresses on the default route, and gives each
+  attempt its own connect and TLS-handshake timeout.
+- [x] Surface diagnostics: the device logs which address it chose and whether it
+  classified it as LAN or VPN. Showing the host's listen addresses in
+  `rba status`/`devices` is still open.
 - Make the path policy explicit, for example `--transport-preference lan`,
   `tailscale` or `auto`. Address selection must never weaken TLS pinning or the
   signed transcript; it only decides where bytes are sent.
-- Surface diagnostics: the device should log which address/network it chose and
-  why, and `rba status`/`devices` should show the host's listen
-  addresses.
 
 Do not make “disable Tailscale” or “allow local network access” the only
 documented fix. Those are workarounds; the app should coexist with a VPN.
@@ -508,7 +507,7 @@ Acceptance criteria:
       device has Tailscale on.
 - [ ] Toggling Tailscale or switching Wi-Fi reconnects without restarting the app.
 - [ ] mDNS does not advertise unintended interfaces by default.
-- [ ] All resolved addresses are tried, with a bounded timeout each.
+- [x] All resolved addresses are tried, with a bounded timeout each.
 - [ ] Tests cover VPN on/off on the device and Tailscale up on the host; address
       choice remains a routing decision, not an authentication decision.
 
