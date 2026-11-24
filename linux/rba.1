@@ -1,0 +1,174 @@
+.TH RBA 1 "2026-11-23" "rba 0.1.0" "Remote Biometric Authenticator"
+.SH NAME
+rba \- Remote Biometric Authenticator controller
+.SH SYNOPSIS
+rba [\-\-socket PATH] <COMMAND> [OPTIONS]
+.SH DESCRIPTION
+\fBrba\fP is the command-line client for the Remote Biometric Authenticator system.
+It is designed to be ADB-like: many commands start the daemon automatically
+if it is not already running, and the binary is self-contained (no separate
+installer scripts, no secrets in argv).
+.SH COMMANDS
+The following subcommands are available:
+.TP
+\fBstart-server\fP
+Start a user-level \fbrbad\fP daemon in the background. If a system-level
+daemon is installed, this is a no-op (use \fIsystemctl start rbad\fP instead).
+.TP
+\fBkill-server\fP
+Stop the user-level \fbrbad\fP daemon started by \fBstart-server\fP. If a
+system-level daemon is managed by systemd, this is a no-op (use
+\fIsystemctl stop rbad\fP instead).
+.TP
+\fBdevices\fP
+Show paired authenticators with their device ID, state, users, root access
+status, and link state.
+.TP
+\fBstatus\fP
+Show daemon status: host information, paired device count, and enabled
+integrations (gdm, polkit, sudo).
+.TP
+\fBpair\fP
+Pair a new biometric authenticator. Waits for the device to confirm, then
+prints \fIPaired.\fP (or \fIPaired \fRmodel\fP when \fB--device\fP is set).
+.TP
+\fBauth \-[u]ser USER\fP
+Authenticate the specified Linux user using a paired authenticator.
+.TP
+\fBunpair \-\-device D\fP
+Remove trust for a device. Owner or root may invoke this.
+.TP
+\fBrevoke \-\-device D\fP
+Revoke an authenticator immediately. Root only.
+.TP
+\fBenable \fRbackend\fP
+Enable a host integration (gdm, polkit, sudo) on Linux. Requires root.
+.TP
+\fBdisable \fRbackend\fP
+Roll back a host integration on Linux. Requires root.
+.TP
+\fBversion\fP
+Print the product and protocol version.
+.TP
+\fBhelp\fP
+Show this help message and exit 0.
+.SH OPTIONS
+.TP
+\fB--socket PATH\fP
+Control socket path. Defaults to the system socket if installed, otherwise a
+per-user socket under \fB$XDG_RUNTIME_DIR/rba\fP.
+.TP
+\fB\-s USER \|\-\-user USER\fP
+Linux user to authenticate (defaults to \fB$USER\fP).
+.TP
+\fB\-d DEVICE \|\-\-device DEVICE\fP
+Device identifier (HOST:PORT or device ID) to target for unpair/revoke.
+.TP
+\fB\-\-code-entry \{device|host\}\fP
+Pairing code entry mode: \fBdevice\fP (host shows code, device types it) or
+\fBhost\fP (device shows code, terminal prompts).
+.TP
+\fB\-\-timeout MS\fP
+Authentication timeout in milliseconds (default 90000).
+.TP
+\fB\-\-state-dir PATH\fP
+User-level state directory (default \fB$XDG_STATE_HOME/rba\fP, or
+\fB$HOME/.local/state/rba\fP, or \fB/tmp/rba-state-\fRuid\fP).
+.TP
+\fB\-\-audit-log PATH\fP
+Audit log path (default under the state directory).
+.TP
+\fB\-\-bind ADDR\fP
+Bind address for the daemon (IP:PORT).
+.TP
+\fB\-\-port N\fP
+TCP port for the daemon (default 47123).
+.TP
+\fB\-\-no-mdns\fP
+Disable mDNS advertisement.
+.TP
+\fB\-\-mdns-interface NAME\fP
+Specify which interface mDNS should use.
+.TP
+\fB\-\-host-name NAME\fP
+Host name shown on the device.
+.TP
+\fB\-\-foreground\fP
+Run the daemon in the foreground (for \fBstart-server\fP).
+.TP
+\fB\-\-socket-explicit\fP
+Use the explicitly given socket path without falling back to system default.
+.TP
+\fB\-\-state-dir\fP PATH
+See \fB--state-dir\fP.
+.TP
+\fB\-\-audit-log\fP PATH
+See \fB--audit-log\fP.
+.TP
+\fB\-\-bind\fP ADDR
+See \fB--bind\fP.
+.TP
+\fB\-\-port\fP N
+See \fB--port\fP.
+.TP
+\fB\-\-no-mdns\fP
+See \fB--no-mdns\fP.
+.TP
+\fB\-\-mdns-interface\fP NAME
+See \fB--mdns-interface\fP.
+.TP
+\fB\-\-host-name\fp NAME
+See \fB--host-name\fP.
+.TP
+\fB\-\-foreground\fP
+See \fB--foreground\fP.
+.SH ENVIRONMENT
+.TP
+\fBRBA_SOCKET\fP
+Control socket (overrides the default choice).
+.TP
+\fBRBA_STATE_DIR\fP
+User-level state directory.
+.TP
+\fBRBA_RUNTIME_DIR\fP
+User-level runtime directory (default \fB$XDG_RUNTIME_DIR/rba\fP).
+.SH EXIT STATUS
+The following exit codes are used:
+.TP
+\fB0\fP
+Success.
+.TP
+\fB1\fP
+Error (usage, connection refused, pairing timeout, permission denied).
+.TP
+\fB2\fP
+Unknown command or invalid arguments.
+.SH FILES
+.TP
+\fB/usr/local/bin/rba\fP
+User-facing binary (installed by \fImake release\fP or \fIinstall-local.sh\fP).
+.TP
+\fB/usr/libexec/rbad\fP
+Daemon binary (installed by \fImake release\fP or \fIinstall-local.sh\fP).
+.TP
+\fB/usr/lib/security/pam_rba.so\fP
+PAM module (installed by \fImake release\fP or \fIinstall-local.sh\fP).
+.TP
+\fB/etc/systemd/system/rbad.service\fP
+Systemd service file (used by system install).
+.TP
+\fB/var/lib/rba\fP
+Default state directory (root-only).
+.TP
+\fB/var/log/rba\fP
+Default audit log directory (root-only).
+.TP
+\fB$XDG_RUNTIME_DIR/rba/control.sock\fP
+Per-user control socket (when no system install).
+.SH SEE ALSO
+rbad(8), pam_rba(8), systemctl(8), adc(1)
+.SH BUGS
+Windows support remains feasibility-only; the Windows Hello Companion Device
+Framework is deprecated.
+.SH AUTHOR
+Written by burtvadr for the Remote Biometric Authenticator project.

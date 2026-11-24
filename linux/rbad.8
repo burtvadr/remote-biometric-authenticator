@@ -1,0 +1,85 @@
+.TH RBAD 8 "2026-11-23" "rbad 0.1.0" "Remote Biometric Authenticator daemon"
+.SH NAME
+rbad \- Remote Biometric Authenticator daemon
+.SH SYNOPSIS
+rbad [\-\-check] [\-\-state-dir PATH] [\-\-socket PATH]
+     [\-\-audit-log PATH] [\-\-bind ADDR] [\-\-port N]
+     [\-\-no-mdns] [\-\-mdns-interface NAME]
+     [\-\-host-name NAME]
+.SH DESCRIPTION
+\fbrbad\fP is the daemon for the Remote Biometric Authenticator system.
+It manages biometric authenticator pairings, handles authentication requests,
+and provides a Unix control socket for \fBrba\fP clients.
+.PP
+The daemon runs as an unprivileged system user (\fBrba\fP) and creates a
+Unix domain socket at the path specified by \fB--socket\fP (default:
+\fB/run/rba/control.sock\fP when a system install is present, otherwise a
+per-user socket under \fB$XDG_RUNTIME_DIR/rba/control.sock\fP).
+.PP
+The daemon can be started manually with \fIrbad\fP, or automatically by
+\fBrba start-server\fP (user-level) or \fIsystemctl start rbad\fP (system-level).
+.PP
+The daemon supports the following options:
+.TP
+\fB\-\-check\fP
+Check that the configuration is valid without binding any socket or opening
+the audit log. Useful for early validation in scripts.
+.TP
+\fB\-\-state-dir PATH\fP
+Root-only directory holding \fBhost.key\fP, \fBhost.crt\fP and \fBregistry.json\fP.
+Default: \fB/var/lib/rba\fP.
+.TP
+\fB\-\-socket PATH\fP
+Unix control socket path. Defaults to \fB/run/rba/control.sock\fP if a
+system install exists, otherwise a per-user socket.
+.TP
+\fB\-\-audit-log PATH\fP
+Path to the audit log file. Default: \fB/var/log/rba/audit.log\fP.
+.TP
+\fB\-\-bind ADDR\fP
+TCP bind address in \fBIP:PORT\fP format. Default: loopback only
+(\fB0.0.0.0:47123\fP). Exposing on LAN is an explicit deployment decision;
+use a firewall to restrict access.
+.TP
+\fB\-\-port N\fP
+TCP port (overrides \fB--bind\fP port). Default: 47123.
+.TP
+\fB\-\-no-mdns\fP
+Disable mDNS advertisement of the control socket.
+.TP
+\fB\-\-mdns-interface NAME\fP
+Specify which interface mDNS should use for advertisement.
+.TP
+\fB\-\-host-name NAME\fP
+Host label shown on the device. Derived from the hostname by default.
+.TP
+\fB\-\-foreground\fP
+Run the daemon in the foreground (useful for debugging).
+.SH FILES
+.TP
+\fB/usr/libexec/rbad\fP
+Default daemon binary path (system install).
+.TP
+\fB/var/lib/rba\fP
+Default state directory (root-only).
+.TP
+\fB/var/log/rba\fP
+Default audit log directory (root-only).
+.TP
+\fB$XDG_RUNTIME_DIR/rba/control.sock\fP
+Per-user control socket (when no system install).
+.TP
+\fB/etc/systemd/system/rbad.service\fP
+Systemd service file.
+.SH EXIT STATUS
+The following exit codes are used:
+.TP
+\fB0\fP
+Success (daemon started or check passed).
+.TP
+\fB1\fP
+Error (configuration invalid, runtime error, socket not available).
+.SH SEE ALSO
+rba(1), pam_rba(8), systemctl(8)
+.SH AUTHOR
+Written by burtvadr for the Remote Biometric Authenticator project.
