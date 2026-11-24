@@ -660,6 +660,9 @@ impl PairingConfirmed {
     pub fn from_payload(payload: &[u8]) -> Result<PairingConfirmed> {
         let v = cbor::decode_canonical(payload)
             .map_err(|e| ProtocolError::BadRequest(format!("pairing_confirmed payload: {e}")))?;
+        if !matches!(&v, Value::Map(entries) if entries.len() == 1) {
+            return Err(ProtocolError::BadRequest("invalid pairing acknowledgement".into()));
+        }
         let session_id = req_bytes(&v, "session_id")?;
         let sid_id = Id::from_slice(session_id)?;
         Ok(PairingConfirmed { session_id: sid_id })

@@ -856,3 +856,23 @@ The current candidate replaces separate account, root and operation fields with 
 Repair candidate for snapshot `b23cafaf`: restore typed registry lifecycle, key validation, explicit principal/scope administration and SEC-003 prompt budgets removed by the incomplete rewrite. Keep the ordered grant set (all contained types derive `Ord`). Compilation, formatting, Clippy and runtime verification are still required.
 
 The repaired host confirmation query now reads the acknowledgement flag, checks that the acknowledgement matches the result sent on the same connection, and bounds the final CLI polling loop. The uploaded Android client does not yet implement wire `PAIRING_CONFIRMED`; its human-confirmation UI state is not a wire acknowledgement. Phone pairing end-to-end remains unverified and must be addressed before release.
+
+
+### Pairing lifecycle follow-up — snapshot `9e6ac805`
+
+Implementation candidate: the host stages enrollment and cleanup revocations until
+the same connection delivers a matching `PAIRING_CONFIRMED`; registry changes are
+published only after a successful write. The host returns a matching receipt.
+Android now encodes/decodes message type 4, checks its local store write and waits
+for the host receipt before displaying completion. A connection owns its own
+submission channel; cancellation before acknowledgement does not publish a new
+credential. Lost final receipts remain an unavoidable ambiguous outcome across
+independent stores. This does not replace the SAS pairing construction or close
+SEC-026/SEC-005.
+
+Freshness tests inspect actual wire request IDs and challenges without sleeping; a
+separate test checks three prompts and rejection of the fourth. The existing
+30/minute Wi-Fi transport budget and three-per-minute account/device budgets are
+unchanged. The JVM Kotlin vector runner passed 132 checks against the updated
+fixtures. Rust compilation, Rust tests, Android app build and physical phone
+pairing remain to be verified.

@@ -52,7 +52,12 @@
       "msg_type": 3,
       "name": "pairing_result",
       "payload_hex": "a4667374617475730068686f73745f6d6163582000000000000000000000000000000000000000000000000000000000000000006a73657373696f6e5f69645099999999999999999999999999999999707265766f636174696f6e5f746f6b656e5820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "msg_type": 4,
+      "name": "pairing_confirmed",
+      "payload_hex": "a16a73657373696f6e5f69645099999999999999999999999999999999"
     }
   ],
-  "spec": "PROTOCOL.md §5-§8"
+  "spec": "PROTOCOL.md \u00a75-\u00a78"
 }

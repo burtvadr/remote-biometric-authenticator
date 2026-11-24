@@ -1210,6 +1210,10 @@ private fun OperatorContent(
             )
             is SessionState.Approved -> ApprovedPanel(state)
             is SessionState.Denied -> DeniedPanel(state)
+            is SessionState.PairingFinalizing -> InfoPanel(
+                "Completing pairing",
+                "Waiting for the host to confirm enrollment.",
+            )
             is SessionState.PairingConfirmed -> InfoPanel(
                 "Pairing complete",
                 "This host can now request authentication.",

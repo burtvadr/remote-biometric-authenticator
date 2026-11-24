@@ -698,6 +698,26 @@ data class PairingResult(
     }
 }
 
+/** Device acknowledgement of the exact pairing session after durable storage. */
+data class PairingConfirmed(val sessionId: Id) {
+    fun toPayload(): ByteArray = Cbor.encode(
+        Cbor.ofMap("session_id" to Cbor.bytes(sessionId.bytes)),
+    )
+
+    companion object {
+        fun fromPayload(payload: ByteArray): PairingConfirmed {
+            val map = Cbor.decode(payload) as? Cbor.Value.Map
+                ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "pairing_confirmed is not a map")
+            val id = (map["session_id"] as? Cbor.Value.Bytes)?.value
+                ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "missing session_id")
+            if (map.entries.size != 1 || id.size != Limits.ID_LEN) {
+                throw ProtocolException(ErrorCode.BAD_REQUEST, "invalid pairing acknowledgement")
+            }
+            return PairingConfirmed(Id(id))
+        }
+    }
+}
+
 /**
  * A device-initiated request to revoke its own pairing.
  *
@@ -994,6 +1014,7 @@ object MessageType {
     const val PAIRING_START = 1
     const val PAIRING_SUBMIT = 2
     const val PAIRING_RESULT = 3
+    const val PAIRING_CONFIRMED = 4
     const val SESSION_HELLO = 10
     const val SESSION_HELLO_ACK = 11
     const val AUTH_REQUEST = 12
@@ -1020,6 +1041,11 @@ sealed class Message {
 
     data class PairingResultMessage(val v: PairingResult) : Message() {
         override val type = MessageType.PAIRING_RESULT
+        override fun toPayload() = v.toPayload()
+    }
+
+    data class PairingConfirmedMessage(val v: PairingConfirmed) : Message() {
+        override val type = MessageType.PAIRING_CONFIRMED
         override fun toPayload() = v.toPayload()
     }
 
@@ -1070,6 +1096,7 @@ sealed class Message {
                 MessageType.PAIRING_START -> PairingStartMessage(PairingStart.fromPayload(frame.payload))
                 MessageType.PAIRING_SUBMIT -> PairingSubmitMessage(PairingSubmit.fromPayload(frame.payload))
                 MessageType.PAIRING_RESULT -> PairingResultMessage(PairingResult.fromPayload(frame.payload))
+                MessageType.PAIRING_CONFIRMED -> PairingConfirmedMessage(PairingConfirmed.fromPayload(frame.payload))
                 MessageType.SESSION_HELLO -> SessionHelloMessage(SessionHello.fromPayload(frame.payload))
                 MessageType.SESSION_HELLO_ACK -> SessionHelloAckMessage(SessionHelloAck.fromPayload(frame.payload))
                 MessageType.AUTH_REQUEST -> AuthRequestMessage(AuthRequest.fromPayload(frame.payload))

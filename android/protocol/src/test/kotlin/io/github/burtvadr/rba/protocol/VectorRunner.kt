@@ -171,6 +171,17 @@ class VectorRunner(private val vectorsDir: File) {
             return Frame(msgType = c.number("msg_type").toInt(), payload = Hex.decode(c.text("payload_hex"))) to
                 Hex.decode(c.text("payload_hex"))
         }
+        messageNamed("pairing_confirmed")?.let { (frame, payload) ->
+            val m = Message.fromFrame(frame) as Message.PairingConfirmedMessage
+            check("pairing_confirmed.session_id", m.v.sessionId == Id(ByteArray(16) { 0x99.toByte() }))
+            check("pairing_confirmed.payload_roundtrip", m.toPayload().contentEquals(payload))
+        }
+        for (size in listOf(0, 15, 17, 32)) {
+            val invalid = Cbor.encode(Cbor.ofMap("session_id" to Cbor.bytes(ByteArray(size))))
+            check("pairing_confirmed.reject_length_$size", runCatching {
+                PairingConfirmed.fromPayload(invalid)
+            }.isFailure)
+        }
         messageNamed("session_hello_ack")?.let { (frame, _) ->
             val m = Message.fromFrame(frame)
             check("session_hello_ack.type", m is Message.SessionHelloAckMessage, "got ${m::class.simpleName}")

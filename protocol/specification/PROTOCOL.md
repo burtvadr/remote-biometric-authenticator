@@ -170,6 +170,7 @@ a broken peer rather than a normal condition.
 | 1 | `PAIRING_START` | host → device | §6.1 |
 | 2 | `PAIRING_SUBMIT` | device → host | §6.2 |
 | 3 | `PAIRING_RESULT` | host → device | §6.3 |
+| 4 | `PAIRING_CONFIRMED` | device → host, then host → device | §6.3.1 |
 | 10 | `SESSION_HELLO` | host → device | §7.1 |
 | 11 | `SESSION_HELLO_ACK` | device → host | §7.2 |
 | 12 | `AUTH_REQUEST` | host → device | §8.1 |
@@ -292,9 +293,27 @@ endpoint's typed code. There is no unattended pairing path.
 | Key | Type | Constraint |
 |---|---|---|
 | `session_id` | bstr | 16 bytes |
-| `status` | uint | `0` = paired, `1` = rejected |
+| `status` | uint | `0` = accepted for confirmation, `1` = rejected |
 | `host_mac` | bstr | 32 bytes, present only when `status == 0` |
 | `revocation_token` | bstr | 32 bytes, present when `status == 0`; bearer capability for §6.5 |
+
+### 6.3.1 `PAIRING_CONFIRMED`
+
+| Key | Type | Constraint |
+|---|---|---|
+| `session_id` | bstr | 16 bytes, exact pairing session identifier |
+
+The device MUST send this single-field canonical map only after the reciprocal
+MAC and the human gate have succeeded and the host record has been durably
+stored. It MUST be sent on the connection that delivered the successful
+`PAIRING_RESULT`, before closing that connection for a pinned reconnect. The
+host MUST reject acknowledgements for a different session or connection, and
+MUST NOT report pairing complete to its CLI until the acknowledgement arrives.
+The host MUST stage the enrollment until the device acknowledgement, then commit
+its registry and echo the same message as a receipt on the same connection.
+Only the receipt completes the device UI. The device acknowledgement is not
+itself authentication proof. A lost final receipt can leave completion
+uncertain; the operator may re-pair. This is not a distributed atomic commit.
 
 ### 6.4 Pairing confirmation (normative)
 
@@ -370,11 +389,10 @@ Requirements:
 * **Cancel**, the back gesture, expiry, timeout, or loss of the pairing link MUST
   discard the pending result. There MUST NOT be a default-allow, silent, or
   unattended confirmation path.
-* The host persists its record when it sends `PAIRING_RESULT` with `status = 0`;
-  the two sides persist independently. A host-side record alone authenticates
-  nothing: the device MUST reject session establishment and authentication from a
-  `host_id` it has not stored. The device's human gate — a typed code or an
-  explicit Allow — is what authorises future authentication.
+* The host stages its record when it sends `PAIRING_RESULT` with `status = 0`.
+  The new credential MUST NOT authenticate until the device confirms that its
+  human gate and local persistence succeeded. The host then commits its
+  registry and sends the receipt in §6.3.1. The two sides persist independently.
 * The host MUST generate a fresh 32-byte `revocation_token` for every successful
   pairing, return it only over the pinned TLS channel, and store only its SHA-256
   hash with the device record. The token MUST NOT be logged. The device MUST store

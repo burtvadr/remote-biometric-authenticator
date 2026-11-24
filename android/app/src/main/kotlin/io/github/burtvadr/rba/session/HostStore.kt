@@ -113,6 +113,7 @@ class HostStore(context: Context) {
         }
     }
 
+    @Synchronized
     fun save(registry: HostRegistry) {
         prefs.edit().putString(KEY_HOSTS, HostCodec.encodeAll(registry.all())).apply()
     }
@@ -124,9 +125,25 @@ class HostStore(context: Context) {
     fun isPaired(hostId: Id): Boolean = load().isPaired(hostId)
 
     /** Inserts or replaces one host, leaving every other host untouched. */
+    @Synchronized
     fun put(host: KnownHost) = save(load().put(host))
 
+    /** Pairing may acknowledge only after the pin and credential are on disk. */
+    @Synchronized
+    fun putDurably(host: KnownHost): Boolean {
+        val previous = prefs.getString(KEY_HOSTS, null)
+        val next = HostCodec.encodeAll(load().put(host).all())
+        if (prefs.edit().putString(KEY_HOSTS, next).commit()) return true
+        // SharedPreferences can update its in-memory view even when disk I/O
+        // fails. Restore the previous view and never acknowledge this attempt.
+        val restore = prefs.edit()
+        if (previous == null) restore.remove(KEY_HOSTS) else restore.putString(KEY_HOSTS, previous)
+        restore.commit()
+        return false
+    }
+
     /** Forgets one host. Returns whether it was actually paired. */
+    @Synchronized
     fun remove(hostId: Id): Boolean {
         val current = load()
         if (!current.remove(hostId)) return false
@@ -134,6 +151,7 @@ class HostStore(context: Context) {
         return true
     }
 
+    @Synchronized
     fun clear() = prefs.edit().remove(KEY_HOSTS).apply()
 
     private companion object {

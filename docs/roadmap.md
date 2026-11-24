@@ -1256,9 +1256,9 @@ Pixel 9 (91620145)        motorola edge 30 ultra connected   12:08
 
 ### Protocol change needed for honest completion
 
-Right now the host persists its device record before it sends `PAIRING_RESULT`,
-while the device persists only after its human gate. That is why the CLI can say
-`Host record saved` while the device still has not accepted.
+The previous implementation persisted the host record before the device's human
+gate. The lifecycle candidate stages the record, then commits after the device
+acknowledges and returns a receipt. Runtime verification remains pending.
 
 To make the CLI truthful, add a final device-to-host acknowledgement after the
 device persists, for example `PAIRING_CONFIRMED`:
@@ -1267,8 +1267,10 @@ device persists, for example `PAIRING_CONFIRMED`:
    `PAIRING_RESULT`.
 2. Device verifies `host_mac`, asks the operator, then persists.
 3. Device sends `PAIRING_CONFIRMED` (bound to the same session/transcript).
-4. Host promotes the record to **paired** and the CLI prints `Paired`.
-5. Timeout, rejection, code mismatch or link loss deletes the pending record.
+4. Host promotes the record to **paired**, returns `PAIRING_CONFIRMED` as a receipt,
+   and the CLI prints `Paired`. The device displays completion on receipt.
+5. Timeout, rejection, code mismatch or link loss before acknowledgement discards
+   the pending record. A lost final receipt may require re-pairing.
 
 Until that exists, the CLI must not claim the pairing is complete; it should say
 `Host side complete; waiting for the device` and leave the final state to

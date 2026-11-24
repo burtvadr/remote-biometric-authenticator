@@ -31,12 +31,15 @@ host                                   device
  │  device: display the code             │
  │  host: prompt for the device's code    │
  │  verify mac                           │
- │  persist the device                   │
+ │  stage the device                     │
  │  PAIRING_RESULT { status, host_mac }  │
  ├──────────────────────────────────────►│  verify host_mac
  │                                       │  device: type the host code
  │                                       │  host: show code, require Allow
  │                                       │  persist only after the human gate
+ │◄────────── PAIRING_CONFIRMED ─────────┤
+ │  commit registry                      │
+ ├─────────── PAIRING_CONFIRMED ─────────►│  receipt: pairing complete
 ```
 
 `code_entry` chooses which endpoint types the code. In `device` mode the Linux
@@ -78,12 +81,14 @@ prove that a human was involved. The Android app's gate depends on `code_entry`:
   an explicit **Allow**. The code entry is a host-side check, not a substitute
   for the device's consent.
 
-Only the human gate writes the host key and certificate pin. **Cancel**, the back
-gesture, or losing the connection discards the pending record. The host has
-already persisted its own side when it sends `PAIRING_RESULT`; the two records are
-independent. A host record alone cannot authenticate anything: the device refuses
-requests from a host it has not stored. The device's typed code or Allow is what
-makes future authentication possible.
+Only the human gate writes the host key and certificate pin. The Android client
+checks synchronous storage success before sending `PAIRING_CONFIRMED`. The host
+stages enrollment until this message arrives on the original connection, commits
+its registry, and sends a matching receipt. The device waits for the receipt before
+reporting success and reconnecting with its pin. Rejection, expiry or disconnect
+before acknowledgement discards the host's staged enrollment. A lost final receipt
+can leave the device with a locally trusted record; re-pair if completion is
+uncertain. This is not a distributed atomic commit.
 
 Pairing can be started while the app is in the background. The foreground service
 holds an idle discovery/connection loop, and the state that needs the operator

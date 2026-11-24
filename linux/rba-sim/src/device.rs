@@ -438,6 +438,9 @@ where
             }
         };
 
+        if result.session_id != start.session_id {
+            return Err(ProtocolError::ContextMismatch("pairing result is for another session".into()));
+        }
         if result.status != 0 {
             return Err(ProtocolError::BadRequest(
                 "host rejected the pairing".into(),
@@ -465,7 +468,7 @@ where
             key_id: start.host_key_id.clone(),
         });
         println!(
-            "[rba] Host {} trusted (key {}).",
+            "[rba] Host {} verified (key {}); awaiting enrollment receipt.",
             &start.host_id.to_hex()[..8],
             start.host_pubkey.short_fingerprint()
         );
@@ -477,8 +480,11 @@ where
     /// Called only after `save_hosts` has succeeded. Until this arrives the host
     /// must not claim the pairing is complete.
     pub async fn confirm_pairing(&mut self, session_id: Id) -> Result<()> {
-        self.send(&Message::PairingConfirmed(PairingConfirmed { session_id }))
-            .await
+        self.send(&Message::PairingConfirmed(PairingConfirmed { session_id })).await?;
+        match self.recv().await? {
+            Some(Message::PairingConfirmed(receipt)) if receipt.session_id == session_id => Ok(()),
+            _ => Err(ProtocolError::ContextMismatch("missing or mismatched pairing receipt".into())),
+        }
     }
 
     /// Handles one authentication request and returns whether it replied.

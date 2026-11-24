@@ -374,6 +374,16 @@ fn a_message_payload_vector_parses_into_the_expected_type() {
     };
     // Pairing messages are checked as raw CBOR because their validity depends on
     // the current clock; the rest must round-trip through the real parser.
+    let pairing = find("pairing_confirmed");
+    let payload = unhex(pairing["payload_hex"].as_str().unwrap());
+    let frame = Frame::new(4, payload.clone());
+    match Message::from_frame(&frame).unwrap() {
+        Message::PairingConfirmed(ack) => {
+            assert_eq!(ack.session_id.as_bytes(), &[0x99; 16]);
+            assert_eq!(ack.to_payload(), payload);
+        }
+        other => panic!("expected PAIRING_CONFIRMED, got {}", other.name()),
+    }
     let ack = find("session_hello_ack");
     let payload = unhex(ack["payload_hex"].as_str().unwrap());
     let frame = Frame::new(11, payload);

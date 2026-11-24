@@ -17,7 +17,7 @@ use std::time::Duration;
 use rba_protocol::errors::{ErrorCode, ProtocolError};
 use rba_protocol::messages::Message;
 use rba_protocol::pairing::CodeEntry;
-use rba_protocol::types::{Id, Transport};
+use rba_protocol::types::{Challenge, Id, Transport};
 use rba_sim::{Behaviour, Device, DeviceKey, KnownHost, Misbehaviour};
 use rbad::engine::{AuthContext, AuthOutcome, PairingPhase};
 use rbad::registry::{DeviceStatus, HostIdentity, Registry};
@@ -26,14 +26,13 @@ use rbad::{audit::AuditLog, engine::Engine, transport};
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn new_engine() -> Arc<Engine> {
-    let key = rba_protocol::crypto::PrivateKey::generate().expect("keygen");
     let host = HostIdentity {
-        host_id: "test-host".into(),
-        public_key: "0400a0c9d3b6e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e".into(),
+        host_id: Id::random().expect("host id"),
+        key: rba_protocol::crypto::PrivateKey::generate().expect("keygen"),
     };
     Engine::with_rate_limit_path(
         host,
-        Registry::new(),
+        Registry::in_memory(),
         AuditLog::null(),
         "test-host".into(),
         None,
@@ -49,12 +48,12 @@ fn recording_engine(tag: &str) -> (Arc<Engine>, std::path::PathBuf) {
     let _ = std::fs::remove_file(&path);
     let log = AuditLog::to_file(&path).expect("audit log");
     let host = HostIdentity {
-        host_id: "test-host".into(),
-        public_key: "0400a0c9d3b6e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e".into(),
+        host_id: Id::random().expect("host id"),
+        key: rba_protocol::crypto::PrivateKey::generate().expect("keygen"),
     };
     let engine = Engine::with_rate_limit_path(
         host,
-        Registry::new(),
+        Registry::in_memory(),
         log,
         "test-host".into(),
         None,
@@ -101,7 +100,6 @@ impl Fixture {
                 None,
                 CodeEntry::Device,
                 "alice".into(),
-                allow_root,
                 "test".into(),
             )
             .expect("pairing opens");
@@ -113,6 +111,8 @@ impl Fixture {
             c.run(10).await
         });
         let device2 = device.clone();
+        let (staged_tx, staged_rx) = tokio::sync::oneshot::channel();
+        let (confirm_tx, confirm_rx) = tokio::sync::oneshot::channel();
         let sim = tokio::spawn(async move {
             let mut dev = Device::new(
                 device2,
@@ -129,7 +129,10 @@ impl Fixture {
             let Some(Message::PairingStart(start)) = dev.recv().await.unwrap() else {
                 return Err("no PAIRING_START".to_string());
             };
-            dev.pair(&start, true).await.map_err(|e| e.to_string())?;
+            let result = dev.pair(&start, true).await.map_err(|e| e.to_string())?;
+            staged_tx.send(()).map_err(|_| "staging observer closed".to_string())?;
+            confirm_rx.await.map_err(|_| "confirmation observer closed".to_string())?;
+            dev.confirm_pairing(result.session_id).await.map_err(|e| e.to_string())?;
             Ok::<(), String>(())
         });
 
@@ -137,7 +140,12 @@ impl Fixture {
         wait_for_phase(&engine, PairingPhase::AwaitingConfirmation).await;
         engine.confirm_pairing().expect("confirmation accepted");
 
-        sim.await.expect("device task").expect("device paired");
+        tokio::time::timeout(TEST_TIMEOUT, staged_rx).await.unwrap().unwrap();
+        assert!(engine.list_devices(None).is_empty(), "the host must not publish a credential before acknowledgement");
+        assert_eq!(engine.pairing_acknowledged_by("test"), Some(false));
+        assert!(engine.cancel_pairing_for("another-caller", false).is_err());
+        confirm_tx.send(()).unwrap();
+        tokio::time::timeout(TEST_TIMEOUT, sim).await.unwrap().expect("device task").expect("device paired");
         conn.await
             .expect("connection task")
             .expect("connection closed cleanly");
@@ -153,8 +161,14 @@ impl Fixture {
         );
         // The fixture explicitly grants its test scope; pairing alone does not
         // grant privileged operations.
+        let scope = rbad::authz::Scope::parse("sudo", "sudo", "authenticate").unwrap();
         engine.set_device_scope(&device.device_id.to_hex(),
-            rbad::authz::Scope::parse("sudo", "sudo", "authenticate").unwrap(), true).unwrap();
+            rbad::authz::Grant::new("alice", scope.clone()), true).unwrap();
+        if allow_root {
+            engine.set_device_scope(&device.device_id.to_hex(),
+                rbad::authz::Grant::new("root", scope), true).unwrap();
+        }
+        assert_eq!(engine.pairing_acknowledged_by("test"), Some(true));
         Fixture {
             engine,
             device,
@@ -184,6 +198,7 @@ async fn wait_for_phase(engine: &Arc<Engine>, want: PairingPhase) {
 /// the normal path rather than a reconnect race.
 struct LivePair {
     device_id: Id,
+    observed: Arc<std::sync::Mutex<Vec<(Id, Challenge)>>>,
     _host: tokio::task::JoinHandle<()>,
     _device: tokio::task::JoinHandle<()>,
 }
@@ -218,6 +233,8 @@ async fn connect(f: &Fixture, behaviour: Behaviour) -> LivePair {
     let device_key = f.device.clone();
     let host_pub = f.engine.host.public_key();
     let host_id = f.engine.host.host_id;
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = observed.clone();
     let device = tokio::spawn(async move {
         let mut dev = Device::new(
             device_key,
@@ -239,6 +256,7 @@ async fn connect(f: &Fixture, behaviour: Behaviour) -> LivePair {
                     let _ = dev.hello_ack(&hello).await;
                 }
                 Ok(Some(Message::AuthRequest(request))) => {
+                    captured.lock().unwrap().push((request.request_id, request.challenge));
                     let _ = dev.handle_auth(&request).await;
                 }
                 Ok(Some(_)) => {}
@@ -249,6 +267,7 @@ async fn connect(f: &Fixture, behaviour: Behaviour) -> LivePair {
 
     let pair = LivePair {
         device_id: f.device.device_id,
+        observed,
         _host: host,
         _device: device,
     };
@@ -304,6 +323,16 @@ async fn authenticate_repeatedly(
     timeout_ms: u64,
 ) -> Vec<Result<AuthOutcome, ProtocolError>> {
     let pair = connect(f, behaviour).await;
+    let out = authenticate_on_connection(f, count, timeout_ms).await;
+    drop(pair);
+    out
+}
+
+async fn authenticate_on_connection(
+    f: &Fixture,
+    count: usize,
+    timeout_ms: u64,
+) -> Vec<Result<AuthOutcome, ProtocolError>> {
     let mut out = Vec::new();
     for _ in 0..count {
         let r = tokio::time::timeout(
@@ -330,7 +359,6 @@ async fn authenticate_repeatedly(
         .expect("authentication did not settle");
         out.push(r);
     }
-    drop(pair);
     out
 }
 
@@ -477,26 +505,16 @@ async fn a_device_replaying_its_own_response_yields_at_most_one_success() {
 #[tokio::test]
 async fn every_request_uses_a_fresh_challenge_and_request_id() {
     let f = Fixture::paired("freshness").await;
-    // Authenticate 4 times with 20s spacing to stay outside the 3-per-60s rate limit,
-    // allowing all 4 to succeed for freshness verification.
-    let mut seen = std::collections::HashSet::new();
-    for _ in 0..4 {
-        let ctx = AuthContext {
-            local_uid: 0,
-            username: "alice",
-            purpose: "rba",
-            service: "rba",
-            operation: "authenticate",
-            device_selector: None,
-            timeout_ms: 10000,
-        };
-        let future = f.engine.authenticate(ctx);
-        let _ = tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
-        let r = tokio::time::timeout(TEST_TIMEOUT, future).await;
-        let out = r.expect("every approval authenticates");
-        assert!(seen.insert(out.request_id), "request ids must never repeat");
+    let pair = connect(&f, Behaviour::Approve).await;
+    // Two independently generated requests suffice to exercise freshness on
+    // the same live connection without exhausting the production prompt budget.
+    for result in authenticate_on_connection(&f, 2, 5000).await {
+        assert!(result.expect("approval authenticates").ok);
     }
-    assert_eq!(seen.len(), 4);
+    let observed = pair.observed.lock().unwrap();
+    assert_eq!(observed.len(), 2);
+    assert_ne!(observed[0].0, observed[1].0, "request IDs must differ");
+    assert_ne!(observed[0].1, observed[1].1, "challenges must differ");
 }
 
 #[tokio::test]
@@ -712,23 +730,14 @@ async fn pairing_is_rate_limited() {
 #[tokio::test]
 async fn authentication_is_rate_limited() {
     let f = Fixture::paired("rate").await;
-    // Denials also count, so a hammering caller cannot reset the window by
-    // retrying immediately.
-    let mut denials = 0;
-    for _ in 0..12 {
-        match authenticate_once(&f, Behaviour::Deny, 2000).await {
-            Ok(_) => {}
-            Err(e) if e.code() == ErrorCode::RateLimited => {
-                denials += 1;
-                break;
-            }
-            Err(_) => {}
-        }
+    let pair = connect(&f, Behaviour::Deny).await;
+    let results = authenticate_on_connection(&f, 4, 5000).await;
+    for result in &results[..3] {
+        assert_eq!(result.as_ref().unwrap_err().code(), ErrorCode::UserCancelled);
     }
-    assert!(
-        denials > 0,
-        "repeated attempts must eventually be rate limited"
-    );
+    assert_eq!(results[3].as_ref().unwrap_err().code(), ErrorCode::RateLimited);
+    assert_eq!(pair.observed.lock().unwrap().len(), 3,
+        "rate-limited requests must never reach the device");
 }
 
 #[tokio::test]
@@ -736,7 +745,7 @@ async fn host_entry_mode_requires_the_correct_code_before_persisting() {
     let engine = new_engine();
     let device = Arc::new(DeviceKey::generate("host-entry").unwrap());
     engine
-        .begin_pairing_with_mode(None, CodeEntry::Host, "alice".into(), false, "test".into())
+        .begin_pairing_with_mode(None, CodeEntry::Host, "alice".into(), "test".into())
         .expect("pairing opens");
     assert_eq!(engine.pairing_code_entry(), Some(CodeEntry::Host));
 
@@ -842,4 +851,51 @@ async fn pairing_without_operator_confirmation_never_persists_anything() {
 
     conn.abort();
     sim.abort();
+}
+
+#[tokio::test]
+async fn disconnect_or_wrong_receipt_never_commits_enrollment() {
+    for wrong_id in [false, true] {
+        let engine = new_engine();
+        let key = Arc::new(DeviceKey::generate("incomplete").unwrap());
+        engine.begin_pairing(None, "alice".into(), "test".into()).unwrap();
+        let (host_side, device_side) = tokio::io::duplex(64 * 1024);
+        let host_engine = engine.clone();
+        let host = tokio::spawn(async move {
+            transport::open(host_engine, host_side, Transport::Wifi, "test".into()).run(10).await
+        });
+        let (staged_tx, staged_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let device = tokio::spawn(async move {
+            let mut dev = Device::new(key, device_side, Misbehaviour {
+                on_request: None, behaviour: Behaviour::Approve,
+            });
+            let Some(Message::SessionHello(hello)) = dev.recv().await.unwrap() else {
+                panic!("missing hello");
+            };
+            dev.hello_ack(&hello).await.unwrap();
+            let Some(Message::PairingStart(start)) = dev.recv().await.unwrap() else {
+                panic!("missing pairing start");
+            };
+            let result = dev.pair(&start, true).await.unwrap();
+            staged_tx.send(result.session_id).unwrap();
+            finish_rx.await.unwrap();
+            if wrong_id {
+                let mut wrong = result.session_id;
+                wrong.0[0] ^= 1;
+                assert!(dev.confirm_pairing(wrong).await.is_err());
+            }
+            // In the other case drop the connection without acknowledging.
+        });
+        wait_for_phase(&engine, PairingPhase::AwaitingConfirmation).await;
+        engine.confirm_pairing().unwrap();
+        tokio::time::timeout(TEST_TIMEOUT, staged_rx).await.unwrap().unwrap();
+        assert!(engine.list_devices(None).is_empty());
+        assert_eq!(engine.pairing_acknowledged_by("test"), Some(false));
+        finish_tx.send(()).unwrap();
+        tokio::time::timeout(TEST_TIMEOUT, device).await.unwrap().unwrap();
+        tokio::time::timeout(TEST_TIMEOUT, host).await.unwrap().unwrap().unwrap();
+        assert!(engine.list_devices(None).is_empty());
+        assert_eq!(engine.pairing_acknowledged_by("test"), None);
+    }
 }

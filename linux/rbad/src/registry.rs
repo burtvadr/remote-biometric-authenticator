@@ -345,6 +345,35 @@ impl Registry {
         )
     }
 
+    /// Publish a new enrollment and its cleanup revocations as one registry write.
+    pub(crate) fn commit_enrollment(
+        &mut self,
+        submit: &rba_protocol::pairing::PairingSubmit,
+        now: u64,
+        token_hash: &str,
+        policy: &DevicePolicy,
+    ) -> Result<Vec<Id>> {
+        // Work on an isolated candidate; individual mutations must not publish
+        // intermediate state or make a credential usable if persistence fails.
+        let mut candidate = Self::in_memory();
+        candidate.devices = self.devices.clone();
+        let mut revoked = Vec::new();
+        for token in &submit.cleanup_tokens {
+            let hash = hex::encode(rba_protocol::crypto::sha256(token));
+            if let Some(id) = candidate.revoke_by_token_hash(&hash)? {
+                revoked.push(id);
+            }
+        }
+        candidate.upsert_paired_full(
+            submit.device_id, &submit.device_name, &submit.device_pubkey,
+            now, Some(token_hash), policy,
+        )?;
+        candidate.path = self.path.clone();
+        candidate.save()?;
+        *self = candidate;
+        Ok(revoked)
+    }
+
     /// Full form: records the account binding chosen at pairing time.
     ///
     /// Re-pairing an existing device replaces its policy: a fresh physical

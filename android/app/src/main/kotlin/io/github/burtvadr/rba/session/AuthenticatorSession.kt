@@ -15,6 +15,7 @@ import io.github.burtvadr.rba.protocol.Hex
 import io.github.burtvadr.rba.protocol.Id
 import io.github.burtvadr.rba.protocol.Limits
 import io.github.burtvadr.rba.protocol.Message
+import io.github.burtvadr.rba.protocol.PairingConfirmed
 import io.github.burtvadr.rba.protocol.PairingResult
 import io.github.burtvadr.rba.protocol.PairingSession
 import io.github.burtvadr.rba.protocol.PairingStart
@@ -80,6 +81,8 @@ sealed interface SessionState {
      * from this screen. The operator still has to approve this host explicitly.
      */
     data class PairingAwaitingApproval(val hostName: String, val code: String) : SessionState
+
+    data class PairingFinalizing(val hostName: String) : SessionState
 
     data class PairingConfirmed(val hostName: String) : SessionState
 
@@ -157,6 +160,7 @@ class AuthenticatorSession(
      * an explicit Allow after the host typed this screen's code.
      */
     private data class ConfirmedPairing(
+        val sessionId: Id,
         val host: KnownHost,
         val code: String,
         val hostName: String,
@@ -164,6 +168,7 @@ class AuthenticatorSession(
     )
 
     private var pendingConfirmation: ConfirmedPairing? = null
+    private var pendingAcknowledgement: ConfirmedPairing? = null
 
     /** Clears a parked confirmation that the operator never settles. */
     private var confirmationTimeout: Job? = null
@@ -417,10 +422,12 @@ class AuthenticatorSession(
     }
 
     /** Installs the sink for the currently connected transport. */
-    fun attachTransport(sink: (Frame) -> Unit) {
+    @Synchronized
+    fun attachTransport(sink: (Frame) -> Boolean) {
         transportSink = sink
     }
 
+    @Synchronized
     fun detachTransport() {
         transportSink = null
     }
@@ -432,6 +439,7 @@ class AuthenticatorSession(
      * nothing may be left on screen that could later be approved against a dead
      * session.
      */
+    @Synchronized
     fun transportLost(reason: String) {
         transportSink = null
         val pairing = pendingPairing
@@ -448,6 +456,8 @@ class AuthenticatorSession(
             pendingConfirmation != null &&
                 (_state.value is SessionState.PairingAwaitingConfirmation ||
                     _state.value is SessionState.PairingAwaitingApproval)
+        val awaitingAcknowledgement = pendingAcknowledgement != null
+        pendingAcknowledgement = null
         pendingConfirmation = null
         confirmationTimeout?.cancel()
         confirmationTimeout = null
@@ -459,13 +469,14 @@ class AuthenticatorSession(
                 _state.value is SessionState.PairingAwaitingHostCode) ->
                 _state.value = SessionState.Failed(reason)
 
-            awaitingConfirmation ->
+            awaitingConfirmation || awaitingAcknowledgement ->
                 _state.value = SessionState.Failed(reason)
         }
     }
 
     /** Installed by the active transport adapter. */
-    private var transportSink: ((Frame) -> Unit)? = null
+    @Volatile
+    private var transportSink: ((Frame) -> Boolean)? = null
 
     // -----------------------------------------------------------------------
     // Pairing
@@ -482,9 +493,10 @@ class AuthenticatorSession(
      *
      * @param hostName the operator-visible host label, when discovery supplied one.
      */
+    @Synchronized
     fun handlePairingStart(start: PairingStart, hostName: String): SessionState {
         return try {
-            if (pendingConfirmation != null) {
+            if (pendingConfirmation != null || pendingAcknowledgement != null) {
                 // Refuse the newcomer without disturbing the confirmation already on
                 // screen; fail() would replace the operator's pending decision.
                 return _state.value
@@ -582,6 +594,7 @@ class AuthenticatorSession(
      * the operator to type the code shown on the host; host-entry mode shows
      * this device's code and still requires an explicit Allow.
      */
+    @Synchronized
     fun handlePairingResult(
         result: PairingResult,
         pinnedCertificate: X509Certificate?,
@@ -612,10 +625,8 @@ class AuthenticatorSession(
                     return fail("this host is already paired with a different key")
                 }
             }
-            // The host has processed any cleanup tokens carried by this pairing
-            // submit before it committed the new record.
-            pendingRevocations.clear(pairing.hostId)
             val pending = ConfirmedPairing(
+                sessionId = result.sessionId,
                 host = KnownHost(
                     hostId = pairing.hostId,
                     keyId = Hex.encode(sha256(pairing.hostPublicKey)),
@@ -632,9 +643,12 @@ class AuthenticatorSession(
             confirmationTimeout?.cancel()
             confirmationTimeout = scope.launch {
                 delay(PAIRING_CONFIRMATION_TIMEOUT_MS)
-                if (pendingConfirmation === pending) {
-                    pendingConfirmation = null
-                    fail("pairing confirmation timed out")
+                synchronized(this@AuthenticatorSession) {
+                    if (pendingConfirmation === pending) {
+                        pendingConfirmation = null
+                        fail("pairing confirmation timed out")
+                        pairingSettledListener?.invoke()
+                    }
                 }
             }
             val state = when (pairing.codeEntry) {
@@ -661,7 +675,9 @@ class AuthenticatorSession(
      *
      * This is the only place a pairing becomes persistent.
      */
+    @Synchronized
     fun confirmPairing(enteredCode: String? = null): Boolean {
+        if (pendingAcknowledgement != null) return false
         val pending = pendingConfirmation ?: run {
             fail("no pairing is awaiting confirmation")
             return false
@@ -684,22 +700,61 @@ class AuthenticatorSession(
         pendingConfirmation = null
         confirmationTimeout?.cancel()
         confirmationTimeout = null
-        addKnownHost(pending.host)
-        val state = SessionState.PairingConfirmed(pending.hostName)
-        _state.value = state
-        // Drop the unpinned bootstrap connection so the next one is TLS-pinned.
+        val sink = transportSink
+        if (sink == null || !runCatching { hosts.putDurably(pending.host) }.getOrDefault(false)) {
+            fail("pairing could not be stored or the connection was lost")
+            pairingSettledListener?.invoke()
+            return false
+        }
+        // The locally trusted record is durable even if the final receipt is
+        // lost. Publish it so subsequent connections always use its pin.
+        _hosts.value = hosts.all()
+        pendingAcknowledgement = pending
+        _state.value = SessionState.PairingFinalizing(pending.hostName)
+        val frame = Message.PairingConfirmedMessage(PairingConfirmed(pending.sessionId)).toFrame()
+        if (!sink(frame)) {
+            pendingAcknowledgement = null
+            fail("pairing acknowledgement could not be queued; pair again")
+            pairingSettledListener?.invoke()
+            return false
+        }
+        confirmationTimeout = scope.launch {
+            delay(PAIRING_CONFIRMATION_TIMEOUT_MS)
+            synchronized(this@AuthenticatorSession) {
+                if (pendingAcknowledgement === pending) {
+                    pendingAcknowledgement = null
+                    fail("host did not confirm pairing; pair again")
+                    pairingSettledListener?.invoke()
+                }
+            }
+        }
+        return true
+    }
+
+    /** Accept the receipt only on the original link and for the pending session. */
+    @Synchronized
+    fun handlePairingReceipt(sessionId: Id): Boolean {
+        val pending = pendingAcknowledgement ?: return false
+        if (pending.sessionId != sessionId) return false
+        pendingAcknowledgement = null
+        confirmationTimeout?.cancel()
+        confirmationTimeout = null
+        pendingRevocations.clear(pending.host.hostId)
+        _hosts.value = hosts.all()
+        _state.value = SessionState.PairingConfirmed(pending.hostName)
         pairingSettledListener?.invoke()
         return true
     }
 
     /** The operator rejected the pairing, or closed the confirmation. */
+    @Synchronized
     fun rejectPairing(): SessionState {
+        if (pendingAcknowledgement != null) return _state.value
         pendingConfirmation = null
         pendingPairing = null
         confirmationTimeout?.cancel()
         confirmationTimeout = null
-        // Close the pairing link; the host may have persisted its side, but this
-        // device is not going to trust it.
+        // Close the pairing link; the host will discard the staged enrollment.
         pairingSettledListener?.invoke()
         return fail("pairing was not confirmed")
     }

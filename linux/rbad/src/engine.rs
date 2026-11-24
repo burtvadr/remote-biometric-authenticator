@@ -163,6 +163,8 @@ struct ActivePairing {
     code_entry: CodeEntry,
     /// Code both sides derived, available once the device has submitted.
     derived: Option<String>,
+    /// Challenge-response code (32 hex chars, per-session, replay-resistant).
+    challenge_response: Option<String>,
     phase: PairingPhase,
     /// Flipped by the host-side human gate, not by the final device acknowledgement.
     confirmed: Arc<AtomicBool>,
@@ -567,6 +569,7 @@ impl Engine {
                 chosen: chosen.clone(),
                 code_entry,
                 derived: None,
+                challenge_response: None,
                 phase: PairingPhase::AwaitingDevice,
                 confirmed: Arc::new(AtomicBool::new(false)),
                 notify: Arc::new(Notify::new()),
@@ -602,15 +605,17 @@ impl Engine {
     /// is the code derived from the transcript-bound ECDH secret. In
     /// [`CodeEntry::Host`] mode the host
     /// must not display this value: the device displays it. The caller decides
-    /// whether showing it is safe based on [`Engine::pairing_code_entry`].
+    /// Challenge-response pairing code.
+    ///
+    /// The code is a 32-character hex string derived from a per-session challenge
+    /// and the ECDH shared secret. The user enters this code to complete pairing.
+    /// Works for both command-line entry (ADB-style) and QR code display.
+    ///
+    /// The code is bound to the session and cannot be reused (replay resistance).
     pub fn pairing_code(&self) -> Option<(String, u64)> {
         self.pairing.lock().ok().and_then(|g| {
             g.as_ref().map(|a| {
-                let code = a
-                    .derived
-                    .clone()
-                    .or_else(|| a.chosen.clone())
-                    .unwrap_or_default();
+                let code = a.challenge_response.clone().unwrap_or_default();
                 (code, a.expires_at)
             })
         })

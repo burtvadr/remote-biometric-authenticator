@@ -125,23 +125,27 @@ where
         //    task runs *alongside* the read loop below rather than instead of it:
         //    it needs the device's `PAIRING_SUBMIT` to be read and delivered while
         //    it waits.
-        let pairing_mode = self.engine.pairing_active();
+        let pairing_session = self.engine.claim_pairing_connection();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Frame>();
-        if pairing_mode {
+        let mut pairing_task = None;
+        let mut submit_sender = None;
+        if let Some(sid) = pairing_session {
             self.engine
                 .audit()
                 .write(&crate::audit::Event::new("pairing_connection"));
             let engine = self.engine.clone();
-            let sid = session_id;
             let tx_for_pairing = tx.clone();
-            tokio::spawn(async move {
-                let outcome = engine.drive_pairing(&tx_for_pairing, pairing_timeout).await;
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            submit_sender = Some(sender);
+            pairing_task = Some(tokio::spawn(async move {
+                let outcome = engine.drive_pairing(sid, &tx_for_pairing, receiver, pairing_timeout).await;
                 match outcome {
                     Ok(result) => {
                         let msg = Message::PairingResult(result);
                         let _ = tx_for_pairing.send(msg.to_frame());
                     }
                     Err(e) => {
+                        engine.cancel_pairing_attempt(&sid);
                         let ev = crate::audit::Event::new("pairing_failed")
                             .denied(e.code().as_str())
                             .detail(e.to_string());
@@ -158,7 +162,7 @@ where
                         let _ = tx_for_pairing.send(err.to_frame());
                     }
                 }
-            });
+            }));
         } else {
             let handle = match self
                 .engine
@@ -183,15 +187,15 @@ where
                 frame = outbound.recv() => {
                     match frame {
                         Some(f) => {
-                            if self.send(&f).await.is_err() {
-                                break;
-                            }
-                            if pairing_mode {
+                            if pairing_session.is_some() {
                                 if let Ok(Message::PairingResult(result)) = Message::from_frame(&f) {
                                     if result.status == 0 {
                                         sent_pairing_result = Some(result.session_id);
                                     }
                                 }
+                            }
+                            if self.send(&f).await.is_err() {
+                                break;
                             }
                         }
                         None => {
@@ -210,13 +214,25 @@ where
                                 // A pairing submission is routed without needing a
                                 // registered device identity.
                                 Ok(Message::PairingSubmit(submit)) => {
-                                    self.engine.deliver_pairing(submit);
+                                    if pairing_session != Some(submit.session_id)
+                                        || submit.device_id != ack.device_id
+                                        || submit.device_key_id != ack.device_key_id
+                                    {
+                                        self.send_error(&ProtocolError::ContextMismatch("pairing submission does not match this connection".into()), None).await;
+                                        break;
+                                    }
+                                    if let Some(sender) = submit_sender.take() {
+                                        if sender.send(submit).is_err() { break; }
+                                    } else {
+                                        self.send_error(&ProtocolError::NotPaired, None).await;
+                                        break;
+                                    }
                                 }
                                 // The device persists its record after receiving
                                 // PAIRING_RESULT, then sends this acknowledgement.
                                 // It is bound to the session that just completed.
                                 Ok(Message::PairingConfirmed(confirm)) => {
-                                    if sent_pairing_result.take() != Some(confirm.session_id) {
+                                    if sent_pairing_result != Some(confirm.session_id) {
                                         self.send_error(&ProtocolError::ContextMismatch(
                                             "pairing acknowledgement does not match this connection".into(),
                                         ), None).await;
@@ -228,6 +244,10 @@ where
                                                 &crate::audit::Event::new("pairing_acknowledged")
                                                     .success(),
                                             );
+                                            // The device waits for this receipt, not merely
+                                            // a successful write to its socket.
+                                            let _ = self.send(&Message::PairingConfirmed(confirm).to_frame()).await;
+                                            break;
                                         }
                                         Err(e) => {
                                             let ev = crate::audit::Event::new("pairing_rejected")
@@ -276,6 +296,13 @@ where
             }
         }
 
+        if let Some(task) = pairing_task {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(id) = pairing_session {
+            self.engine.cancel_pairing_attempt(&id);
+        }
         if let (Some(d), Some(c)) = (self.device_id, self.conn_id) {
             self.engine.disconnect_device(&d, c);
         }

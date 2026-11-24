@@ -295,11 +295,12 @@ class HostLink(
                         transport.send(frame)
                     } catch (e: IOException) {
                         Log.i(TAG, "write failed: ${e.message}")
+                        transport.close()
                         break
                     }
                 }
             }
-            session.attachTransport { frame -> outbound.trySend(frame) }
+            session.attachTransport { frame -> outbound.trySend(frame).isSuccess }
             attached = true
             session.setConnectedHost(hello.hostId)
 
@@ -333,9 +334,8 @@ class HostLink(
                         }
                         val outcome = session.handlePairingResult(message.v, certificate)
                         when (outcome) {
-                            // Keep the bootstrap socket open while the operator
-                            // finishes the code/approval gate. The session's settled
-                            // listener closes it, which forces the pinned reconnect.
+                            // Keep this socket open through the human gate and
+                            // host receipt; only then reconnect with the pin.
                             is SessionState.PairingAwaitingConfirmation,
                             is SessionState.PairingAwaitingApproval,
                             -> {
@@ -352,6 +352,12 @@ class HostLink(
                         }
                     }
 
+                    is Message.PairingConfirmedMessage -> {
+                        if (!pairingParked || !session.handlePairingReceipt(message.v.sessionId)) break
+                        served = true
+                        break
+                    }
+
                     is Message.AuthRequestMessage -> {
                         if (message.v.hostId != hello.hostId) {
                             // The request must carry the identity that opened this
@@ -364,7 +370,7 @@ class HostLink(
                         // the link was opened: a host can become paired (or start
                         // pairing) while this very connection is alive.
                         val knownNow = session.knownHosts().any { it.hostId == hello.hostId }
-                        if (!pinnedLink && (pairingParked || knownNow)) {
+                        if (pairingParked || (!pinnedLink && knownNow)) {
                             // An unpinned link to a host this device already trusts
                             // could be a relay. Fail closed and let the pinned
                             // attempt win.

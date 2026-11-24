@@ -173,6 +173,7 @@ class MainActivity : androidx.fragment.app.FragmentActivity() {
                 cancelAutoClose()
                 dropPromptReference()
             }
+            is SessionState.PairingFinalizing,
             is SessionState.PairingAwaitingCode -> {
                 cancelAutoClose()
                 dropPromptReference()

@@ -312,14 +312,10 @@ async fn dispatch(
         }
 
         ControlRequest::CancelPairing => {
-            if engine.pairing_active() && peer.uid != 0 && !engine.pairing_opened_by(&peer_key) {
-                return ControlResponse::err(
-                    "PERMISSION_DENIED",
-                    "this pairing session was opened by another user",
-                );
+            match engine.cancel_pairing_for(&peer_key, peer.uid == 0) {
+                Ok(()) => ControlResponse::ok(serde_json::json!({ "cancelled": true })),
+                Err(e) => ControlResponse::from_protocol_error(&e),
             }
-            engine.cancel_pairing();
-            ControlResponse::ok(serde_json::json!({ "cancelled": true }))
         }
 
         ControlRequest::Authenticate {

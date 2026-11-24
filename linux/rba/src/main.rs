@@ -434,7 +434,12 @@ fn cmd_pair(args: &Args) {
     eprintln!("Waiting for device... ({remaining}s)");
 
     // Wait until the device has submitted and both sides can derive the code.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(remaining.max(0) as u64);
     let code = loop {
+        if std::time::Instant::now() >= deadline {
+            eprintln!("rba: pairing timed out");
+            std::process::exit(1);
+        }
         let st = match request(args, &ControlRequest::PairingCode) {
             Ok(r) if r.ok => r,
             Ok(r) => fail(&r),
@@ -443,6 +448,10 @@ fn cmd_pair(args: &Args) {
                 std::process::exit(1)
             }
         };
+        if st.result.as_ref().and_then(|r| r.get("active")).and_then(|v| v.as_bool()) == Some(false) {
+            eprintln!("rba: pairing expired or cancelled");
+            std::process::exit(1);
+        }
         let phase = st
             .result
             .as_ref()
@@ -475,23 +484,19 @@ fn cmd_pair(args: &Args) {
         CodeEntry::Host => {
             // The device shows the code; the host operator types it, like
             // `adb pair`.
-            let entered = loop {
-                print!("Enter pairing code: ");
-                let _ = std::io::stdout().flush();
-                let mut answer = String::new();
-                match std::io::stdin().read_line(&mut answer) {
-                    Ok(0) | Err(_) => {
-                        eprintln!("\nrba: no code read; pairing cancelled");
-                        std::process::exit(1);
-                    }
-                    Ok(_) => {}
+            print!("Enter pairing code: ");
+            let _ = std::io::stdout().flush();
+            let mut answer = String::new();
+            match std::io::stdin().read_line(&mut answer) {
+                Ok(0) | Err(_) => {
+                    let _ = request(args, &ControlRequest::CancelPairing);
+                    eprintln!("\nrba: no code read; pairing cancelled");
+                    std::process::exit(1);
                 }
-                let entered: String = answer.chars().filter(|c| c.is_ascii_digit()).collect();
-                if entered == code {
-                    break entered;
-                }
-                println!("Code mismatch; try again.");
-            };
+                Ok(_) => {}
+            }
+            // The daemon, not the CLI, consumes the single allowed comparison.
+            let entered = answer.trim().to_owned();
             Some(entered)
         }
     };
@@ -509,7 +514,6 @@ fn cmd_pair(args: &Args) {
     // Wait for the daemon to finish the host side and the device to confirm.
     // The device sends PAIRING_CONFIRMED after it persists its record; only then
     // is the pairing fully complete and safe to claim as "Paired".
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     let confirmed = loop {
         if std::time::Instant::now() >= deadline { break false; }
         match request(args, &ControlRequest::PairingConfirmed) {

@@ -26,7 +26,7 @@ use rba_protocol::cbor;
 use rba_protocol::crypto::{self, PrivateKey};
 use rba_protocol::frame::{Frame, HEADER_LEN, MAGIC};
 use rba_protocol::messages::Message;
-use rba_protocol::pairing::{PairingResult, PairingSession, PairingStart, PairingSubmit};
+use rba_protocol::pairing::{PairingConfirmed, PairingResult, PairingSession, PairingStart, PairingSubmit};
 use rba_protocol::types::{
     AuthReject, AuthRequest, AuthResponse, Challenge, ErrorMsg, Id, SessionHello, SessionHelloAck,
     AUTH_REQUEST_TTL_DEFAULT,
@@ -534,6 +534,13 @@ fn main() {
                 })
                 .to_payload()
             ),
+        }),
+        json!({
+            "name": "pairing_confirmed",
+            "msg_type": 4,
+            "payload_hex": hexs(&Message::PairingConfirmed(PairingConfirmed {
+                session_id: det_id(0x99),
+            }).to_payload()),
         }),
     ];
     write_json(
