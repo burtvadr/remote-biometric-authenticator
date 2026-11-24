@@ -212,6 +212,14 @@ Kotlin `PairingSession.code()` mirrors it; vectors were regenerated.
 
 ### SEC-003 — Broad `common-auth` deployment creates an MFA-fatigue surface
 
+**Proposed partial remediation:** Add transport-independent sliding-window prompt
+budgets of three admitted attempts per 60 seconds for each authorized account
+and each registered device. Reject over-budget attempts before challenge dispatch;
+rejected attempts do not extend the cooldown. The additional budgets are currently
+in-memory. Number matching, restart persistence, transaction context and runtime
+regression verification remain open. SEC-003 must not be closed on this change alone.
+
+
 **Severity:** High  
 **Status:** Confirmed  
 **Source:** external review, 2026-11-18  
@@ -843,4 +851,8 @@ frontend uses; do not weaken its peer checks while addressing SEC-006.
 
 **Severity:** High. **Status:** Open; implementation candidate, runtime verification pending.
 
-The pure evaluator checks account binding, explicit root opt-in and exact operation scope. The engine filters devices before prompting and rechecks policy and key identity before success. Root-only scope management is exposed through the local control API. Existing credentials remain registered but non-basic operations require explicit grants. See `AUTHORIZATION_MODEL.md` for migration and outstanding identity/context, delegated-login and testing requirements. SEC-003 is preserved; PAKE and remote attestation are unchanged.
+The current candidate replaces separate account, root and operation fields with explicit principal/scope grants. Empty policies deny all operations; confirmed enrollment stores one explicit basic grant. Administrative changes require the exact principal and scope. The existing engine checks current grants and credential identity before prompting and before returning success. No legacy policy loader or automatic migration is provided. See `AUTHORIZATION_MODEL.md` for the breaking change and remaining identity, context, lifecycle and runtime verification requirements. SEC-003 is preserved; PAKE and remote attestation are unchanged.
+
+Repair candidate for snapshot `b23cafaf`: restore typed registry lifecycle, key validation, explicit principal/scope administration and SEC-003 prompt budgets removed by the incomplete rewrite. Keep the ordered grant set (all contained types derive `Ord`). Compilation, formatting, Clippy and runtime verification are still required.
+
+The repaired host confirmation query now reads the acknowledgement flag, checks that the acknowledgement matches the result sent on the same connection, and bounds the final CLI polling loop. The uploaded Android client does not yet implement wire `PAIRING_CONFIRMED`; its human-confirmation UI state is not a wire acknowledgement. Phone pairing end-to-end remains unverified and must be addressed before release.

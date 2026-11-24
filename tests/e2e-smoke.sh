@@ -36,7 +36,7 @@ step "no authenticators paired yet"
 "$CTL" $CTL_SOCK devices | grep -q "List of authenticators paired" || fail "expected an empty list"
 
 step "pair"
-"$CTL" $CTL_SOCK pair >"$WORK/pair.log" 2>&1 &
+"$CTL" $CTL_SOCK pair --owner "$(id -un)" >"$WORK/pair.log" 2>&1 &
 PAIR_PID=$!
 sleep 1
 timeout 60 "$SIM" pair --host "127.0.0.1:$PORT" --name "Pixel 9" \
@@ -48,6 +48,8 @@ PAIR_RC=$?
 echo "--- simulator (rc=$SIM_RC) ---"; cat "$WORK/sim-pair.log"
 echo "--- rba pair (rc=$PAIR_RC) ---"; cat "$WORK/pair.log"
 [ "$SIM_RC" -eq 0 ] || fail "simulator pairing failed"
+[ "$PAIR_RC" -eq 0 ] || fail "host pairing did not complete"
+grep -q "^Paired" "$WORK/pair.log" || fail "missing host pairing acknowledgement"
 grep -q "Compare this code" "$WORK/sim-pair.log" || fail "no code was displayed"
 grep -qi "confirm" "$WORK/pair.log" || true
 
@@ -62,7 +64,7 @@ step "hold a connection open and authenticate"
 SIM_SERVE_PID=$!
 sleep 1.5
 USER_NAME="$(id -un)"
-"$CTL" $CTL_SOCK auth --user "$USER_NAME" --purpose sudo --service sudo \
+"$CTL" $CTL_SOCK auth --user "$USER_NAME" \
         --timeout 30000 >"$WORK/auth.log" 2>&1
 AUTH_RC=$?
 kill "$SIM_SERVE_PID" 2>/dev/null
@@ -77,7 +79,7 @@ step "a second authentication must fail: replay of the same challenge is impossi
     --ca "$WORK/state/host.crt" --timeout 30 --behaviour stall >"$WORK/sim-stall.log" 2>&1 &
 STALL_PID=$!
 sleep 1.5
-timeout 20 "$CTL" $CTL_SOCK auth --user "$USER_NAME" --purpose sudo --timeout 2500 \
+timeout 20 "$CTL" $CTL_SOCK auth --user "$USER_NAME" --timeout 2500 \
     >"$WORK/auth-timeout.log" 2>&1
 TIMEOUT_RC=$?
 kill "$STALL_PID" 2>/dev/null

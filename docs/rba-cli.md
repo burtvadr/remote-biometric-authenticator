@@ -38,7 +38,7 @@ rba status
 rba devices [<device>] [-l|--long]
 rba devices rename <device> <name>
 rba pair [--transport wifi|adb] [--code-entry device|host] [--owner USER]
-         [--allow-root] [--timeout SECONDS]
+         [--timeout SECONDS]
 rba connect [<device>] [--transport wifi|adb]
 rba disconnect [<device>]
 rba unpair <device> [--yes]
@@ -180,11 +180,7 @@ Paired.
   leaves no trusted pairing behind.
 - `--transport adb` uses ADB only as a pipe. ADB's own pairing code is never used
   as the rba trust code.
-- The device is bound to the account that pairs it. `--owner` defaults to the
-  invoking user; a normal user may only name themselves. Root must pass
-  `--owner USER` explicitly, and `--allow-root` is a separate opt-in that lets the
-  device authenticate `root`. Without it, root is denied. No group membership or
-  re-login is needed to run any of this.
+- Confirmed pairing stores an explicit `authenticate/rba/authenticate` grant for the chosen account. An ordinary user may pair only for themselves; an administrator must specify `--owner USER`. Other operations require explicit principal-specific grants.
 
 ## Authentication
 
@@ -204,12 +200,7 @@ not unlock the screen and does not authorize `sudo`.
 - Default user is the current user.
 - A normal user may only request their own account. Root may request another
   account; the daemon enforces this, not the CLI.
-- Independently, the selected device must be bound to the requested account.
-  A device paired for alice is refused for bob or root even when root is the
-  caller; root needs a device paired with `--allow-root`.
-- Default purpose is `cli`, so direct CLI use is distinguishable from PAM's
-  `sudo`, `gdm` or `polkit` requests. `--purpose` exists for integration tests and
-  advanced use.
+- Independently, the selected credential must have the exact principal and scope grant. There is no implicit root authorization. The default scope is `authenticate/rba/authenticate`.
 - `--quiet` suppresses "Waiting" but still prints the result.
 - Exit codes distinguish denial, timeout and no-device; scripts should not parse
   the human text.
@@ -269,35 +260,7 @@ These are different things and must not share a command:
 | Device ownership, account scope, allowed purposes, root, delegation | `rba policy` | Administrator |
 | Preferred device, output format, color, default timeout | `rba config` | The local user |
 
-The policy model is the SEC-004 model:
-
-- owner is `{uid, name}`;
-- default scope is `self`;
-- `all` excludes UID 0;
-- `allow_root` is a separate, explicit switch;
-- operations are canonical, not raw IPC strings;
-- delegation is default-deny and belongs to the target account's policy;
-- a device capability can only narrow what the host already allows.
-
-Example:
-
-```bash
-sudo rba -s pixel-8 policy set \
-  --owner desktop \
-  --accounts self \
-  --allow login,unlock,cli \
-  --deny sudo,polkit
-```
-
-This is deliberately a verb, not a global `--disable-sudo` flag. A one-off
-negative flag hides a policy mutation, is hard to compose, and invites a
-non-admin path. `rba -s ID policy deny sudo` is short enough and auditable.
-
-`policy allow` can only add a purpose that the host policy already permits; it
-cannot create a new privilege. `policy deny` always narrows. Both are admin-only.
-
-`rba policy` is admin-only. The daemon checks the caller's UID; the CLI does not
-try to elevate itself.
+The implemented SEC-025 policy is a set of exact principal/scope grants. `grant-scope` and `remove-scope` require administrator authority, an explicit `--device`, `--user`, and the requested `--purpose`, `--service`, `--operation` (scope defaults match basic CLI authentication). These commands cannot confer operating-system privileges. See [AUTHORIZATION_MODEL.md](AUTHORIZATION_MODEL.md). The previous independent account and root fields are obsolete; fresh enrollment is required.
 
 ## Output and exit codes
 

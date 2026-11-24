@@ -477,9 +477,22 @@ async fn a_device_replaying_its_own_response_yields_at_most_one_success() {
 #[tokio::test]
 async fn every_request_uses_a_fresh_challenge_and_request_id() {
     let f = Fixture::paired("freshness").await;
-    let results = authenticate_repeatedly(&f, Behaviour::Approve, 4, 5000).await;
+    // Authenticate 4 times with 20s spacing to stay outside the 3-per-60s rate limit,
+    // allowing all 4 to succeed for freshness verification.
     let mut seen = std::collections::HashSet::new();
-    for r in results {
+    for _ in 0..4 {
+        let ctx = AuthContext {
+            local_uid: 0,
+            username: "alice",
+            purpose: "rba",
+            service: "rba",
+            operation: "authenticate",
+            device_selector: None,
+            timeout_ms: 10000,
+        };
+        let future = f.engine.authenticate(ctx);
+        let _ = tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
+        let r = tokio::time::timeout(TEST_TIMEOUT, future).await;
         let out = r.expect("every approval authenticates");
         assert!(seen.insert(out.request_id), "request ids must never repeat");
     }

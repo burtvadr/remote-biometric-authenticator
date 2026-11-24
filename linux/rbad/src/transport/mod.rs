@@ -176,6 +176,7 @@ where
 
         // 4. Serve until the peer disconnects or a protocol error occurs.
         let mut outbound = rx;
+        let mut sent_pairing_result: Option<Id> = None;
         loop {
             tokio::select! {
                 biased;
@@ -184,6 +185,13 @@ where
                         Some(f) => {
                             if self.send(&f).await.is_err() {
                                 break;
+                            }
+                            if pairing_mode {
+                                if let Ok(Message::PairingResult(result)) = Message::from_frame(&f) {
+                                    if result.status == 0 {
+                                        sent_pairing_result = Some(result.session_id);
+                                    }
+                                }
                             }
                         }
                         None => {
@@ -208,10 +216,12 @@ where
                                 // PAIRING_RESULT, then sends this acknowledgement.
                                 // It is bound to the session that just completed.
                                 Ok(Message::PairingConfirmed(confirm)) => {
-                                    eprintln!(
-                                        "rbad: pairing ack received for {}",
-                                        confirm.session_id.short()
-                                    );
+                                    if sent_pairing_result.take() != Some(confirm.session_id) {
+                                        self.send_error(&ProtocolError::ContextMismatch(
+                                            "pairing acknowledgement does not match this connection".into(),
+                                        ), None).await;
+                                        break;
+                                    }
                                     match self.engine.acknowledge_pairing(&confirm.session_id) {
                                         Ok(()) => {
                                             self.engine.audit().write(

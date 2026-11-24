@@ -103,9 +103,9 @@ pub const CLOCK_SKEW_STRICT: u64 = 10;
 pub const PAIRING_CODE_DIGITS: usize = 6;
 pub const RATE_PAIRING: u32 = 5;
 pub const RATE_PAIRING_WINDOW: u64 = 300;
-pub const RATE_AUTH: u32 = 5;
+pub const RATE_AUTH: u32 = 30;
 pub const RATE_AUTH_WINDOW: u64 = 60;
-pub const RATE_BLE_AUTH: u32 = 3;
+pub const RATE_BLE_AUTH: u32 = 15;
 pub const RATE_BLE_AUTH_WINDOW: u64 = 120;
 
 /// Which freshness window applies. BLE is slower, so it is given a tighter

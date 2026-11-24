@@ -212,7 +212,6 @@ async fn dispatch(
             code_entry,
             timeout_ms: _,
             owner,
-            allow_root,
         } => {
             let mode = match code_entry.as_deref() {
                 None | Some("device") => CodeEntry::Device,
@@ -225,19 +224,13 @@ async fn dispatch(
             };
             // The device is bound to the local principal that opened pairing.
             // Root must name an existing account explicitly; it is never an
-            // implicit owner, and root authentication needs a second opt-in.
+            // implicit owner, and choosing that account explicitly grants basic authentication only.
             let owner = match (viewer.as_deref(), owner) {
                 (None, Some(owner)) if !owner.is_empty() => {
                     if !ipc::user_exists(&owner) {
                         return ControlResponse::err(
                             "BAD_REQUEST",
                             format!("no such local user: {owner}"),
-                        );
-                    }
-                    if owner == "root" && !allow_root {
-                        return ControlResponse::err(
-                            "BAD_REQUEST",
-                            "refusing to bind a device to root without --allow-root",
                         );
                     }
                     owner
@@ -259,13 +252,7 @@ async fn dispatch(
                 }
                 (Some(me), None) => me.to_owned(),
             };
-            if allow_root && viewer.is_some() {
-                return ControlResponse::err(
-                    "CONTEXT_MISMATCH",
-                    "only root may allow a device to authenticate root",
-                );
-            }
-            match engine.begin_pairing_with_mode(code, mode, owner, allow_root, peer_key) {
+            match engine.begin_pairing_with_mode(code, mode, owner, peer_key) {
                 Ok((chosen, expires_at)) => ControlResponse::ok(serde_json::json!({
                     "chosen_code": chosen,
                     "expires_at": expires_at,
@@ -377,7 +364,7 @@ async fn dispatch(
             }
         }
 
-        ControlRequest::SetScope { device, purpose, service, operation, grant } => {
+        ControlRequest::SetScope { device, user, purpose, service, operation, grant } => {
             if peer.uid != 0 {
                 return ControlResponse::err("PERMISSION_DENIED", "only root may change scope grants");
             }
@@ -385,7 +372,10 @@ async fn dispatch(
                 Ok(scope) => scope,
                 Err(_) => return ControlResponse::err("BAD_REQUEST", "invalid scope"),
             };
-            match engine.set_device_scope(&device, scope, grant) {
+            if grant && !ipc::user_exists(&user) {
+                return ControlResponse::err("BAD_REQUEST", "grant requires a canonical local account");
+            }
+            match engine.set_device_scope(&device, crate::authz::Grant::new(&user, scope), grant) {
                 Ok(()) => ControlResponse::ok(serde_json::json!({ "updated": true })),
                 Err(e) => ControlResponse::from_protocol_error(&e),
             }
@@ -405,15 +395,8 @@ async fn dispatch(
         }
 
         ControlRequest::Unpair { device } => {
-            // The owner may unpair their own device; root may unpair any.
-            let viewer = ipc::viewer_name(peer).ok().flatten();
-            if !engine.may_unpair(&device, viewer.as_deref()) {
-                return ControlResponse::err(
-                    "PERMISSION_DENIED",
-                    "only the device owner or root may unpair it",
-                );
-            }
-            match engine.unpair_device(&device) {
+            // Shared credentials can only be removed by an administrator.
+            match engine.unpair_device(&device, viewer.as_deref()) {
                 Ok(name) => ControlResponse::ok(serde_json::json!({ "unpaired": name })),
                 Err(e) => ControlResponse::from_protocol_error(&e),
             }

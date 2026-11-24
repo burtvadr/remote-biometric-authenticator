@@ -124,13 +124,14 @@ start_daemon() {
 }
 
 pair_device() {
-    asuser "$BIN/rba" --socket "$SOCKET" pair --yes --timeout 45000 >"$WORK/pair.log" 2>&1 &
+    asuser "$BIN/rba" --socket "$SOCKET" pair --timeout 45000 >"$WORK/pair.log" 2>&1 &
     local p=$!
     sleep 1
     asuser timeout 45 "$BIN/rba-sim" pair --host "127.0.0.1:$PORT" --name "Pixel 9" \
         --daemon "$BIN/rbad" --daemon-arg --state-dir --daemon-arg "$WORK/state" \
         >"$WORK/sim-pair.log" 2>&1
-    wait "$p"
+    wait "$p" || return 1
+    "$BIN/rba" --socket "$SOCKET" grant-scope --device "Pixel 9" --user "$ME" --purpose sudo --service sudo
 }
 
 serve() {

@@ -6,7 +6,7 @@
 //! adapters deliver [`Message`]s to it and it sends [`Frame`]s back, which is
 //! what keeps the two transports security-identical.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -27,8 +27,7 @@ use rba_protocol::verifier;
 use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::audit::{AuditLog, Event};
-use crate::registry::{DevicePolicy, DeviceStatus, HostIdentity, Registry, public_key_key_id_hex};
-use crate::authz;
+use crate::registry::{DevicePolicy, DeviceStatus, HostIdentity, Registry};
 
 /// A currently connected device.
 #[derive(Clone, Debug)]
@@ -91,6 +90,36 @@ impl AuthOutcome {
     }
 }
 
+/// Shared prompt budgets, independent of transport and requested service.
+/// Only admitted attempts consume these budgets; rejected requests do not
+/// prolong the cooldown or grow the timestamp queues.
+struct PromptBudget {
+    accounts: RateLimiter,
+    devices: RateLimiter,
+}
+
+impl PromptBudget {
+    fn new() -> Self {
+        Self {
+            accounts: RateLimiter::new(Limit::new(3, 60)),
+            devices: RateLimiter::new(Limit::new(3, 60)),
+        }
+    }
+
+    fn admit(&mut self, account: &str, device: &str, now: u64) -> Result<()> {
+        self.accounts.prune(now);
+        self.devices.prune(now);
+        if !self.accounts.peek(account, now) || !self.devices.peek(device, now) {
+            let retry = self.accounts.retry_after(account, now)
+                .max(self.devices.retry_after(device, now));
+            return Err(ProtocolError::RateLimited(retry));
+        }
+        self.accounts.check_and_record(account, now);
+        self.devices.check_and_record(device, now);
+        Ok(())
+    }
+}
+
 pub struct Engine {
     pub host: HostIdentity,
     pub registry: Mutex<Registry>,
@@ -101,13 +130,12 @@ pub struct Engine {
     pending_auth: Mutex<HashMap<Id, oneshot::Sender<Message>>>,
     pending_pairing: Mutex<Option<oneshot::Sender<PairingSubmit>>>,
     pairing: Mutex<Option<ActivePairing>>,
-    /// The most recent host-side pairing completion, retained after the active
-    /// session is consumed so the device's final acknowledgement can be observed.
     last_pairing: Mutex<Option<CompletedPairing>>,
     rate_pairing: Mutex<RateLimiter>,
     /// One limiter per transport, because the limits differ (§11). Keyed by
     /// `Transport` so a request cannot dodge the limit by switching transport.
     rate_auth: Mutex<HashMap<Transport, RateLimiter>>,
+    prompt_budget: Mutex<PromptBudget>,
     /// Optional path for persistent rate-limit state.
     rate_limit_path: Option<std::path::PathBuf>,
     /// Advertised host label, shown on the device.
@@ -136,9 +164,7 @@ struct ActivePairing {
     /// Code both sides derived, available once the device has submitted.
     derived: Option<String>,
     phase: PairingPhase,
-    /// Flipped by `confirm_pairing` when the operator passes the human gate;
-    /// observed by the waiting connection task. This is not the device's final
-    /// acknowledgement, which arrives later as `PAIRING_CONFIRMED`.
+    /// Flipped by the host-side human gate, not by the final device acknowledgement.
     confirmed: Arc<AtomicBool>,
     notify: Arc<Notify>,
     started_at: u64,
@@ -147,12 +173,8 @@ struct ActivePairing {
     peer_key: String,
     /// Linux account the new device will be bound to.
     owner: String,
-    /// Whether the operator explicitly allowed this device to authenticate root.
-    allow_root: bool,
 }
 
-/// A pairing whose host side finished and which is waiting for the device's
-/// final `PAIRING_CONFIRMED`.
 struct CompletedPairing {
     session_id: Id,
     /// The local principal that opened the session; only it may observe or
@@ -232,6 +254,7 @@ impl Engine {
             last_pairing: Mutex::new(None),
             rate_pairing: Mutex::new(rate_pairing),
             rate_auth: Mutex::new(rate_auth),
+            prompt_budget: Mutex::new(PromptBudget::new()),
             rate_limit_path,
             host_name,
         })
@@ -268,7 +291,7 @@ impl Engine {
         rba_protocol::types::SessionHello {
             protocol_version: rba_protocol::PROTOCOL_VERSION,
             host_id: self.host.host_id,
-            host_key_id: public_key_key_id_hex(&self.host.public_key),
+            host_key_id: self.host.public_key().key_id_hex(),
             host_nonce,
             session_id,
             transports: vec![
@@ -283,7 +306,7 @@ impl Engine {
         Ok(Message::SessionHello(rba_protocol::types::SessionHello {
             protocol_version: rba_protocol::PROTOCOL_VERSION,
             host_id: self.host.host_id,
-            host_key_id: public_key_key_id_hex(&self.host.public_key),
+            host_key_id: self.host.public_key().key_id_hex(),
             host_nonce,
             session_id,
             transports: vec![
@@ -485,7 +508,7 @@ impl Engine {
         owner: String,
         peer_key: String,
     ) -> Result<(Option<String>, u64)> {
-        self.begin_pairing_with_mode(code, CodeEntry::Device, owner, false, peer_key)
+        self.begin_pairing_with_mode(code, CodeEntry::Device, owner, peer_key)
     }
 
     /// Opens a pairing session with an explicit code-entry direction and owner.
@@ -494,7 +517,6 @@ impl Engine {
         code: Option<String>,
         code_entry: CodeEntry,
         owner: String,
-        allow_root: bool,
         peer_key: String,
     ) -> Result<(Option<String>, u64)> {
         let now = rba_protocol::unix_now();
@@ -506,11 +528,6 @@ impl Engine {
                     .write(&Event::new("pairing_rate_limited").denied("RATE_LIMITED"));
                 return Err(ProtocolError::RateLimited(retry));
             }
-        }
-        // A new session supersedes any previous completion; its acknowledgement
-        // must never be mistaken for this one.
-        if let Ok(mut last) = self.last_pairing.lock() {
-            *last = None;
         }
         if let Ok(mut guard) = self.pairing.lock() {
             if let Some(active) = guard.as_ref() {
@@ -544,6 +561,7 @@ impl Engine {
             };
             let ttl = rba_protocol::types::PAIRING_TTL;
             let expires_at = now + ttl;
+            *self.last_pairing.lock().map_err(|_| ProtocolError::Internal("pairing completion mutex poisoned".into()))? = None;
             *guard = Some(ActivePairing {
                 session,
                 chosen: chosen.clone(),
@@ -556,7 +574,6 @@ impl Engine {
                 expires_at,
                 peer_key,
                 owner,
-                allow_root,
             });
             self.audit.write(&Event::new("pairing_started"));
             Ok((chosen, expires_at))
@@ -692,9 +709,7 @@ impl Engine {
         if let Ok(mut g) = self.pairing.lock() {
             *g = None;
         }
-        if let Ok(mut last) = self.last_pairing.lock() {
-            *last = None;
-        }
+        if let Ok(mut last) = self.last_pairing.lock() { *last = None; }
     }
 
     /// Records the device's final `PAIRING_CONFIRMED`.
@@ -808,7 +823,7 @@ impl Engine {
             a.session.derive_with_device_ephemeral(
                 &self.host.host_id,
                 &submit.device_id,
-                &self.host.public_key,
+                &self.host.public_key(),
                 &submit.device_pubkey,
                 submit.device_nonce,
                 submit.device_eph_pubkey,
@@ -878,14 +893,13 @@ impl Engine {
         // device cannot influence it, and a different local caller cannot take
         // the session over.
         let owner = active.owner.clone();
-        let allow_root = active.allow_root;
         let peer_key = active.peer_key.clone();
         let session_id = active.session.session_id;
         let mut session = active.session;
         session.derive_with_device_ephemeral(
             &self.host.host_id,
             &submit.device_id,
-            &self.host.public_key,
+            &self.host.public_key(),
             &submit.device_pubkey,
             submit.device_nonce,
             submit.device_eph_pubkey,
@@ -906,7 +920,7 @@ impl Engine {
         let expected = session.device_mac(
             &self.host.host_id,
             &submit.device_id,
-            &self.host.public_key,
+            &self.host.public_key(),
             &submit.device_pubkey,
         )?;
         if !rba_protocol::crypto::ct_eq_slice(&submit.mac, &expected) {
@@ -918,7 +932,7 @@ impl Engine {
         let host_mac = session.host_mac(
             &self.host.host_id,
             &submit.device_id,
-            &self.host.public_key,
+            &self.host.public_key(),
             &submit.device_pubkey,
         )?;
 
@@ -944,32 +958,10 @@ impl Engine {
             }
         }
         // Only now is anything persisted.
-        // Build the initial grant set from the owner.
-        // In the pre-release phase, the owner receives basic authentication grant.
-        let owner_grant = authz::Grant {
-            principal: authz::PrincipalId::from(owner.clone()),
-            scope: authz::Scope::parse("rba", "rba", "authenticate").unwrap(),
-        };
-        let mut initial_grants = BTreeSet::new();
-        initial_grants.insert(owner_grant);
-        // If root is explicitly allowed, also grant root access
-        let policy = DevicePolicy {
-            grants: if allow_root {
-                let root_grant = authz::Grant {
-                    principal: authz::PrincipalId::from("root".to_string()),
-                    scope: authz::Scope::parse("rba", "rba", "authenticate").unwrap(),
-                };
-                let mut g = BTreeSet::new();
-                g.insert(owner_grant);
-                g.insert(root_grant);
-                g
-            } else {
-                BTreeSet::new().insert(owner_grant)
-            },
-        };
+        let policy = DevicePolicy::for_user(owner.clone());
         reg.upsert_paired_full(
             submit.device_id,
-            submit.device_name.clone(),
+            &submit.device_name,
             &submit.device_pubkey,
             now,
             Some(&revocation_token_hash),
@@ -981,16 +973,7 @@ impl Engine {
             e
         })?;
         drop(reg);
-
-        // The record is durable. Remember the completed session so the device's
-        // final acknowledgement can be matched to it and observed by `rba pair`.
-        if let Ok(mut last) = self.last_pairing.lock() {
-            *last = Some(CompletedPairing {
-                session_id,
-                peer_key,
-                acknowledged: false,
-            });
-        }
+        *self.last_pairing.lock().map_err(|_| ProtocolError::Internal("pairing completion mutex poisoned".into()))? = Some(CompletedPairing { session_id, peer_key, acknowledged: false });
 
         self.audit.write(
             &Event {
@@ -998,10 +981,7 @@ impl Engine {
                 device_id: Some(submit.device_id.to_hex()),
                 device_name: Some(submit.device_name.clone()),
                 username: Some(owner),
-                detail: Some(format!(
-                    "root={}",
-                    if allow_root { "allowed" } else { "denied" }
-                )),
+                detail: Some("explicit basic enrollment grant".into()),
                 ..Event::new("paired")
             }
             .success(),
@@ -1053,8 +1033,8 @@ impl Engine {
         let start = PairingStart {
             session_id: active.session.session_id,
             host_id: self.host.host_id,
-            host_pubkey: self.host.public_key,
-            host_key_id: public_key_key_id_hex(&self.host.public_key),
+            host_pubkey: self.host.public_key(),
+            host_key_id: self.host.public_key().key_id_hex(),
             code: code.to_owned(),
             code_entry: active.code_entry,
             expires_at: active.expires_at.max(now),
@@ -1076,7 +1056,7 @@ impl Engine {
             operation,
             device_selector,
             timeout_ms,
-            transport_pref,
+            transport_pref: _,
         } = request;
         let username = username.to_owned();
         let purpose = purpose.to_owned();
@@ -1112,28 +1092,6 @@ impl Engine {
             devs.get(&device_id).cloned()
         };
 
-        {
-            let actual_transport = handle
-                .as_ref()
-                .map(|h| h.transport)
-                .unwrap_or(transport_pref);
-            let mut map = self.rate_auth.lock().expect("rate mutex");
-            let limiter = map
-                .entry(actual_transport)
-                .or_insert_with(|| RateLimiter::for_auth_transport(actual_transport));
-            if !limiter.check_and_record(&device_id.to_hex(), now) {
-                let retry = limiter.retry_after(&device_id.to_hex(), now);
-                self.audit.write(
-                    &Event::new("auth_rate_limited")
-                        .denied("RATE_LIMITED")
-                        .device_id(device_id_hex(&device_id))
-                        .username(username)
-                        .purpose(purpose),
-                );
-                return Err(ProtocolError::RateLimited(retry));
-            }
-        }
-
         let Some(handle) = handle else {
             self.audit.write(
                 &Event::new("auth")
@@ -1145,6 +1103,35 @@ impl Engine {
             );
             return Err(ProtocolError::NotPaired);
         };
+
+        // Check the transport limit before reserving the shared prompt budgets.
+        // Keep the transport lock until both shared budgets have been admitted;
+        // a denied request must not consume any of the three budgets.
+        {
+            let mut map = self.rate_auth.lock().expect("rate mutex");
+            let limiter = map
+                .entry(handle.transport)
+                .or_insert_with(|| RateLimiter::for_auth_transport(handle.transport));
+            let key = device_id.to_hex();
+            limiter.prune(now);
+            let admission = if !limiter.peek(&key, now) {
+                Err(ProtocolError::RateLimited(limiter.retry_after(&key, now)))
+            } else {
+                self.prompt_budget.lock().expect("prompt budget mutex")
+                    .admit(&username, &key, now)
+            };
+            if let Err(e) = admission {
+                self.audit.write(
+                    &Event::new("auth_rate_limited")
+                        .denied("RATE_LIMITED")
+                        .device_id(key)
+                        .username(&username)
+                        .purpose(&purpose),
+                );
+                return Err(e);
+            }
+            limiter.check_and_record(&key, now);
+        }
 
         // Fresh identifiers for every attempt.
         let request_id = Id::random()?;
@@ -1364,7 +1351,7 @@ impl Engine {
             device_id,
             outstanding.session_id,
             rba_protocol::unix_now(),
-            transport_pref_for(transport, transport_pref),
+            transport,
         ) {
             Ok(()) => {
                 let mut reg = self.registry.lock().map_err(|_| ProtocolError::Internal("registry mutex poisoned".into()))?;
@@ -1471,20 +1458,11 @@ impl Engine {
         let reg = self.registry.lock().expect("registry mutex");
         let allowed = |rec: &crate::registry::DeviceRecord| {
             rec.status.may_authenticate()
-                && for_user.map_or(true, |user| {
-                    // In the new model, check if the device's grant policy is bound to the user
-                    let principal = authz::PrincipalId::from(user.to_string());
-                    rec.policy.is_bound_to(&principal)
-                })
                 && match (for_user, scope) {
-                    (Some(_), Some(s)) => {
-                        // Check authorization: principal must be granted this scope
-                        let principal = authz::PrincipalId::for_user.unwrap_or_else(|| authz::PrincipalId::from("unknown".to_string()));
-                        // Use the registry's evaluate method
-                        // Note: this requires the device_id; we'll handle it below
-                        true // placeholder - actual check done after device resolution
-                    }
-                    _ => true,
+                    (Some(user), Some(scope)) => rec.id().and_then(|id| reg.authorize_scope(&id, user, scope)).is_ok(),
+                    (Some(user), None) => rec.is_bound_to(user),
+                    (None, None) => true,
+                    (None, Some(_)) => false,
                 }
         };
         match selector {
@@ -1557,16 +1535,17 @@ impl Engine {
             .all()
             .into_iter()
             .filter(|rec| viewer.map_or(true, |user| rec.is_bound_to(user)))
-            .map(|rec| {
+            .map(|mut rec| {
                 let id = rec.id().unwrap_or_default();
+                if let Some(user) = viewer {
+                    rec.policy.grants.retain(|g| g.principal.as_str() == user);
+                }
                 serde_json::json!({
                     "device_id": rec.device_id,
                     "name": rec.name,
                     "key_id": rec.key_id().unwrap_or_default(),
                     "status": rec.status.as_str(),
-                    "users": rec.policy.users,
-                    "allow_root": rec.policy.allow_root,
-                    "allowed_scopes": rec.policy.allowed_scopes,
+                    "grants": rec.policy.grants,
                     "available": connected.contains(&id),
                     "added_at": rec.added_at,
                     "last_seen": rec.last_seen,
@@ -1578,10 +1557,10 @@ impl Engine {
     }
 
     /// Administrative policy mutation; IPC enforces the administrator boundary.
-    pub fn set_device_scope(&self, selector: &str, scope: crate::authz::Scope, grant: bool) -> Result<()> {
+    pub fn set_device_scope(&self, selector: &str, permission: crate::authz::Grant, grant: bool) -> Result<()> {
         let (id, _, _) = self.resolve_device(Some(selector), None)?;
-        self.registry.lock().map_err(|_| ProtocolError::Internal("registry mutex poisoned".into()))?.set_scope(&id, scope, grant)?;
-        self.audit.write(&Event::new(if grant { "scope_granted" } else { "scope_removed" }).device_id(id.to_hex()).success());
+        self.registry.lock().map_err(|_| ProtocolError::Internal("registry mutex poisoned".into()))?.set_scope(&id, permission.clone(), grant)?;
+        self.audit.write(&Event::new(if grant { "scope_granted" } else { "scope_removed" }).device_id(id.to_hex()).username(permission.principal.as_str().to_owned()).detail(format!("{}/{}/{:?}", permission.scope.purpose, permission.scope.service, permission.scope.operation)).success());
         Ok(())
     }
 
@@ -1602,39 +1581,22 @@ impl Engine {
         Ok(name)
     }
 
-    /// Unpairs a device: marks it `Replaced` (retained for audit), drops the
-    /// live connection, and audits the decision. Unlike `revoke`, the owner of
-    /// the device may do this without being root.
-    pub fn unpair_device(&self, selector: &str) -> Result<String> {
+    /// Unpair a selected credential. Shared or empty policies require an administrator.
+    pub fn unpair_device(&self, selector: &str, caller_user: Option<&str>) -> Result<String> {
         let (id, name, _) = self.resolve_device(Some(selector), None)?;
-        self.registry.lock().expect("registry mutex").unpair(&id)?;
-        self.force_disconnect_device(&id);
-        self.audit.write(
-            &Event::new("unpaired")
-                .success()
-                .device_id(device_id_hex(&id))
-                .device_name(name.clone()),
-        );
-        Ok(name)
-    }
-
-    /// Whether the caller may unpair `selector`. Root may unpair anything; a
-    /// non-root caller may only unpair a device bound to their own account.
-    pub fn may_unpair(&self, selector: &str, caller_user: Option<&str>) -> bool {
-        if caller_user.is_none() {
-            return true; // root
-        }
-        let Some(user) = caller_user else { return true };
-        let reg = self.registry.lock().expect("registry mutex");
-        if let Ok(id) = Id::from_hex(selector) {
-            if let Some(rec) = reg.get(&id) {
-                return rec.is_bound_to(user);
+        {
+            let mut reg = self.registry.lock().expect("registry mutex");
+            let rec = reg.get(&id).ok_or(ProtocolError::NotPaired)?;
+            if let Some(user) = caller_user {
+                if !rec.is_bound_to(user) || rec.policy.grants.iter().any(|g| g.principal.as_str() != user) {
+                    return Err(ProtocolError::ContextMismatch("only an administrator may unpair a shared credential".into()));
+                }
             }
+            reg.unpair(&id)?;
         }
-        // by name: any matching device bound to the caller
-        reg.by_name(selector)
-            .iter()
-            .any(|rec| rec.is_bound_to(user))
+        self.force_disconnect_device(&id);
+        self.audit.write(&Event::new("unpaired").success().device_id(device_id_hex(&id)).device_name(name.clone()));
+        Ok(name)
     }
 
     /// Status filtered to the caller's own devices.
@@ -1672,7 +1634,7 @@ impl Engine {
         };
         serde_json::json!({
             "host_id": self.host.host_id.to_hex(),
-            "host_key_id": public_key_key_id_hex(&self.host.public_key),
+            "host_key_id": self.host.public_key().key_id_hex(),
             "host_name": self.host_name,
             "paired_devices": paired_devices,
             "connected_devices": connected_devices,
@@ -1698,17 +1660,6 @@ impl Engine {
 
 fn device_id_hex(id: &Id) -> String {
     id.to_hex()
-}
-
-/// The transport actually used decides the freshness window, but only when the
-/// operator has not pinned a preference. Transport never changes whether a
-/// signature is accepted.
-fn transport_pref_for(actual: Transport, pref: Transport) -> Transport {
-    if pref == actual {
-        pref
-    } else {
-        actual
-    }
 }
 
 /// Convenience: the response a device sends when it declines.
@@ -1752,7 +1703,7 @@ mod tests {
         let host = HostIdentity::for_tests(PrivateKey::generate().expect("OS randomness"), host_id);
         let device_key = PrivateKey::generate().expect("OS randomness");
         let device_id = Id::random().expect("random");
-        let mut registry = Registry::new();
+        let mut registry = Registry::in_memory();
         registry
             .upsert_paired_for_user(device_id, "Pixel", &device_key.public_key(), 100, "alice")
             .expect("pair");
@@ -1861,5 +1812,32 @@ mod tests {
             .expect("registers");
         assert!(engine.force_disconnect_device(&device_id));
         assert!(engine.connected_devices().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod prompt_budget_tests {
+    use super::*;
+
+    #[test]
+    fn account_budget_is_shared_across_devices() {
+        let mut budget = PromptBudget::new();
+        for device in ["a", "b", "c"] {
+            assert!(budget.admit("alice", device, 100).is_ok());
+        }
+        assert!(matches!(budget.admit("alice", "d", 101), Err(ProtocolError::RateLimited(_))));
+        assert!(budget.admit("bob", "d", 101).is_ok());
+    }
+
+    #[test]
+    fn device_budget_is_shared_across_accounts_and_rejections_do_not_extend_it() {
+        let mut budget = PromptBudget::new();
+        for account in ["alice", "bob", "carol"] {
+            assert!(budget.admit(account, "a", 100).is_ok());
+        }
+        for _ in 0..100 {
+            assert!(matches!(budget.admit("dave", "a", 159), Err(ProtocolError::RateLimited(1))));
+        }
+        assert!(budget.admit("dave", "a", 160).is_ok());
     }
 }

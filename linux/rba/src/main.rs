@@ -23,6 +23,7 @@
 //! function without those: it can auto-start a user-level daemon and operate
 //! from environment variables or companion files next to the binary.
 
+
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
@@ -31,15 +32,6 @@ use rbad::ipc::{ControlRequest, ControlResponse};
 
 #[cfg(target_os = "linux")]
 mod pam;
-
-/// Directory containing the `rba` binary, used to resolve relative paths.
-/// If the binary is next to companion files (e.g. `libpam_rba.so`), those
-/// are discovered and used as defaults for user-level operations.
-fn exe_dir() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-}
 
 const DEFAULT_SOCKET: &str = rbad::config::DEFAULT_SOCKET;
 
@@ -56,8 +48,8 @@ fn usage_text() -> String {
          \x20   pair                      pair a device; one side shows the code, the other types it\n\
          \x20   auth --user U             ask a device to authenticate a Linux user\n\
          \x20   unpair --device D         remove trust for a device (owner or root)\n\
-         \x20   grant-scope --device D    grant exact purpose/service/operation (root only)\n\
-         \x20   remove-scope --device D   remove an explicit scope grant (root only)\n\
+         \x20   grant-scope --device D --user U    grant exact scope (root only)\n\
+         \x20   remove-scope --device D --user U   remove an exact grant (root only)\n\
          \x20   revoke --device D         revoke an authenticator immediately (root only)\n\
          \x20   enable <backend>          enable a host integration (gdm, polkit, sudo) [linux]\n\
          \x20   disable <backend>         roll back a host integration [linux]\n\
@@ -69,7 +61,6 @@ fn usage_text() -> String {
          \x20   rba pair --code-entry device  host shows the code; type it on the device (default)\n\
          \x20   rba pair --code-entry host    device shows the code; type it in this terminal\n\
          \x20   --owner USER                  account the device may authenticate (default: you)\n\
-         \x20   --allow-root                  also allow this device to authenticate root (explicit)\n\
          \n\
          OPTIONS:\n\
          \x20   --socket PATH    control socket (default {DEFAULT_SOCKET})\n\
@@ -85,8 +76,8 @@ fn usage_text() -> String {
          ENVIRONMENT:\n\
          \x20   RBA_SOCKET       control socket (default {DEFAULT_SOCKET})\n\
          \n\
-         A device authenticates only the account it was paired for. Root is denied\n\
-         unless pairing used --allow-root. The 'auth' command performs no\n\
+         A device authenticates only explicitly granted principal/scope pairs.\n\
+         The 'auth' command performs no\n\
          cryptography here: it asks the daemon, which verifies a signature over a\n\
          fresh challenge against the registered device public key.\n",
         rba_protocol::VERSION
@@ -123,7 +114,6 @@ struct Args {
     code: Option<String>,
     code_entry: CodeEntry,
     owner: Option<String>,
-    allow_root: bool,
     dry_run: bool,
     verbose: bool,
     timeout_ms: u64,
@@ -144,7 +134,6 @@ fn parse() -> Args {
         code: None,
         code_entry: CodeEntry::Device,
         owner: None,
-        allow_root: false,
         dry_run: false,
         verbose: false,
         timeout_ms: rbad::server::DEFAULT_AUTH_TIMEOUT_MS,
@@ -194,7 +183,6 @@ fn parse() -> Args {
                 };
             }
             "--owner" => args.owner = Some(v("--owner")),
-            "--allow-root" => args.allow_root = true,
             "--dry-run" => args.dry_run = true,
             "--verbose" => args.verbose = true,
             "--timeout" => args.timeout_ms = v("--timeout").parse().unwrap_or(90_000),
@@ -309,8 +297,8 @@ fn cmd_devices(args: &Args) {
     }
     println!();
     println!(
-        "{:<22} {:<12} {:<10} {:<12} {:<14} LINK",
-        "DEVICE", "ID", "STATE", "USERS", "ROOT"
+        "{:<22} {:<12} {:<10} LINK",
+        "DEVICE", "ID", "STATE"
     );
     for d in &devices {
         let name = d
@@ -319,26 +307,7 @@ fn cmd_devices(args: &Args) {
             .unwrap_or("(unnamed)");
         let id = d.get("device_id").and_then(|v| v.as_str()).unwrap_or("-");
         let status = d.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-        let users = d
-            .get("users")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            })
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "-".into());
-        let root = if d
-            .get("allow_root")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            "allowed"
-        } else {
-            "denied"
-        };
+        let grants = d.get("grants").and_then(|v| v.as_array());
         let link = if d
             .get("available")
             .and_then(|v| v.as_bool())
@@ -349,14 +318,18 @@ fn cmd_devices(args: &Args) {
             "not connected"
         };
         println!(
-            "{:<22} {:<12} {:<10} {:<12} {:<14} {}",
+            "{:<22} {:<12} {:<10} {}",
             name.chars().take(22).collect::<String>(),
             id.chars().take(12).collect::<String>(),
             status,
-            users.chars().take(12).collect::<String>(),
-            root,
             link
         );
+        if let Some(grants) = grants {
+            for grant in grants {
+                let scope = &grant["scope"];
+                println!("  {}: {}/{}/{}", grant["principal"].as_str().unwrap_or("?"), scope["purpose"].as_str().unwrap_or("?"), scope["service"].as_str().unwrap_or("?"), scope["operation"].as_str().unwrap_or("?"));
+            }
+        }
     }
 }
 
@@ -440,7 +413,6 @@ fn cmd_pair(args: &Args) {
             code_entry: Some(args.code_entry.as_str().to_string()),
             timeout_ms: Some(args.timeout_ms.max(1000)),
             owner: args.owner.clone(),
-            allow_root: args.allow_root,
         },
     )
     .unwrap_or_else(|e| {
@@ -537,24 +509,18 @@ fn cmd_pair(args: &Args) {
     // Wait for the daemon to finish the host side and the device to confirm.
     // The device sends PAIRING_CONFIRMED after it persists its record; only then
     // is the pairing fully complete and safe to claim as "Paired".
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     let confirmed = loop {
+        if std::time::Instant::now() >= deadline { break false; }
+        match request(args, &ControlRequest::PairingConfirmed) {
+            Ok(r) if r.ok => {
+                if r.result.as_ref().and_then(|v| v.get("confirmed")).and_then(|v| v.as_bool()) == Some(true) {
+                    break true;
+                }
+            }
+            _ => break false,
+        }
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let Ok(r) = request(args, &ControlRequest::PairingConfirmed) else {
-            continue;
-        };
-        if r.ok {
-            let Some(val) = r.result else { break false };
-            break val.as_bool().unwrap_or(false);
-        }
-        // If the pairing session has expired, give up.
-        let Some(res) = &r.result else { continue };
-        let still_open = res
-            .get("pairing")
-            .and_then(|p| p.get("seconds_remaining"))
-            .is_some();
-        if !still_open {
-            break false;
-        }
     };
 
     if confirmed {
@@ -618,8 +584,12 @@ fn cmd_scope(args: &Args, grant: bool) {
         eprintln!("rba: --device is required");
         std::process::exit(2);
     };
+    let Some(user) = args.user.clone() else {
+        eprintln!("rba: --user is required for grant changes");
+        std::process::exit(2);
+    };
     match request(args, &ControlRequest::SetScope {
-        device, purpose: args.purpose.clone(), service: args.service.clone(),
+        device, user, purpose: args.purpose.clone(), service: args.service.clone(),
         operation: args.operation.clone(), grant,
     }) {
         Ok(r) if r.ok => println!("Scope updated."),

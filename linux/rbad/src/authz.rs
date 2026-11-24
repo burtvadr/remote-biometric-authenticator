@@ -1,42 +1,30 @@
 //! Pure authorization policy. No OS, transport, persistence or crypto I/O.
-
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
 
-/// Represents a requested operation with its purpose and service context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Operation {
     Authenticate,
     Authorize,
 }
 
-/// Granular denial reasons for authorization failures
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Denial {
-    InvalidScope,          // malformed or unknown scope
-    PrincipalNotBound,   // caller not recognized as authorized principal
-    RootNotGranted,      // root access not explicitly granted
-    ScopeNotGranted,     // scope not explicitly granted for this operation
-}
-
-/// Scope (purpose, service, operation) identifying an authorization boundary.
-/// Exact string matching; no wildcards or implicit elevation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Purpose and service are exact namespaced identifiers supplied by an adapter.
+/// No wildcard or implicit elevation is supported.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Scope {
-    /// The purpose identifier (e.g., "rba", "sudo")
     pub purpose: String,
-    /// The service identifier (e.g., "rba", "sudo")
     pub service: String,
-    /// The operation being requested
     pub operation: Operation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Denial {
+    InvalidScope,
+    PrincipalNotBound,
+    ScopeNotGranted,
+}
+
 impl Scope {
-    /// Parse a scope from three space-separated strings: purpose, service, operation.
-    /// 
-    /// Validates that strings are non-empty, at most 128 bytes, and contain
-    /// only ASCII alphanumeric characters, hyphens, underscores, dots, colons, or slashes.
     pub fn parse(purpose: &str, service: &str, operation: &str) -> Result<Self, Denial> {
         let valid = |s: &str| !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| {
             b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b'/')
@@ -51,174 +39,93 @@ impl Scope {
         };
         Ok(Self { purpose: purpose.into(), service: service.into(), operation })
     }
+}
 
-    /// Check if this is a basic authentication scope (rba/rba/authenticate).
-    pub fn is_basic(&self) -> bool {
-        self.purpose == "authenticate" && self.service == "rba"
-            && self.operation == Operation::Authenticate
+/// Canonical host-local identity, supplied by the trusted OS adapter.
+/// The registry is local to one host. No interpretation of names occurs here.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PrincipalId(String);
+
+impl PrincipalId {
+    pub fn new(id: &str) -> Self {
+        Self(id.to_owned())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
-impl Hash for Scope {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.purpose.hash(state);
-        self.service.hash(state);
-        self.operation.hash(state);
-    }
-}
-
-/// A complete authorization relationship between a principal and an operation.
-/// Each grant explicitly expresses: principal is authorized for this scope.
-/// The absence of a grant denotes denial — no implicit permissions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Grant {
-    /// The identity being authenticated — resolved by platform adapter
     pub principal: PrincipalId,
-    
-    /// The scope being granted — exact purpose/service/operation
     pub scope: Scope,
 }
 
-/// Minimal, unified authorization policy — replaces users + allow_root + allowed_scopes
-/// 
-/// Each grant explicitly expresses: principal is authorized for this scope.
-/// Empty policy denies everything. No implicit permissions, no legacy fields.
-/// 
-/// The policy is a HashSet of (principal, scope) grants. A principal is authorized
-/// for a scope if and only if an exact (principal, scope) grant exists in the set.
-pub struct DevicePolicy {
-    /// Each grant explicitly expresses: principal is authorized for this scope
-    /// The HashSet contains exactly the granted (principal, scope) pairs
-    /// Absence of a grant = denial (default-deny policy)
-    pub grants: HashSet<Grant>,
-}
-
-impl Default for DevicePolicy {
-    fn default() -> Self {
-        DevicePolicy {
-            grants: HashSet::new(),
-        }
+impl Grant {
+    pub fn new(principal: &str, scope: Scope) -> Self {
+        Self { principal: PrincipalId::new(principal), scope }
     }
 }
 
-impl DevicePolicy {
-    /// Whether this policy grants the principal access to the requested scope
-    pub fn grants_principal(&self, principal: &PrincipalId, scope: &Scope) -> bool {
-        self.grants.contains(&Grant {
-            principal: principal.clone(),
-            scope: *scope,
-        })
-    }
-
-    /// Whether this policy is bound to the given principal (i.e., has any grant for this principal)
-    pub fn is_bound_to(&self, principal: &PrincipalId) -> bool {
-        self.grants.iter().any(|g| g.principal == *principal)
-    }
-}
-
-/// Central authorization evaluator — no platform I/O, testable in isolation
-/// 
-/// Evaluates whether a principal is authorized for a given scope,
-/// given the device's policy configuration.
-/// 
-/// # Security
-/// - Default-deny: absent grants deny
-/// - Root requires explicit grant (no implicit elevation)
-/// - Principal must have exact (principal, scope) grant
-/// - Scope must be explicitly granted
+/// The only authorization rule: the exact principal and exact scope must occur
+/// together in an explicit grant. Empty policies deny all operations.
 pub fn evaluate(
-    principal: PrincipalId,
-    policy_grants: &HashSet<Grant>,
-) -> Result<(), Denial> {
-    // Check if there's an explicit grant for this principal and scope
-    if policy_grants.contains(&Grant {
-        principal: principal.clone(),
-        scope: /* scope */,
-    }) {
-        return Ok(());
-    }
-    
-    // No explicit grant = denial (default-deny)
-    Err(Denial::ScopeNotGranted)
-}
-
-/// Convenience overload that takes a scope parameter
-pub fn evaluate_with_scope(
-    principal: PrincipalId,
-    policy_grants: &HashSet<Grant>,
+    principal: &PrincipalId,
+    grants: &std::collections::BTreeSet<Grant>,
     scope: &Scope,
 ) -> Result<(), Denial> {
-    // Check if there's an explicit grant for this principal and scope
-    if policy_grants.contains(&Grant {
-        principal: principal.clone(),
-        scope: *scope,
-    }) {
-        return Ok(());
+    if grants.contains(&Grant { principal: principal.clone(), scope: scope.clone() }) {
+        Ok(())
+    } else if !grants.iter().any(|g| &g.principal == principal) {
+        Err(Denial::PrincipalNotBound)
+    } else {
+        Err(Denial::ScopeNotGranted)
     }
-    
-    // No explicit grant = denial (default-deny)
-    Err(Denial::ScopeNotGranted)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
-    fn authenticate_scope() -> Scope {
-        Scope::parse("rba", "rba", "authenticate").unwrap()
-    }
+    fn basic() -> Scope { Scope::parse("authenticate", "rba", "authenticate").unwrap() }
+    fn sudo() -> Scope { Scope::parse("sudo", "sudo", "authenticate").unwrap() }
 
-    fn sudo_scope() -> Scope {
-        Scope::parse("sudo", "sudo", "authenticate").unwrap()
+    #[test]
+    fn empty_policy_denies_basic_and_privileged() {
+        let grants = BTreeSet::new();
+        for name in ["alice", "root"] {
+            for scope in [basic(), sudo()] {
+                assert_eq!(evaluate(&PrincipalId::new(name), &grants, &scope), Err(Denial::PrincipalNotBound));
+            }
+        }
     }
 
     #[test]
-    fn grant_denies_unauthorized_principal() {
-        // Empty policy denies everything
-        let policy = DevicePolicy::default();
-        let principal = PrincipalId("alice".into());
-        assert_eq!(evaluate_with_scope(principal, &policy.grants, &authenticate_scope), Err(Denial::ScopeNotGranted));
+    fn grants_are_not_a_cartesian_product() {
+        let grants = BTreeSet::from([Grant::new("alice", sudo()), Grant::new("bob", basic())]);
+        assert!(evaluate(&PrincipalId::new("alice"), &grants, &sudo()).is_ok());
+        assert!(evaluate(&PrincipalId::new("bob"), &grants, &basic()).is_ok());
+        assert_eq!(evaluate(&PrincipalId::new("bob"), &grants, &sudo()), Err(Denial::ScopeNotGranted));
+        assert_eq!(evaluate(&PrincipalId::new("alice"), &grants, &basic()), Err(Denial::ScopeNotGranted));
+        assert_eq!(evaluate(&PrincipalId::new("charlie"), &grants, &basic()), Err(Denial::PrincipalNotBound));
     }
 
     #[test]
-    fn grant_allows_authorized_principal() {
-        let mut grants = HashSet::new();
-        grants.insert(Grant { principal: PrincipalId("alice".into()), scope: authenticate_scope });
-        let policy = DevicePolicy { grants };
-        let principal = PrincipalId("alice".into());
-        assert!(evaluate_with_scope(principal, &policy.grants, &authenticate_scope).is_ok());
-    }
-
-    #[test]
-    fn cross_principal_isolation() {
-        let mut grants = HashSet::new();
-        grants.insert(Grant { principal: PrincipalId("alice".into()), scope: authenticate_scope });
-        let policy = DevicePolicy { grants };
-        // bob should be denied even though alice is authorized
-        let principal = PrincipalId("bob".into());
-        assert_eq!(evaluate_with_scope(principal, &policy.grants, &authenticate_scope), Err(Denial::ScopeNotGranted));
-    }
-
-    #[test]
-    fn root_access_requires_explicit_grant() {
-        let mut grants = HashSet::new();
-        // root does NOT get automatic access — must be explicit
-        let policy = DevicePolicy { grants };
-        let principal = PrincipalId("root".into());
-        assert_eq!(evaluate_with_scope(principal, &policy.grants, &authenticate_scope), Err(Denial::RootNotGranted));
-    }
-
-    #[test]
-    fn root_with_explicit_grant() {
-        let mut grants = HashSet::new();
-        grants.insert(Grant { principal: PrincipalId("root".into()), scope: authenticate_scope });
-        let policy = DevicePolicy { grants };
-        let principal = PrincipalId("root".into());
-        assert!(evaluate_with_scope(principal, &policy.grants, &authenticate_scope).is_ok());
+    fn privileged_identity_requires_its_own_grant() {
+        let mut grants = BTreeSet::from([Grant::new("alice", sudo())]);
+        assert!(evaluate(&PrincipalId::new("root"), &grants, &sudo()).is_err());
+        grants.insert(Grant::new("root", sudo()));
+        assert!(evaluate(&PrincipalId::new("root"), &grants, &sudo()).is_ok());
+        assert!(evaluate(&PrincipalId::new("root"), &grants, &basic()).is_err());
     }
 
     #[test]
     fn unknown_operations_are_rejected() {
         assert_eq!(Scope::parse("sudo", "sudo", "unknown"), Err(Denial::InvalidScope));
+        assert_eq!(Scope::parse("*", "sudo", "authenticate"), Err(Denial::InvalidScope));
     }
 }

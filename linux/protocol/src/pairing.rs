@@ -661,13 +661,28 @@ impl PairingConfirmed {
         let v = cbor::decode_canonical(payload)
             .map_err(|e| ProtocolError::BadRequest(format!("pairing_confirmed payload: {e}")))?;
         let session_id = req_bytes(&v, "session_id")?;
-        if session_id.len() != 32 {
-            return Err(ProtocolError::BadRequest(
-                "session_id must be 32 bytes".into(),
-            ));
-        }
         let sid_id = Id::from_slice(session_id)?;
         Ok(PairingConfirmed { session_id: sid_id })
+    }
+}
+
+#[cfg(test)]
+mod pairing_confirmed_tests {
+    use super::*;
+
+    #[test]
+    fn acknowledgement_roundtrips_a_protocol_id() {
+        let expected = Id::from_slice(&[0x42; crate::types::ID_LEN]).unwrap();
+        let payload = PairingConfirmed { session_id: expected }.to_payload();
+        assert_eq!(PairingConfirmed::from_payload(&payload).unwrap().session_id, expected);
+    }
+
+    #[test]
+    fn acknowledgement_rejects_wrong_identifier_length() {
+        let payload = cbor::encode(&Value::map(vec![(
+            "session_id", Value::Bytes(vec![0; 32]),
+        )]));
+        assert!(PairingConfirmed::from_payload(&payload).is_err());
     }
 }
 

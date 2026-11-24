@@ -69,3 +69,5 @@ Cargo is unavailable. This is the direct manifest inventory, not a resolved Carg
 
 - dependencies: getrandom, hex, libc, mdns-sd, p256, rand_core, rba-protocol, rcgen, rustls, rustls-pemfile, serde, serde_json, sha2, tokio, tokio-rustls, zeroize
 - dev-dependencies: hex, rba-protocol, rba-sim, serde_json
+
+The authorization module now uses `PrincipalId`, `Scope` and exact `Grant` set membership. It remains free of OS, network, filesystem and cryptographic I/O. Linux NSS canonical identity resolution and administrative peer checks remain in IPC/server integration. The enclosing daemon is still Linux-specific.

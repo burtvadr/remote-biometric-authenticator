@@ -84,14 +84,11 @@ impl Daemon {
     /// A daemon with in-memory state, for tests.
     pub fn in_memory(config: Config) -> Daemon {
         let key = rba_protocol::crypto::PrivateKey::generate().expect("OS randomness is required");
-        let host = HostIdentity {
-            host_id: "test-host".into(),
-            public_key: "0400a0c9d3b6e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e".into(),
-        };
+        let host = HostIdentity::for_tests(key, rba_protocol::types::Id::random().expect("random"));
         let audit = AuditLog::null();
         let engine = Engine::with_rate_limit_path(
             host,
-            Registry::new(),
+            Registry::in_memory(),
             audit,
             "test-host".into(),
             None,

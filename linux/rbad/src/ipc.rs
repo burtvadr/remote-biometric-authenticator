@@ -117,7 +117,7 @@ pub fn user_exists(name: &str) -> bool {
             &mut result,
         )
     };
-    rc == 0 && !result.is_null()
+    rc == 0 && !result.is_null() && user_for_uid(passwd.pw_uid).as_deref() == Some(name)
 }
 
 /// Decides whether `peer` may request an authentication for `requested_user`.
@@ -127,7 +127,7 @@ pub fn user_exists(name: &str) -> bool {
 pub fn authorize_caller(peer: PeerCredentials, requested_user: &str) -> Result<String> {
     if peer.uid == 0 {
         // root may ask on behalf of any user (login, PAM as root, etc.).
-        return Ok(requested_user.to_owned());
+        return if user_exists(requested_user) { Ok(requested_user.to_owned()) } else { Err(ProtocolError::ContextMismatch("target account is not a canonical local principal".into())) };
     }
     match user_for_uid(peer.uid) {
         Some(actual) if actual == requested_user => Ok(actual),
@@ -168,9 +168,6 @@ pub enum ControlRequest {
         /// must name an existing account explicitly.
         #[serde(default)]
         owner: Option<String>,
-        /// Explicitly allow this device to authenticate root. Root-only choice.
-        #[serde(default)]
-        allow_root: bool,
     },
     /// Ask a paired device to authenticate a Linux user.
     Authenticate {
@@ -188,7 +185,7 @@ pub enum ControlRequest {
         #[serde(default)]
         timeout_ms: Option<u64>,
     },
-    SetScope { device: String, purpose: String, service: String, operation: String, grant: bool },
+    SetScope { device: String, user: String, purpose: String, service: String, operation: String, grant: bool },
     /// Revoke a device's authorisation immediately.
     Revoke { device: String },
     /// Remove trust for a device (marks it Replaced, retained for audit).
@@ -359,13 +356,15 @@ mod tests {
     }
 
     #[test]
-    fn root_may_request_any_user() {
+    fn root_may_request_a_canonical_local_user() {
         let peer = PeerCredentials {
             pid: 0,
             uid: 0,
             gid: 0,
         };
-        assert_eq!(authorize_caller(peer, "alice").unwrap(), "alice");
+        let name = user_for_uid(0).expect("root account");
+        assert_eq!(authorize_caller(peer, &name).unwrap(), name);
+        assert!(authorize_caller(peer, "").is_err());
     }
 
     #[test]

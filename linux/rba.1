@@ -21,8 +21,8 @@ system-level daemon is managed by systemd, this is a no-op (use
 \fIsystemctl stop rbad\fP instead).
 .TP
 \fBdevices\fP
-Show paired authenticators with their device ID, state, users, root access
-status, and link state.
+Show paired authenticators with their device ID, state, explicit principal/scope
+grants, and link state.
 .TP
 \fBstatus\fP
 Show daemon status: host information, paired device count, and enabled
@@ -36,7 +36,7 @@ prints \fIPaired.\fP (or \fIPaired \fRmodel\fP when \fB--device\fP is set).
 Authenticate the specified Linux user using a paired authenticator.
 .TP
 \fBunpair \-\-device D\fP
-Remove trust for a device. Owner or root may invoke this.
+Remove trust for a device. Shared credentials require administrator authority.
 .TP
 \fBrevoke \-\-device D\fP
 Revoke an authenticator immediately. Root only.
