@@ -96,7 +96,13 @@ class V2HardwareKeysTest {
             assertTrue(info.isUserAuthenticationRequirementEnforcedBySecureHardware)
             @Suppress("DEPRECATION")
             val perUse=info.userAuthenticationValidityDurationSeconds
-            assertEquals(-1,perUse)
+            // Keystore2 implementations can report zero when AUTH_TIMEOUT is
+            // absent. The modern generator uses zero for auth-per-operation;
+            // the legacy getter documents -1. Neither permits a positive window.
+            // This metadata check is not a substitute for the negative signing
+            // probe below. No production key inspection is changed here.
+            assertTrue("Expected per-operation authentication; reported duration=$perUse",
+                perUse == -1 || (Build.VERSION.SDK_INT >= 30 && perUse == 0))
             if(Build.VERSION.SDK_INT>=31) assertTrue(info.securityLevel in setOf(KeyProperties.SECURITY_LEVEL_TRUSTED_ENVIRONMENT,KeyProperties.SECURITY_LEVEL_STRONGBOX))
             else {
                 @Suppress("DEPRECATION")
