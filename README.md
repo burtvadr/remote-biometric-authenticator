@@ -1,5 +1,13 @@
 # Remote Biometric Authenticator `rba` (v0.1.0)
 
+> [!WARNING]
+> **Status warning (as of B.3.7.5).** The Android app as currently on `main` is
+> known to be broken for real device enrollment: the V2 app fails during
+> hardware-backed enrollment on the Motorola Edge 30 Ultra (LineageOS) with a
+> Keystore/KeyMint failure (`KeyStoreException:-10003`) during EC P-256 key
+> generation. See `docs/B3_7_5_2_GUI_RESTORATION.md` and the `RbaV2Keys` /
+> `RbaV2Enrollment` diagnostic logs. The Linux/CLI side remains functional.
+
 
 
 <img src="media/icons/auto/rba-light.svg" width="128" height="128" alt="Light icon" align="right" />
@@ -47,7 +55,7 @@ Authenticated.
 | `rba` | working |
 | `rba-sim` | working, including deliberate misbehaviour for tests |
 | `pam_rba` | scoped GDM and polkit overrides; password fallback preserved (`make verify`) |
-| Android app | validated on Android 17 LineageOS : Wi-Fi discovery, both pairing code directions, background auto-prompt, biometric-gated signing, auto-close after the decision |
+| Android app | **known broken (B.3.7.5)** — V2 enrollment fails at hardware key generation on LineageOS (Keystore `-10003`); pending correction |
 | polkit agent | **unnecessary** — see below. Kept for headless hosts only |
 | BLE transport | framing and segmentation complete and tested; BlueZ/central wiring not done |
 | fprintd compatibility | not started, deliberately last |
