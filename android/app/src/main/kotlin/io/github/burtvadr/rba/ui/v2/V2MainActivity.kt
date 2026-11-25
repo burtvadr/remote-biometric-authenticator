@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
+import android.view.MotionEvent
 import android.view.WindowManager
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -54,7 +55,7 @@ class V2MainActivity : FragmentActivity() {
     private val operations=Mutex()
     private val attempted=linkedSetOf<String>()
     private val maintenanceAttempts=mutableMapOf<String,Long>()
-    private val reviews by lazy { V2ReviewDialogs(this) }
+    private val reviews by lazy { V2ReviewPresentation(this) }
     private val permission=registerForActivityResult(ActivityResultContracts.RequestPermission()){refreshPermissions()}
     private val labels get()=getSharedPreferences("rba-v2-presentation",MODE_PRIVATE)
 
@@ -79,12 +80,13 @@ class V2MainActivity : FragmentActivity() {
                     onThemeModeChange={theme=it;AppSettings.setThemeMode(this@V2MainActivity,it);AppIconController.apply(this@V2MainActivity,icon,dark(it))},
                     onIconStyleChange={icon=it;AppSettings.setIconStyle(this@V2MainActivity,it);AppIconController.apply(this@V2MainActivity,it,dark(theme))},
                     onDynamicColorChange={dynamic=it;AppSettings.setDynamicColor(this@V2MainActivity,it)},
-                    // V2's live operation owner drives protected code/consent dialogs;
-                    // the former V1 callbacks cannot approve a V2 operation.
+                    // V2 live review replaces the operator panel, not the product GUI.
+                    // Legacy screen callbacks never authorize a V2 operation.
                     onConfirmPairing={false},onRejectPairing={},
                     onForgetHost=::forgetHost,onFixNotifications=::notifications,
                     onFixOverlay={},onFixBattery=::applicationSettings,onFixFullScreen={},
                     versionName=BuildConfig.VERSION_NAME,isDebug=BuildConfig.DEBUG,
+                    operatorReview=if(reviews.active) ({ modifier -> reviews.Content(icon,modifier) }) else null,
                 )
             }
         }
@@ -108,6 +110,8 @@ class V2MainActivity : FragmentActivity() {
             }
         }
     }
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean =
+        if(reviews.rejectObscured(event)) true else super.dispatchTouchEvent(event)
     override fun onResume(){super.onResume();refreshPermissions()}
     private fun dark(mode:ThemeMode)=when(mode){
         ThemeMode.DARK->true;ThemeMode.LIGHT->false
@@ -177,7 +181,14 @@ class V2MainActivity : FragmentActivity() {
                 screen=ScreenState.PairingConfirmed(if(enrolled!=null)pair.label else "Verified host")
                 delay(700)
             }catch(e:CancellationException){throw e}
-            catch(_:Exception){screen=ScreenState.Failed("Pairing not completed. Check the host terminal before retrying.");delay(1800)}
+            catch(e:V2HardwareKeys.GenerationFailure){
+                screen=ScreenState.Failed("This device could not create the required attested hardware key. Pairing was not completed.")
+                delay(4500)
+            }
+            catch(e:Exception){
+                android.util.Log.w("RbaV2Enrollment", "Enrollment failed: ${e.javaClass.simpleName}")
+                screen=ScreenState.Failed("Pairing not completed. Check the host terminal before retrying.");delay(1800)
+            }
             finally{screen=ScreenState.Idle}
             // An interrupted receipt can leave a durable PENDING record. Reload
             // before a new listener captures the inventory snapshot.

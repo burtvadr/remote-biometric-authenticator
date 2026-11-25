@@ -3,6 +3,8 @@ package io.github.burtvadr.rba.keystore
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.security.KeyStoreException
+import android.util.Log
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyInfo
 import android.security.keystore.KeyProperties
@@ -31,6 +33,23 @@ internal object V2HardwareKeys {
     private const val MAX_TRANSCRIPT = 65536
     enum class Role { TRANSPORT, BIOMETRIC }
     enum class Location { TEE, STRONGBOX, HARDWARE } // pre-31 does not distinguish TEE and StrongBox
+    /** Only safe metadata is logged: never aliases, challenges, certificates,
+     * provider exception messages or stack traces containing key parameters. */
+    class GenerationFailure internal constructor(val role: Role, val backend: String,
+                                                 val stage: String, cause: Exception) :
+        IllegalStateException("Attested hardware key $stage failed ($role, $backend)", cause)
+
+    private fun generationFailure(role: Role, strongBox: Boolean, stage: String, cause: Exception): GenerationFailure {
+        val backend = if (strongBox) "StrongBox" else "TEE"
+        val details = if (Build.VERSION.SDK_INT >= 33) {
+            val ks = generateSequence<Throwable>(cause) { it.cause }.take(8)
+                .filterIsInstance<KeyStoreException>().firstOrNull()
+            if (ks != null) " public_code=${ks.numericErrorCode} system_error=${ks.isSystemError} transient=${ks.isTransientFailure} retry=${ks.retryPolicy}"
+            else ""
+        } else ""
+        Log.w("RbaV2Keys", "stage=$stage role=$role requested_backend=$backend exception=${cause.javaClass.simpleName}$details")
+        return GenerationFailure(role, backend, stage, cause)
+    }
     // Conscrypt delegates TLS 1.3 CertificateVerify for opaque EC keys as
     // prehashed ECDSA. Only the transport role may use that mechanism.
     private fun digests(role:Role)=if(role==Role.TRANSPORT)
@@ -107,16 +126,27 @@ internal object V2HardwareKeys {
                 initialize(builder.build())
             }.generateKeyPair()
         }
-        if (preferStrongBox) {
-            try { generate(true) }
-            catch (_: StrongBoxUnavailableException) {
-                // Only explicit hardware unavailability permits the TEE attempt.
-                // An ambiguous failure that left an alias is not retried.
-                check(!ks.containsAlias(name))
-                generate(false)
-            }
-        } else generate(false)
-        return inspect(ks, name, role, challenge = challenge)
+        var requestedStrongBox = preferStrongBox
+        try {
+            if (preferStrongBox) {
+                try { generate(true) }
+                catch (_: StrongBoxUnavailableException) {
+                    // Only explicit hardware unavailability permits the TEE attempt.
+                    // An ambiguous failure that left an alias is not retried.
+                    check(!ks.containsAlias(name))
+                    Log.i("RbaV2Keys", "role=$role StrongBox unavailable; trying TEE with unchanged attestation requirements")
+                    requestedStrongBox = false
+                    generate(false)
+                }
+            } else generate(false)
+        } catch (failure: Exception) {
+            throw generationFailure(role, requestedStrongBox, "generation", failure)
+        }
+        try {
+            return inspect(ks, name, role, challenge = challenge)
+        } catch (failure: Exception) {
+            throw generationFailure(role, requestedStrongBox, "inspection", failure)
+        }
     }
 
     /** Key handles never leave this object. These public facts are copies. */

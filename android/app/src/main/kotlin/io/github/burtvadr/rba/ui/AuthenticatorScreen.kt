@@ -131,9 +131,10 @@ fun AuthenticatorScreen(
     versionName: String,
     isDebug: Boolean,
     modifier: Modifier = Modifier,
+    operatorReview: (@Composable (Modifier) -> Unit)? = null,
 ) {
     var selectedTab by rememberSaveable { mutableStateOf(Tab.OVERVIEW.name) }
-    val operatorState = state !is ScreenState.Idle
+    val operatorState = state !is ScreenState.Idle || operatorReview != null
 
     Scaffold(
         modifier = modifier,
@@ -147,7 +148,9 @@ fun AuthenticatorScreen(
             }
         },
     ) { padding ->
-        if (operatorState) {
+        if (operatorReview != null) {
+            operatorReview(Modifier.padding(padding))
+        } else if (operatorState) {
             OperatorContent(
                 state = state,
                 iconStyle = iconStyle,
@@ -1156,13 +1159,12 @@ private fun DialogField(label: String, value: String, monospace: Boolean = false
 // Operator-facing screens (requests and pairing)
 // ---------------------------------------------------------------------------
 
+/** Shared original operator layout for protocol-independent live reviews. */
 @Composable
-private fun OperatorContent(
-    state: ScreenState,
+internal fun OperatorFrame(
     iconStyle: AppIconStyle,
-    onConfirmPairing: (String?) -> Boolean,
-    onRejectPairing: () -> Unit,
     modifier: Modifier = Modifier,
+    content: @Composable () -> Unit,
 ) {
     Column(
         modifier = modifier
@@ -1181,6 +1183,19 @@ private fun OperatorContent(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+        content()
+    }
+}
+
+@Composable
+private fun OperatorContent(
+    state: ScreenState,
+    iconStyle: AppIconStyle,
+    onConfirmPairing: (String?) -> Boolean,
+    onRejectPairing: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    OperatorFrame(iconStyle, modifier) {
         when (state) {
             is ScreenState.AwaitingApproval -> RequestPanel(state, waitingForBiometric = false)
             is ScreenState.AwaitingBiometric -> RequestPanel(state, waitingForBiometric = true)
@@ -1358,6 +1373,23 @@ private fun PairingWaitingPanel(hostName: String) {
     }
 }
 
+/** Original pairing-code graphic, also used by the V2 operator review. */
+@Composable
+internal fun PairingCodeDisplay(code: String) {
+    Box(
+        modifier = Modifier
+            .background(cardContainer(), RoundedCornerShape(20.dp))
+            .padding(horizontal = 32.dp, vertical = 20.dp),
+    ) {
+        Text(
+            code.chunked(3).joinToString(" "),
+            fontSize = 34.sp,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold,
+        )
+    }
+}
+
 @Composable
 private fun PairingHostCodePanel(
     hostName: String,
@@ -1386,23 +1418,7 @@ private fun PairingHostCodePanel(
             textAlign = TextAlign.Center,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        if (code.isNotEmpty()) {
-        Box(
-            modifier = Modifier
-                .background(
-                    cardContainer(),
-                    RoundedCornerShape(20.dp),
-                )
-                .padding(horizontal = 32.dp, vertical = 20.dp),
-        ) {
-            Text(
-                code.chunked(3).joinToString(" "),
-                fontSize = 34.sp,
-                fontFamily = FontFamily.Monospace,
-                fontWeight = FontWeight.Bold,
-            )
-        }
-        }
+        if (code.isNotEmpty()) PairingCodeDisplay(code)
         Text("Host: $hostName", style = MaterialTheme.typography.bodySmall)
         if (onAllow != null && onCancel != null) {
             Row(

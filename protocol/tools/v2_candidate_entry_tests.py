@@ -47,11 +47,31 @@ class CandidateEntryTests(unittest.TestCase):
         for forbidden in ('AuthenticatorRuntime', 'HostLink(', 'EditText(', 'Initialize new V2 store', 'Host listener port'):
             self.assertNotIn(forbidden, activity)
 
+    def test_live_reviews_use_original_compose_frame(self):
+        base = ROOT / 'android/app/src/main/kotlin/io/github/burtvadr/rba'
+        self.assertFalse((base / 'ui/v2/V2ReviewDialogs.kt').exists())
+        review = (base / 'ui/v2/V2ReviewPresentation.kt').read_text()
+        self.assertIn('OperatorFrame(iconStyle, modifier)', review)
+        self.assertIn('suspendCancellableCoroutine', review)
+        self.assertIn('if (pending !== review) return', review)
+        self.assertIn('review.erase()', review)
+        self.assertIn('FLAG_WINDOW_IS_OBSCURED', review)
+        self.assertIn('FLAG_WINDOW_IS_PARTIALLY_OBSCURED', review)
+        for forbidden in ('AlertDialog', 'rememberSaveable', 'EditText', 'ClipboardManager'):
+            self.assertNotIn(forbidden, review)
+        for name in ('V2MainActivity.kt', 'V2NotificationActivity.kt'):
+            activity = (base / 'ui/v2' / name).read_text()
+            self.assertIn('V2ReviewPresentation(this)', activity)
+            self.assertIn('reviews.Content(', activity)
+            self.assertIn('reviews.rejectObscured(event)', activity)
+            self.assertIn('FLAG_SECURE', activity)
+
     def test_minimal_permissions(self):
         self.assertEqual({attr(x, 'name') for x in self.manifest.findall('uses-permission')}, {
             'android.permission.INTERNET', 'android.permission.USE_BIOMETRIC',
             'android.permission.FOREGROUND_SERVICE', 'android.permission.FOREGROUND_SERVICE_SPECIAL_USE',
-            'android.permission.POST_NOTIFICATIONS'})
+            'android.permission.POST_NOTIFICATIONS', 'android.permission.ACCESS_NETWORK_STATE',
+            'android.permission.ACCESS_WIFI_STATE', 'android.permission.CHANGE_WIFI_MULTICAST_STATE'})
         self.assertEqual(attr(self.app.find('service'), 'foregroundServiceType'), 'specialUse')
         self.assertEqual(attr(self.app, 'allowBackup'), 'false')
         self.assertEqual(attr(self.app, 'usesCleartextTraffic'), 'false')

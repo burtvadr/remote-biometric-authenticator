@@ -119,8 +119,30 @@ async fn read_auth(channel: &mut Channel, local: &LocalLink, deadline: Deadline,
     Ok(msg)
 }
 
+// Bounded diagnostics: static stage and error category only. Do not print
+// message bodies, raw errors, credentials, challenges or pairing codes.
+fn enrollment_stage_error(stage: &str, error: Error) -> Error {
+    let category = match &error {
+        Error::Io(e) => format!("io:{:?}", e.kind()),
+        Error::Sql(_) => "storage".to_string(),
+        Error::Invalid => "invalid".to_string(),
+        Error::Denied => "denied".to_string(),
+        Error::Clock => "deadline".to_string(),
+        Error::State => "state".to_string(),
+    };
+    eprintln!("RBA enrollment: stage={stage} result={category}");
+    error
+}
+
 async fn read_enrollment(channel: &mut Channel, local: &LocalLink, deadline: Deadline, expected: Kind) -> Result<Message> {
-    let msg = local.wait(deadline, channel.read_until(deadline)).await?;
+    let stage = match expected {
+        Kind::EnrollShare => "await-share",
+        Kind::EnrollConfirmB => "await-confirmation",
+        Kind::EnrollEvidence => "await-evidence",
+        Kind::EnrollStaged => "await-staged-record",
+        _ => "await-enrollment-message",
+    };
+    let msg = local.wait(deadline, channel.read_until(deadline)).await.map_err(|e|enrollment_stage_error(stage,e))?;
     if msg.kind() == Kind::EnrollCancel {
         let (now, mono) = clock()?;
         locked(&channel.stream.get_ref().0.owner, |a| a.enrollment_cancel(channel.id(), &msg, now, mono))?;
@@ -223,7 +245,7 @@ impl Channel {
         let (now, mono) = clock()?;
         locked(&owner, |a| a.enrollment_confirm(conn, &confirm, now, mono))?;
         let evidence = read_enrollment(&mut self, &local, deadline, Kind::EnrollEvidence).await?;
-        let facts = locked(&owner, |a| a.enrollment_evidence(conn, &evidence, clock))?;
+        let facts = locked(&owner, |a| a.enrollment_evidence(conn, &evidence, clock)).map_err(|e|enrollment_stage_error("verify-evidence",e))?;
         if facts.enrollment != enrollment { return Err(Error::Denied); }
         let approval = local.ask(deadline, |reply| LocalEvent::ReviewEnrollment { facts, reply }).await?;
         let (now, mono) = clock()?;

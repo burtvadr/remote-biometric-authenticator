@@ -2,6 +2,7 @@ package io.github.burtvadr.rba.ui.v2
 
 import android.app.KeyguardManager
 import android.os.Bundle
+import android.view.MotionEvent
 import android.view.WindowManager
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Column
@@ -25,13 +26,15 @@ import io.github.burtvadr.rba.runtime.V2BackgroundRuntime
 class V2NotificationActivity : FragmentActivity() {
     private var attached:String?=null
     private var attempted=false
+    private val reviews by lazy { V2ReviewPresentation(this) }
     override fun onCreate(savedInstanceState:Bundle?){
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         setContent {
             AppTheme(AppSettings.themeMode(this),AppSettings.dynamicColor(this)){
                 Surface(Modifier.fillMaxSize()){
-                    Column(Modifier.padding(20.dp),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.spacedBy(16.dp)){
+                    if(reviews.active) reviews.Content(AppSettings.iconStyle(this@V2NotificationActivity))
+                    else Column(Modifier.padding(20.dp),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.spacedBy(16.dp)){
                         FingerprintBadge(style=AppSettings.iconStyle(this@V2NotificationActivity),size=76.dp)
                         Text("Authentication request",style=MaterialTheme.typography.headlineSmall)
                         Text("Review the live authentication request. Close this screen to cancel.",style=MaterialTheme.typography.bodyMedium)
@@ -40,6 +43,8 @@ class V2NotificationActivity : FragmentActivity() {
             }
         }
     }
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean =
+        if(reviews.rejectObscured(event)) true else super.dispatchTouchEvent(event)
     override fun onResume(){
         super.onResume()
         if(attempted){if(attached==null)finish();return};attempted=true
@@ -47,7 +52,7 @@ class V2NotificationActivity : FragmentActivity() {
         val token=uri?.lastPathSegment
         val unlocked=!getSystemService(KeyguardManager::class.java).isDeviceLocked
         if(!unlocked || uri==null || uri.scheme!="rba-v2-review" || uri.authority!="local" || token==null ||
-            !V2BackgroundRuntime.attach(token,V2ReviewDialogs(this))){finish();return}
+            !V2BackgroundRuntime.attach(token,reviews)){finish();return}
         attached=token
     }
     override fun onStop(){attached?.let{V2BackgroundRuntime.abandon(it)};attached=null;super.onStop();finish()}
