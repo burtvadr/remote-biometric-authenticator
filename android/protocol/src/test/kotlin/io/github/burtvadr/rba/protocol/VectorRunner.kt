@@ -36,6 +36,7 @@ class VectorRunner(private val vectorsDir: File) {
         nonCanonicalCbor()
         framing()
         messagePayloads()
+        wireVersionChecks()
         authRequestTranscript()
         signedFieldCoverage()
         signatures()
@@ -194,6 +195,26 @@ class VectorRunner(private val vectorsDir: File) {
         messageNamed("error")?.let { (frame, _) ->
             val m = Message.fromFrame(frame) as Message.ErrorMessageEnvelope
             check("error.code", m.v.code == 10, "expected REPLAY, got ${m.v.code}")
+        }
+    }
+
+    private fun wireVersionChecks() {
+        val id = Id(ByteArray(Limits.ID_LEN))
+        val hello = SessionHello(hostId = id, hostKeyId = "a".repeat(64),
+            hostNonce = ByteArray(Limits.CHALLENGE_LEN), sessionId = id, transports = listOf("wifi"))
+        val ack = SessionHelloAck(deviceId = id, deviceKeyId = "b".repeat(64),
+            deviceNonce = ByteArray(Limits.CHALLENGE_LEN), sessionId = id)
+        check("wire.version.hello", SessionHello.fromPayload(hello.toPayload()).protocolVersion == Limits.PROTOCOL_VERSION_LONG)
+        check("wire.version.ack", SessionHelloAck.fromPayload(ack.toPayload()).protocolVersion == Limits.PROTOCOL_VERSION_LONG)
+        for (version in listOf(0L, Limits.PROTOCOL_VERSION_LONG + 1, 255L, 256L, Long.MAX_VALUE)) {
+            val helloError = runCatching { SessionHello.fromPayload(hello.copy(protocolVersion = version).toPayload()) }.exceptionOrNull()
+            val ackError = runCatching { SessionHelloAck.fromPayload(ack.copy(protocolVersion = version).toPayload()) }.exceptionOrNull()
+            check("wire.version.hello.reject.$version", (helloError as? ProtocolException)?.errorCode == ErrorCode.UNSUPPORTED_VERSION)
+            check("wire.version.ack.reject.$version", (ackError as? ProtocolException)?.errorCode == ErrorCode.UNSUPPORTED_VERSION)
+        }
+        for (version in listOf(0, Limits.PROTOCOL_VERSION + 1, 255)) {
+            val bytes = Frame(version = version, msgType = 10, payload = byteArrayOf()).encode()
+            check("wire.version.frame.reject.$version", runCatching { Frame.decode(bytes) }.exceptionOrNull() is Frame.FrameException)
         }
     }
 

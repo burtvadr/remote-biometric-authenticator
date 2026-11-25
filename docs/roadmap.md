@@ -1,3 +1,50 @@
+# RBA roadmap — V2 security-first development
+
+**B.1 proposed roadmap.** The executable baseline is `2b8e76d` + B.0, not V2. B.0 delivery complete, Rust/Android/GitHub acceptance not established here. No backward compatibility; preserve feature goals, not obsolete implementation. [Architecture](ARCHITECTURE_V2.md) and [implementation plan](IMPLEMENTATION_V2.md) take precedence over older design proposals below.
+
+## Authoritative development order
+
+| Phase | Deliverable | Exit gate |
+|---|---|---|
+| B.0 | Baseline, audit and CI candidate | Verify baseline locally; report CI evidence |
+| B.1 | Coherent V2 design, six documents | Review profile, resolve implementation feasibility gates; no code or security closure claimed |
+| B.2 | Shared Rust codec/core, state machines, transactional store and protocol tests | Complete contract with adversarial/fault tests, no transitional production implementation |
+| B.3 | Mandatory attestation, mTLS TCP/Android, enrollment and release-signed app | Physical end-to-end acceptance; no software/debug fallback |
+| B.4 | Linux CLI/IPC, trusted adapters, PAM and recovery | Supported service scopes tested on target distro; unsupported scopes remain disabled |
+| B.5 | Complete acceptance, fuzzing, CI/release and independent review | All applicable SEC acceptance gates met or release blocked; record residual risk explicitly |
+| C | Advanced features and additional platforms | Separate supported platform/transport and threat-model acceptance |
+
+B.2–B.4 may be developed in an isolated V2 branch with internal tests, but never shipped as a partially secured authentication product. B.3 prerequisite feasibility may be investigated before B.2. No V1 dual stack, migration, temporary weaker verifier or silent fallback. Keep password recovery independent.
+
+## Preserved product feature contract
+
+| Feature | Delivery intent |
+|---|---|
+| Linux sudo, GDM login/unlock, pkexec/systemctl/polkit | B.4/C: scoped supported OS integration, verified local intent and action provenance; no lock screen bypass, no global PAM edit. |
+| Android biometric approval, pairing both six-digit directions, truthful commit/receipt, unpair | B.3: complete mandatory hardware-backed trust, explicit intent, offline revocation cleanup. |
+| Wi-Fi, BLE, VPN/Tailscale, failover/multipath | TCP B.3; BLE/ADB and multipath C after authenticated ordered-stream feasibility. Each retry fresh challenge; VPN routes are not trust anchors. |
+| Multi-account/device policy and delegation | Core exact grants B.2; managed account lifecycle B.4; advanced UI/policy controls C. |
+| Capability negotiation, account/device controls, app logs and advanced options | Mandatory minimum capability check B.2; extended UI/operations C. No capability grants access. |
+| ADB-like CLI, start/kill-server, devices, pair/unpair, status, man pages | B.4: one CLI/daemon lifecycle and versioned IPC, honest results. |
+| Native fprintd-style integration | C feasibility only; maintain real sensor and OS security boundaries; no fake fingerprint. |
+| BSD, macOS, iOS, Windows | C platform-specific adapters and acceptance; Windows feasibility only, not promised. |
+| Optional relay and headless ADB helper | C proposals, only if justified; preserve identity and physical biometric UI. |
+| Packaging, reproducible releases, distro documentation | B.4/B.5; independent review before expansion. |
+
+## Superseded design decisions
+
+- Optional attestation → mandatory verified hardware-backed keys and release identity.
+- Old ECDH/SAS and V1 profile → mandatory SPAKE2 and V2-only wire.
+- `users` + `allow_root` → exact principal/approver/target/scope grants.
+- Per-device line files → single transactional SQLite store; human-readable inspection via CLI. Runtime RBA-owned JSON remains excluded, test JSON and external standard JSON are not runtime state formats.
+- Broad/default PAM integration → only verified local intent/context adapters; no unsupported scope enabled. Stock desktop polkit-agent routing limitation remains unresolved.
+- Preserve old state for offline rollback review only, not for V2 migration or live fallback.
+- Old Phase 0–4 checklist below is historical, not a competing implementation sequence.
+
+## Historical roadmap (baseline feature detail and deployment evidence)
+
+Retained verbatim to preserve detailed goals, experiments, limitations, decisions and links. Its sample commands/configuration, old phase statuses and proposed architectures are V1 historical material, not instructions for V2 deployment. Do not install them as part of B.1–B.3.
+
 # Roadmap
 
 This is a living roadmap. It records what is supported **today**, what is

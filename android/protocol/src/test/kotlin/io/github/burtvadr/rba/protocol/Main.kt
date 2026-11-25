@@ -32,6 +32,17 @@ fun main(args: Array<String>) {
 
     println("Running cross-language conformance vectors from ${dir.absolutePath}")
     val result = VectorRunner(dir).run()
+    println("PASS: ${V2WireVectors.run(dir)} V2 wire checks against independent fixtures")
+
+    println("PASS: ${V2MessageVectors.run(dir)} V2 message/transcript fixtures")
+
+    println("PASS: ${V2DevicePolicyTests.run(dir)} V2 device policy checks")
+
+    println("PASS: ${V2AuthenticationTests.run(dir)} V2 authentication state checks")
+
+    println("PASS: ${V2EnrollmentTests.run(dir)} V2 enrollment state checks")
+
+    println("PASS: ${V2JvmStateFuzz.replay(dir)} V2 structured state traces")
 
     if (result.failures.isEmpty()) {
         println("PASS: ${result.checks} checks agreed with the Rust implementation")

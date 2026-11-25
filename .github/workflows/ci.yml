@@ -1,0 +1,109 @@
+name: RBA baseline CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rba-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust and native dependencies
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup override set stable
+          sudo apt-get update
+          sudo apt-get install -y libpam0g-dev libsqlite3-dev libssl-dev pkg-config
+      - name: Check independent V2 wire fixtures
+        run: |
+          python3 protocol/tools/v2_text_profile.py --check
+          python3 protocol/tools/v2_wire_vectors.py --check
+          python3 protocol/tools/v2_message_vectors.py --check
+          python3 protocol/tools/v2_enrollment_vectors.py --check
+      - name: Check pinned Android attestation roots
+        run: python3 protocol/tools/v2_attestation_roots.py
+      - name: Check SQLite schema independently
+        run: |
+          python3 protocol/tools/v2_store_tests.py
+          python3 protocol/tools/v2_device_store_tests.py
+      - name: Check V2 candidate entry-point contract
+        run: python3 protocol/tools/v2_candidate_entry_tests.py
+      - name: Check Linux workspace
+        working-directory: linux
+        run: cargo check --workspace --all-targets --locked
+      - name: Test Linux workspace (including protocol fixtures)
+        working-directory: linux
+        run: cargo test --workspace --locked
+      - name: Test portable SPAKE2 (including RFC KAT)
+        run: cargo test --manifest-path crates/rba-enrollment/Cargo.toml --locked
+      - name: Clippy Linux workspace
+        working-directory: linux
+        run: cargo clippy --workspace --all-targets --locked
+      - name: Formatting baseline (advisory until existing drift is fixed)
+        continue-on-error: true
+        run: |
+          cargo fmt --manifest-path linux/Cargo.toml --all -- --check
+      - name: Formatting portable crates (advisory)
+        continue-on-error: true
+        run: |
+          cargo fmt --manifest-path crates/rba-enrollment/Cargo.toml -- --check
+          cargo fmt --manifest-path crates/rba-enrollment-jni/Cargo.toml -- --check
+
+  kotlin:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+      - name: JVM tests and cross-language conformance
+        working-directory: android
+        run: |
+          env -u ANDROID_HOME -u ANDROID_SDK_ROOT gradle --no-daemon :protocol:test
+
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      NDK_VERSION: '27.2.12479018'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+      - name: Install SDK, NDK and Rust Android targets
+        run: |
+          sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' "ndk;${NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          rustup toolchain install stable --profile minimal
+          rustup override set stable
+          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+          cargo install cargo-ndk --locked
+      - name: Build Android app and JNI, run unit tests and lint
+        working-directory: android
+        run: gradle --no-daemon :app:assembleDebug :app:assembleDebugAndroidTest :app:testDebugUnitTest :app:lintDebug

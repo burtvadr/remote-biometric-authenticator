@@ -1,3 +1,51 @@
+# Security audit tracker — V2 acceptance register
+
+**B.1 design only.** The following is the authoritative target acceptance register. Historical severity and findings are preserved below, unchanged except for this prefatory status boundary. A design decision is not remediation; prior fixes are not automatically inherited by a rewrite. B.0 evidence is in [PHASE_B0.md](PHASE_B0.md). Source baseline `2b8e76d` plus delivered B.0 patch. No new code, tests or device execution in B.1.
+
+Close an item only with root cause, complete implementation, removal of obsolete paths, positive/negative regression tests, updated specification/threat model, exact revision/build evidence and physical/deployment evidence where required. Record reviewed residual risk separately; do not label it fixed. SEC-002 was a retracted claim, not a new vulnerability. Documentation-only corrections still require consistency and deployment evidence as applicable. All B.1 statuses below refer to target V2, not an assertion that every prior V1 fix failed.
+
+| ID | Original finding | Status | Owner milestone | Required acceptance evidence |
+|---|---|---|---|---|
+| SEC-001 | Pairing code is not bound to the public keys | Superseded in V1 candidate; V2 open | B.2/B.3 | PAKE confirmation binds both keys, actual TLS certs/exporter; substitution and independent review. |
+| SEC-002 | Pairing code was truncated to one HMAC byte | Historical retraction; prevent regression | B.2 | No SAS or one-byte comparison remains; six-digit random code, PAKE KAT and wrong-code rejection. |
+| SEC-003 | Broad `common-auth` deployment creates an MFA-fatigue surface | Open | B.2/B.4/B.5 | Verified local intent, manual number matching, independent persistent prompt/ingress limits, scoped PAM; concurrent and physical tests. |
+| SEC-004 | No device-to-Linux-user binding | V1 fix candidate; V2 open | B.2/B.4 | Cross-account and root-by-default denials, managed principal generation and trusted service mapping; live OS tests. |
+| SEC-005 | No Android Key Attestation | Open | B.3 | Both keys remotely attested; path, challenge, security level, key auth, boot, app, patch, revocation and freshness negative tests on release device. |
+| SEC-006 | PAM client does not verify the control-socket server | V1 fix candidate; V2 open | B.4 | Mutual local peer identity, protected socket path, reject fake daemon and production override; deployment tests. |
+| SEC-007 | Network-exposed daemon hardening | Open | B.2/B.3/B.5 | mTLS, pre-auth caps, bind restrictions, deadlines, parser fuzz and resource load tests; no permanent permissive enrollment listener. |
+| SEC-008 | Android assurance and release build | Open | B.3/B.5 | Verified non-debuggable release APK, signing digest, hardware and negative tests on supported phone; record device/OS/build. |
+| SEC-009 | PAM module robustness | Open | B.4 | Release panic containment actually effective (no abort reliance), FFI safety, bounded I/O, actual PAM recovery and panic tests. |
+| SEC-010 | Timing can reveal whether an account has a paired device | Needs measurement | B.3/B.5 | No pre-auth account oracle; compare authorized/unauthorized paths, characterize residual traffic and timing exposure. |
+| SEC-011 | Pairing race and display identity | Open | B.3 | Actual peer fingerprints and explicit consent in both directions, substitution/race and wrong peer UI tests. |
+| SEC-012 | `--code` is visible in process arguments | Removed in V1 source; V2 verify | B.3/B.4 | No argv code, secret logs or clipboard exposure; CLI rejection, process listing and log capture using dummy data. |
+| SEC-013 | Recommended PAM line includes `debug` | Historical docs fix; deploy verify | B.4 | No debug in production examples or installed PAM; configuration and log inspection. |
+| SEC-014 | Auth response is not bound to the TLS session | Open | B.2/B.3 | RFC 9266 exporter, session/request IDs and context in signatures; cross-channel replay/substitution rejection. |
+| SEC-015 | mDNS metadata and tracking | Needs measurement | B.3/B.5 | Generic opt-in discovery, no stable key/account IDs; packet capture across restarts; residual address linkability documented. |
+| SEC-016 | PAM integration docs assume Debian-style `common-auth` | Historical docs fix; deploy verify | B.4 | Distro-specific scoped overrides; no broad common-auth/system-auth edits; installation review. |
+| SEC-017 | Host key path differs between documents | Design reconciled; runtime open | B.4 | Single root-only host key path /var/lib/rba/v2/; actual permissions and path tests; no legacy fallback. |
+| SEC-018 | `expires_at` skew wording contradicts the formula | Design reconciled; runtime open | B.2 | Exact expiry formula, no post-expiry skew; equality, overflow, rollback and monotonic deadlines tested. |
+| SEC-019 | Test counts in the review are outdated | Historical docs correction | B.5 | CI-generated counts with revision and evidence; no stale fixed success counts. |
+| SEC-020 | Confusing PAM rollback lines | Historical docs fix; deploy verify | B.4 | One documented rollback path per integration; independent password/root recovery tested. |
+| SEC-021 | Control-socket request limit was checked after a full read | V1 fix candidate; V2 open | B.2/B.4 | Bound IPC header before body read, frame and queue limits, malformed/oversize tests and fuzz. |
+| SEC-022 | Authentication timeout was caller-controlled and unbounded | V1 fix candidate; V2 open | B.2/B.4 | Bound caller timeout, absolute monotonic deadline across all stages; stalled peer and overflow tests. |
+| SEC-023 | Biometric approval showed an unsigned host name | V1 fix candidate; V2 open | B.2/B.3 | Immutable signed host/principal/operation and proven context source; physical UI and mutation tests. |
+| SEC-024 | Wi-Fi listener had no connection or handshake deadline | V1 fix candidate; V2 open | B.3 | Bound connection count, handshake/frame/idle deadlines and explicit interface bind; live resource and fault tests. |
+| SEC-025 | Operation-specific authorization (Phase 1 candidate) | Open; V1 implementation candidate | B.2/B.4 | Exact grants, delegated approval, managed identity lifecycle, policy intersection, revision races, commit-time recheck and runtime tests. |
+| SEC-026 | portable SPAKE2 candidate (not integrated) | Open; V1 integration candidate | B.2/B.3 | RFC 9382 KAT + reviewed application profile, both directions, fresh attestation, atomic staging/commit/status, cancellation/replay/fault and physical tests. |
+
+## Additional design risks (not numbered reproduced findings)
+
+- V2-D1: NSS has no universal immutable account generation. Require managed lifecycle integration and test it before enabling OS authentication.
+- V2-D2: Android TLS exporter and unattended hardware Keystore transport signing need a real native bridge feasibility test; no unauthenticated substitute.
+- V2-D3: PAM may not expose authenticated exact action context or a usable local number display. Disable unsupported scopes, retain roadmap objective and design a supported integration.
+- V2-D4: distributed enrollment receipt loss is not atomic across devices. Verify status recovery and no pending-device authentication.
+- V2-D5: Android attestation proves creation-time properties, not continuous OS/UI integrity. Verify freshness/revocation policy and document residual risk.
+- V2-D6: SQLite durability, host state permissions and release-mode PAM panic policy require deployment and fault tests.
+
+## Historical tracker (V1 and B.0)
+
+Everything below is retained as original review history, including old “Resolved” labels and superseded paths/algorithms. It is not normative for V2. Use the acceptance register above for decisions.
+
 # Security audit tracker
 
 This is a living tracker for design, protocol and implementation findings. It is
@@ -33,6 +81,11 @@ when the finding was first written.
 
 ## Summary
 
+B.0 source review: see [B.0 audit and verification](PHASE_B0.md) for the actual
+snapshot identity, all 26 finding dispositions, verification boundaries, and
+remaining release gates. Historical observations below are retained as review
+history; they are not all descriptions of the current tree.
+
 ### High
 
 | ID | Finding | Status |
@@ -55,6 +108,8 @@ when the finding was first written.
 | SEC-022 | Caller-controlled authentication timeout is unbounded | Resolved |
 | SEC-023 | Biometric prompt shows unsigned host name and hides signed operation context | Resolved |
 | SEC-024 | Network listener lacks connection/handshake/frame deadlines and wide default bind | Resolved in tree |
+| SEC-025 | Operation-specific authorization | Open — implementation candidate |
+| SEC-026 | SPAKE2 enrollment | Open — integration candidate |
 
 ### Low
 
@@ -62,7 +117,7 @@ when the finding was first written.
 |---|---|---|
 | SEC-010 | Timing can reveal whether an account has a paired device | Needs verification |
 | SEC-011 | Pairing race: operator sees only a device name, not key fingerprint/source | Confirmed |
-| SEC-012 | `rba --code` is visible in `argv` | Confirmed |
+| SEC-012 | `rba --code` is visible in `argv` | Removed in source; runtime regression pending |
 | SEC-013 | Recommended PAM sample includes `debug` | Resolved |
 | SEC-014 | Authentication signature is not bound to the TLS session | Confirmed |
 | SEC-015 | mDNS exposes stable host metadata; linkability/privacy | Needs verification |

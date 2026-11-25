@@ -28,6 +28,14 @@ zeroize.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 libc = "0.2"
+# Link to the distribution-maintained SQLite; STRICT tables require >= 3.37.
+rusqlite = "=0.32.1"
+# Android attestation: distribution OpenSSL path validation and X.509 extraction.
+openssl = "=0.10.81"
+x509-parser = "=0.18.1"
+# Fixed-origin Android certificate status retrieval; no automatic decompression/proxy.
+reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "native-tls"] }
+httpdate = "=1.0.3"
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "net",
@@ -56,3 +64,6 @@ rba-protocol.workspace = true
 rba-sim = { path = "../rba-sim" }
 hex.workspace = true
 serde_json.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

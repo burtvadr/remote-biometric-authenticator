@@ -15,7 +15,7 @@ pub const HEADER_LEN: usize = 13;
 /// Mirror of [`crate::MAX_FRAME_PAYLOAD`], re-exported here so framing code
 /// needs a single import.
 pub const MAX_FRAME_PAYLOAD: usize = MAX_FRAME_PAYLOAD_LIMIT;
-pub const PROTOCOL_VERSION: u8 = 0x01;
+pub const PROTOCOL_VERSION: u8 = crate::PROTOCOL_VERSION as u8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
@@ -313,6 +313,19 @@ fn try_decode(buf: &[u8]) -> Result<Option<(Frame, usize)>, FrameError> {
     if buf.len() < HEADER_LEN {
         return Ok(None);
     }
+    // Validate the fixed header before waiting for a peer-controlled body.
+    let mut magic = [0u8; 4];
+    magic.copy_from_slice(&buf[..4]);
+    if magic != MAGIC {
+        return Err(FrameError::BadMagic(magic));
+    }
+    if buf[4] != PROTOCOL_VERSION {
+        return Err(FrameError::UnsupportedVersion(buf[4]));
+    }
+    let flags = u16::from_be_bytes([buf[7], buf[8]]);
+    if flags != 0 {
+        return Err(FrameError::UnsupportedFlags(flags));
+    }
     let len = u32::from_be_bytes([buf[9], buf[10], buf[11], buf[12]]);
     if len as usize > MAX_FRAME_PAYLOAD {
         return Err(FrameError::PayloadTooLarge(len));
@@ -359,7 +372,7 @@ mod tests {
         let bytes = f.encode();
         assert_eq!(bytes.len(), HEADER_LEN + 3);
         assert_eq!(&bytes[..4], b"PAF1");
-        assert_eq!(bytes[4], 1);
+        assert_eq!(bytes[4], PROTOCOL_VERSION);
         let (back, n) = Frame::decode(&bytes).unwrap();
         assert_eq!(n, bytes.len());
         assert_eq!(back, f);
@@ -386,6 +399,24 @@ mod tests {
         let mut f = Frame::new(1, vec![]).encode();
         f[4] = 9;
         assert_eq!(Frame::decode(&f), Err(FrameError::UnsupportedVersion(9)));
+    }
+
+    #[test]
+    fn stream_rejects_unsupported_version_before_payload() {
+        let mut bytes = Frame::new(1, vec![0; 8]).encode();
+        bytes[4] = PROTOCOL_VERSION + 1;
+        bytes.truncate(HEADER_LEN);
+        let mut reader = FrameReader::new(&bytes[..]);
+        assert_eq!(reader.next_frame(), Err(FrameError::UnsupportedVersion(PROTOCOL_VERSION + 1)));
+    }
+
+    #[tokio::test]
+    async fn async_stream_rejects_unsupported_version_before_payload() {
+        let mut bytes = Frame::new(1, vec![0; 8]).encode();
+        bytes[4] = PROTOCOL_VERSION + 1;
+        bytes.truncate(HEADER_LEN);
+        let mut reader = AsyncFrames::new(std::io::Cursor::new(bytes));
+        assert_eq!(reader.next_frame().await, Err(FrameError::UnsupportedVersion(PROTOCOL_VERSION + 1)));
     }
 
     #[test]

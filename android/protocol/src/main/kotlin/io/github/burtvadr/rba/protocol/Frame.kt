@@ -56,7 +56,7 @@ class Frame(
     companion object {
         val MAGIC = byteArrayOf('P'.code.toByte(), 'A'.code.toByte(), 'F'.code.toByte(), '1'.code.toByte())
         const val HEADER_LEN = 13
-        const val PROTOCOL_VERSION = 1
+        const val PROTOCOL_VERSION = Limits.PROTOCOL_VERSION
         const val MAX_FRAME_PAYLOAD = 65_536
 
         /**

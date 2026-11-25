@@ -107,6 +107,10 @@ pub const RATE_AUTH: u32 = 30;
 pub const RATE_AUTH_WINDOW: u64 = 60;
 pub const RATE_BLE_AUTH: u32 = 15;
 pub const RATE_BLE_AUTH_WINDOW: u64 = 120;
+/// Shared prompt reservation ceiling per account and per device, across transports.
+/// This is intentionally stricter than the transport ceilings (SEC-003).
+pub const RATE_AUTH_PROMPT: u32 = 3;
+pub const RATE_AUTH_PROMPT_WINDOW: u64 = 60;
 
 /// Which freshness window applies. BLE is slower, so it is given a tighter
 /// window to compensate for reduced transport reliability.
@@ -408,6 +412,14 @@ pub struct SessionHello {
     pub transports: Vec<String>,
 }
 
+/// The protocol has one supported wire version, not a negotiation range.
+fn validate_wire_version(version: u64) -> Result<()> {
+    if version != crate::PROTOCOL_VERSION {
+        return Err(ProtocolError::UnsupportedVersion(u8::try_from(version).unwrap_or(u8::MAX)));
+    }
+    Ok(())
+}
+
 impl SessionHello {
     pub fn to_payload(&self) -> Vec<u8> {
         cbor::encode(&Value::map([
@@ -457,11 +469,7 @@ impl SessionHello {
             session_id: req_id(&v, "session_id")?,
             transports,
         };
-        if h.protocol_version != crate::PROTOCOL_VERSION {
-            return Err(ProtocolError::UnsupportedVersion(
-                crate::PROTOCOL_VERSION as u8,
-            ));
-        }
+        validate_wire_version(h.protocol_version)?;
         if h.host_key_id.len() != 64
             || !h
                 .host_key_id
@@ -507,8 +515,10 @@ impl SessionHelloAck {
         }
         let mut nonce = [0u8; CHALLENGE_LEN];
         nonce.copy_from_slice(nb);
+        let protocol_version = req_uint(&v, "protocol_version")?;
+        validate_wire_version(protocol_version)?;
         Ok(SessionHelloAck {
-            protocol_version: req_uint(&v, "protocol_version")?,
+            protocol_version,
             device_id: req_id(&v, "device_id")?,
             device_key_id: req_text(&v, "device_key_id")?,
             device_nonce: nonce,
@@ -766,6 +776,33 @@ mod tests {
             Id::random().unwrap(),
         );
         assert!(e.is_err());
+    }
+
+    #[test]
+    fn hello_and_ack_reject_every_unsupported_version_sample() {
+        let mut hello = SessionHello {
+            protocol_version: crate::PROTOCOL_VERSION,
+            host_id: Id([1; 16]),
+            host_key_id: "a".repeat(64),
+            host_nonce: [2; CHALLENGE_LEN],
+            session_id: Id([3; 16]),
+            transports: vec!["wifi".into()],
+        };
+        let mut ack = SessionHelloAck {
+            protocol_version: crate::PROTOCOL_VERSION,
+            device_id: Id([4; 16]),
+            device_key_id: "b".repeat(64),
+            device_nonce: [5; CHALLENGE_LEN],
+            session_id: hello.session_id,
+        };
+        assert_eq!(SessionHello::from_payload(&hello.to_payload()).unwrap(), hello);
+        assert_eq!(SessionHelloAck::from_payload(&ack.to_payload()).unwrap(), ack);
+        for version in [0, crate::PROTOCOL_VERSION + 1, 255, 256, u64::MAX] {
+            hello.protocol_version = version;
+            ack.protocol_version = version;
+            assert!(matches!(SessionHello::from_payload(&hello.to_payload()), Err(ProtocolError::UnsupportedVersion(_))));
+            assert!(matches!(SessionHelloAck::from_payload(&ack.to_payload()), Err(ProtocolError::UnsupportedVersion(_))));
+        }
     }
 
     #[test]

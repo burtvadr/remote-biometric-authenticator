@@ -43,7 +43,7 @@ typealias ProtocolResult<T> = Result<T>
 /** Constants fixed by the specification. */
 object Limits {
     const val PROTOCOL_VERSION = 1
-    const val PROTOCOL_VERSION_LONG = 1L
+    val PROTOCOL_VERSION_LONG: Long = PROTOCOL_VERSION.toLong()
     const val ID_LEN = 16
     const val CHALLENGE_LEN = 32
     const val PUBKEY_LEN = 65
@@ -350,8 +350,13 @@ data class SessionHelloAck(
             if (nonce.size != Limits.CHALLENGE_LEN) {
                 throw ProtocolException(ErrorCode.BAD_REQUEST, "device_nonce must be 32 bytes")
             }
+            val version = (v["protocol_version"] as? Cbor.Value.Uint)?.value
+                ?: throw ProtocolException(ErrorCode.BAD_REQUEST, "missing protocol_version")
+            if (version != Limits.PROTOCOL_VERSION_LONG) {
+                throw ProtocolException(ErrorCode.UNSUPPORTED_VERSION, "protocol_version $version")
+            }
             return SessionHelloAck(
-                protocolVersion = (v["protocol_version"] as Cbor.Value.Uint).value,
+                protocolVersion = version,
                 deviceId = Id((v["device_id"] as Cbor.Value.Bytes).value),
                 deviceKeyId = (v["device_key_id"] as Cbor.Value.Text).value,
                 deviceNonce = nonce,

@@ -260,3 +260,29 @@ pub fn finish_device(exchange: DeviceExchange, host_share: &[u8], host_tag: &[u8
     let _confirmed = unconfirmed.verify_peer(host_tag)?;
     Ok(tag)
 }
+
+/// The V2 protocol layer constructs and validates the exact deterministic
+/// CBOR ENROLL-CONTEXT transcript before calling this primitive. Identities
+/// are the same host/credential IDs used in that transcript. This is not a
+/// wire decoder: never pass arbitrary peer bytes here. No legacy AAD fallback.
+fn check_v2_context(host: &[u8;16], credential: &[u8;16], aad: &[u8]) -> Result<(), Error> {
+    const DOMAIN: &[u8] = b"RBA-V2-ENROLL-CONTEXT\0";
+    if *host == [0;16] || *credential == [0;16] || aad.len() <= DOMAIN.len() || aad.len() > 4096 || !aad.starts_with(DOMAIN) {
+        return Err(Error::InvalidContext);
+    }
+    Ok(())
+}
+
+pub fn start_host_v2(code: PairingCode, host: &[u8;16], credential: &[u8;16], aad: &[u8], rng: &mut impl CryptoRng) -> Result<(Vec<u8>, HostExchange), Error> {
+    check_v2_context(host, credential, aad)?;
+    let scalar = password_scalar(code)?;
+    let (share, state) = PartyA::<Spake2P256>::start(&scalar, host, credential, aad, rng).map_err(|_| Error::ExchangeFailed)?;
+    Ok((share, HostExchange(state)))
+}
+
+pub fn start_device_v2(code: PairingCode, host: &[u8;16], credential: &[u8;16], aad: &[u8], rng: &mut impl CryptoRng) -> Result<(Vec<u8>, DeviceExchange), Error> {
+    check_v2_context(host, credential, aad)?;
+    let scalar = password_scalar(code)?;
+    let (share, state) = PartyB::<Spake2P256>::start(&scalar, host, credential, aad, rng).map_err(|_| Error::ExchangeFailed)?;
+    Ok((share, DeviceExchange(state)))
+}

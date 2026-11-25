@@ -9,7 +9,12 @@ credential policy or a new enrollment protocol.
 - A pairing attempt consumes the existing per-local-peer budget (5/300 s).
 - A connected authorized device's authentication attempt must satisfy all three
   limits: account (3/60 s), device (3/60 s), and selected transport (the existing
-  protocol limits, Wi-Fi 30/60 s and BLE 15/120 s). No configured limit changes.
+  protocol limits, Wi-Fi 30/60 s and BLE 15/120 s). The BLE limit is 15 per
+  **two minutes**, not per minute. The stricter shared prompt ceiling is deliberate:
+  transport capacity is not permission to generate additional biometric prompts.
+  All numeric limits are centralized in `linux/protocol/src/types.rs`; the
+  `RateLimiter` policy constructors are used for both new and restored budgets.
+  No numeric limit or state format changes in B.0.
 - One engine mutex serializes admission, including persistence. Denials do not
   consume another budget or extend any cooldown. Successful reservations are
   charged even if a later stage fails or a request cannot be dispatched.
@@ -58,6 +63,14 @@ Run from `linux/`: `cargo test -p rba-protocol ratelimit`,
 `cargo test -p rbad admission`, `cargo test --workspace`,
 `cargo fmt --all -- --check`, and `cargo clippy --workspace --all-targets -- -D warnings`.
 The full daemon and phone integration suites must still be exercised.
+
+## B.0 policy boundary
+
+These are admission reservations for possible prompts, not counters for every
+incoming packet or local request. There is not yet an independent inbound-request
+limiter or an elevated-operation prompt class. B.1/B.4 must establish those
+semantics before tuning prompt throughput; do not raise the prompt ceiling merely
+to match transport capacity. Keep the existing durable store on upgrade.
 
 ## Scope boundary
 

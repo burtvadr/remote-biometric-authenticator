@@ -115,3 +115,40 @@ fn generated_code_is_six_ascii_digits() {
     let code = PairingCode::generate().unwrap();
     assert!(code.as_ascii().iter().all(u8::is_ascii_digit));
 }
+
+// V2 application-context input is supplied by the exact protocol codec, not
+// the legacy Context. The fixture is independent Python CBOR output.
+fn v2_aad() -> Vec<u8> {
+    let fixtures=include_str!("../../../protocol/test-vectors/v2-enrollment-context.tsv");
+    let row=fixtures.lines().find(|l|l.starts_with("device-types\t")).unwrap();
+    hex::decode(row.split('\t').nth(1).unwrap()).unwrap()
+}
+fn v2_exchange(aad:&[u8], other:&[u8], host_code:&[u8], device_code:&[u8])->(Unconfirmed,Unconfirmed){
+    let mut rng=rand_core::UnwrapErr(getrandom::SysRng);
+    let (hs,h)=rba_enrollment::start_host_v2(PairingCode::parse(host_code).unwrap(),&[3;16],&[4;16],aad,&mut rng).unwrap();
+    let (ds,d)=rba_enrollment::start_device_v2(PairingCode::parse(device_code).unwrap(),&[3;16],&[4;16],other,&mut rng).unwrap();
+    (h.finish(&ds).unwrap(),d.finish(&hs).unwrap())
+}
+#[test]
+fn v2_application_context_binds_both_entry_directions(){
+    let fixture=include_str!("../../../protocol/test-vectors/v2-enrollment-context.tsv");
+    for row in fixture.lines().filter(|l|!l.starts_with('#')) {
+        let aad=hex::decode(row.split('\t').nth(1).unwrap()).unwrap();
+        let (h,d)=v2_exchange(&aad,&aad,b"000123",b"000123");
+        let hm=h.confirmation().to_vec();let dm=d.confirmation().to_vec();
+        assert_eq!(h.verify_peer(&dm).unwrap().key_material(),d.verify_peer(&hm).unwrap().key_material());
+    }
+}
+#[test]
+fn v2_wrong_code_and_context_mismatch_fail(){
+    let aad=v2_aad();let (h,d)=v2_exchange(&aad,&aad,b"000123",b"000124");verify_rejected(h,d);
+    let mut other=aad.clone();let last=other.len()-1;other[last]^=1;
+    let (h,d)=v2_exchange(&aad,&other,b"000123",b"000123");verify_rejected(h,d);
+}
+#[test]
+fn v2_rejects_legacy_context_and_invalid_identities(){
+    let mut rng=rand_core::UnwrapErr(getrandom::SysRng);
+    for (host,aad) in [([3;16],vec![0;219]),([0;16],v2_aad()),([3;16],vec![0;4097])] {
+        assert!(matches!(rba_enrollment::start_host_v2(PairingCode::parse(b"000123").unwrap(),&host,&[4;16],&aad,&mut rng),Err(Error::InvalidContext)));
+    }
+}

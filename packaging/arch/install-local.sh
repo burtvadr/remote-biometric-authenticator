@@ -41,6 +41,9 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+echo "V2 candidate: system installation blocked until B.4/B.5 acceptance." >&2
+exit 1
+
 if [ "$(id -u)" -ne 0 ]; then
     echo "Run this with sudo/root." >&2
     exit 1

@@ -35,6 +35,15 @@ impl RateLimiter {
         RateLimiter::new(Limit::new(max_events, window_secs))
     }
 
+    /// Policy for a potential biometric prompt, shared across transports.
+    pub const fn prompt_limit() -> Limit {
+        Limit::new(crate::types::RATE_AUTH_PROMPT, crate::types::RATE_AUTH_PROMPT_WINDOW)
+    }
+
+    pub const fn pairing_limit() -> Limit {
+        Limit::new(crate::types::RATE_PAIRING, crate::types::RATE_PAIRING_WINDOW)
+    }
+
     pub fn new(limit: Limit) -> RateLimiter {
         RateLimiter {
             limit,

@@ -1,0 +1,44 @@
+[package]
+name = "rba-v2-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+rba-protocol = { path = "../protocol" }
+rbad = { path = "../rbad" }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "v2_frame"
+path = "fuzz_targets/v2_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v2_payload"
+path = "fuzz_targets/v2_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v2_transcript"
+path = "fuzz_targets/v2_transcript.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v2_host_state"
+path = "fuzz_targets/v2_host_state.rs"
+test = false
+doc = false
+bench = false

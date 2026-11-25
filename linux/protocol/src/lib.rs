@@ -31,11 +31,16 @@ pub mod pairing;
 pub mod ratelimit;
 pub mod types;
 pub mod verifier;
+pub mod v2_wire;
+pub mod v2_message;
+mod v2_text_profile;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Protocol version implemented by this crate (`PROTOCOL.md` §5, §17).
 pub const PROTOCOL_VERSION: u64 = 1;
+// The same version is encoded in a single byte in frames and signatures.
+const _: () = assert!(PROTOCOL_VERSION > 0 && PROTOCOL_VERSION <= u8::MAX as u64);
 
 /// Hard cap on a frame payload, from `PROTOCOL.md` §11.
 pub const MAX_FRAME_PAYLOAD: usize = 65_536;

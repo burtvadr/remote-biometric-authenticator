@@ -10,6 +10,7 @@ CARGO ?= cargo
 GRADLE ?= $(HOME)/.local/tc/gradle-8.10.2/bin/gradle
 KTORLIN_HOME ?= $(HOME)/.local/tc/kotlin/kotlinc
 JDK_HOME ?= $(HOME)/.local/tc/jdk21
+KOTLIN_JVM_TARGET ?= 21
 ANDROID_HOME ?= $(HOME)/android-sdk
 VECTORS := protocol/test-vectors
 
@@ -23,7 +24,7 @@ help: ## Show this help
 	@echo "Quick start:"
 	@echo "  make vectors        regenerate the cross-language protocol vectors"
 	@echo "  make test           Rust unit, security and vector tests"
-	@echo "  make e2e            full daemon + simulator smoke test"
+	@echo "  make e2e            blocked until V2 local IPC is implemented"
 	@echo "  make verify         everything that does not need an Android device"
 	@echo "  make android-all    lint, test and build the Android app"
 
@@ -76,15 +77,21 @@ vectors-kt: ## Run the Kotlin implementation against the shared vectors
 		export JAVA_HOME="$(JDK_HOME)"; export PATH="$(JDK_HOME)/bin:$(PATH)"; \
 		echo "==> compiling the Kotlin protocol implementation"; \
 		mkdir -p build/kotlin-protocol; \
-		$(KTORLIN_HOME)/bin/kotlinc -jvm-target 21 -d build/kotlin-protocol \
+		$(KTORLIN_HOME)/bin/kotlinc -jvm-target $(KOTLIN_JVM_TARGET) -d build/kotlin-protocol \
 			android/protocol/src/main/kotlin/io/github/burtvadr/rba/protocol/*.kt \
 			android/protocol/src/test/kotlin/io/github/burtvadr/rba/protocol/VectorRunner.kt \
+			android/protocol/src/test/kotlin/io/github/burtvadr/rba/protocol/V2WireVectors.kt \
+			android/protocol/src/test/kotlin/io/github/burtvadr/rba/protocol/V2MessageVectors.kt \
+			android/protocol/src/test/kotlin/io/github/burtvadr/rba/protocol/V2DevicePolicyTests.kt \
+			android/protocol/src/test/kotlin/io/github/burtvadr/rba/protocol/V2AuthenticationTests.kt \
+			android/protocol/src/test/kotlin/io/github/burtvadr/rba/protocol/V2EnrollmentTests.kt \
+			android/protocol/src/test/kotlin/io/github/burtvadr/rba/protocol/V2FuzzDrivers.kt \
 			android/protocol/src/test/kotlin/io/github/burtvadr/rba/protocol/Main.kt || exit 1; \
 		echo "==> running the conformance vectors"; \
 		$(JDK_HOME)/bin/java -cp "build/kotlin-protocol:$(KTORLIN_HOME)/lib/kotlin-stdlib.jar" \
 			io.github.burtvadr.rba.protocol.MainKt $(VECTORS); \
 	else \
-		echo "skipping: need both a JDK (JDK_HOME=$(JDK_HOME)) and kotlinc (KTORLIN_HOME=$(KTORLIN_HOME))"; \
+		echo "ERROR: need both a JDK (JDK_HOME=$(JDK_HOME)) and kotlinc (KTORLIN_HOME=$(KTORLIN_HOME))" >&2; exit 1; \
 	fi
 
 .PHONY: conformance
@@ -95,27 +102,35 @@ conformance: test-protocol vectors-kt ## Both implementations against the vector
 # ---------------------------------------------------------------------------
 
 .PHONY: e2e
-e2e: build ## Run the full daemon + simulator smoke test
-	./tests/e2e-smoke.sh
+e2e: ## V2 candidate has no verified live local IPC adapter yet
+	@echo "V2 live end-to-end test blocked until B.4 IPC integration; run cargo tests for TLS loopbacks." >&2
+	@false
 
 .PHONY: pam-test
 pam-test: build ## Load the real module into libpam and drive real authentication
-	./tests/pam-integration.sh
+	@echo "V2 candidate: live OS integration is blocked until B.4/B.5 acceptance." >&2
+	@false
 
 .PHONY: sudo-test
 sudo-test: build ## Insert into /etc/pam.d/sudo, test, then roll back (needs root)
-	./tests/sudo-integration.sh
+	@echo "V2 candidate: live OS integration is blocked until B.4/B.5 acceptance." >&2
+	@false
 
 .PHONY: verify
-verify: lint test vectors-kt e2e ## Everything verifiable without an Android device
+verify: lint test vectors-kt ## Candidate automated checks only, not live acceptance
+	python3 protocol/tools/v2_candidate_entry_tests.py
+	python3 protocol/tools/v2_store_tests.py
+	python3 protocol/tools/v2_device_store_tests.py
 
 .PHONY: polkit-test
 polkit-test: build ## Register a real polkit agent and drive a real authorization (needs root)
-	./tests/polkit-integration.sh
+	@echo "V2 candidate: live OS integration is blocked until B.4/B.5 acceptance." >&2
+	@false
 
 .PHONY: common-auth-test
 common-auth-test: build ## One common-auth line: prove every password prompt uses the device
-	./tests/common-auth-integration.sh
+	@echo "V2 candidate: live OS integration is blocked until B.4/B.5 acceptance." >&2
+	@false
 
 .PHONY: verify-pam
 verify-pam: lint test vectors-kt e2e pam-test sudo-test ## Verify, including a live PAM and a real sudo

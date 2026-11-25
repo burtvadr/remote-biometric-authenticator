@@ -76,6 +76,9 @@ main() {
         shift
     done
 
+    echo "V2 candidate: PAM enablement blocked until B.4/B.5 acceptance. Rollback remains available." >&2
+    return 1
+
     validate_timeout
     require_root
 

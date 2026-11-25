@@ -13,6 +13,36 @@ import kotlin.test.assertTrue
  * fixture directory, fails loudly and early.
  */
 class ConformanceTest {
+    @Test
+    fun `V2 wire agrees with independent fixtures`() {
+        assertTrue(V2WireVectors.run(vectorsDir()) >= 60)
+    }
+
+
+    @Test
+    fun `V2 message and transcript fixtures`() {
+        assertTrue(V2MessageVectors.run(vectorsDir()) >= 250)
+    }
+
+    @Test
+    fun `V2 device policy intersects exact committed grants`() {
+        assertTrue(V2DevicePolicyTests.run(vectorsDir()) >= 20)
+    }
+
+    @Test
+    fun `V2 authentication state transitions and signatures`() {
+        assertTrue(V2AuthenticationTests.run(vectorsDir()) >= 20)
+    }
+
+    @Test
+    fun `V2 enrollment transitions and receipt recovery`() {
+        assertTrue(V2EnrollmentTests.run(vectorsDir()) >= 35)
+    }
+
+    @Test
+    fun `V2 state trace replay`() {
+        assertTrue(V2JvmStateFuzz.replay(vectorsDir()) == 42)
+    }
 
     private fun vectorsDir(): File {
         val candidates = listOf(
@@ -45,6 +75,9 @@ class ConformanceTest {
         val dir = vectorsDir()
         for (name in listOf(
             "cbor-canonical.json",
+            "v2-wire.tsv",
+            "v2-message.tsv",
+            "v2-enrollment-context.tsv",
             "framing.json",
             "messages.json",
             "signing-transcript.json",

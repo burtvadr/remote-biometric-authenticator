@@ -21,6 +21,8 @@ pub mod registry;
 pub mod server;
 pub mod tls;
 pub mod transport;
+pub mod v2_store;
+pub mod v2_tls;
 
 use std::sync::Arc;
 

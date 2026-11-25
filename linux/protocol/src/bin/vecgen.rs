@@ -24,7 +24,7 @@ use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::SecretKey as P256SecretKey;
 use rba_protocol::cbor;
 use rba_protocol::crypto::{self, PrivateKey};
-use rba_protocol::frame::{Frame, HEADER_LEN, MAGIC};
+use rba_protocol::frame::{Frame, HEADER_LEN, MAGIC, PROTOCOL_VERSION};
 use rba_protocol::messages::Message;
 use rba_protocol::pairing::{PairingChallenge, PairingConfirmed, PairingProof, PairingResult, PairingStart, PairingSubmit};
 use rba_protocol::types::{
@@ -379,10 +379,10 @@ fn main() {
             }
         ],
         "rejected": [
-            {"name": "bad_magic", "hex": hexs(&malformed_header(b"\xDE\xAD\xBE\xEF", 1, 1, 0, 0)), "reason": "magic is not PAF1"},
-            {"name": "future_version", "hex": hexs(&malformed_header(&MAGIC, 2, 1, 0, 0)), "reason": "version 2 is not implemented"},
-            {"name": "nonzero_flags", "hex": hexs(&malformed_header(&MAGIC, 1, 1, 1, 0)), "reason": "flags must be zero in v1"},
-            {"name": "oversized_length", "hex": hexs(&malformed_header(&MAGIC, 1, 1, 0, 70_000)), "reason": "payload length exceeds the cap"}
+            {"name": "bad_magic", "hex": hexs(&malformed_header(b"\xDE\xAD\xBE\xEF", PROTOCOL_VERSION, 1, 0, 0)), "reason": "magic is not PAF1"},
+            {"name": "future_version", "hex": hexs(&malformed_header(&MAGIC, PROTOCOL_VERSION + 1, 1, 0, 0)), "reason": format!("version {} is not implemented", PROTOCOL_VERSION + 1)},
+            {"name": "nonzero_flags", "hex": hexs(&malformed_header(&MAGIC, PROTOCOL_VERSION, 1, 1, 0)), "reason": format!("flags must be zero in v{}", PROTOCOL_VERSION)},
+            {"name": "oversized_length", "hex": hexs(&malformed_header(&MAGIC, PROTOCOL_VERSION, 1, 0, 70_000)), "reason": "payload length exceeds the cap"}
         ]
     });
     write_json(&out_dir.join("framing.json"), &framing);
@@ -420,7 +420,7 @@ fn main() {
             "msg_type": 10,
             "payload_hex": hexs(
                 &Message::SessionHello(SessionHello {
-                    protocol_version: 1,
+                    protocol_version: rba_protocol::PROTOCOL_VERSION,
                     host_id: det_id(0x22),
                     host_key_id: host_sk.public_key().key_id_hex(),
                     host_nonce: [0x66; 32],
@@ -435,7 +435,7 @@ fn main() {
             "msg_type": 11,
             "payload_hex": hexs(
                 &Message::SessionHelloAck(SessionHelloAck {
-                    protocol_version: 1,
+                    protocol_version: rba_protocol::PROTOCOL_VERSION,
                     device_id: det_id(0x33),
                     device_key_id: device_pk.key_id_hex(),
                     device_nonce: [0x77; 32],

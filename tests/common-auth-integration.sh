@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# V2 candidate does not expose the legacy local ABI.
+echo "V2 candidate: live legacy integration test blocked until B.4/B.5 acceptance." >&2
+exit 1
 # Proves the thing the whole project actually wants: a password prompt anywhere on the
 # system authenticates with the device, with no per-service editing.
 #

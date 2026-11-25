@@ -74,3 +74,27 @@ pub extern "system" fn Java_io_github_burtvadr_rba_session_NativeEnrollment_canc
         if active.as_ref().map(|v| v.0) == Some(handle) { active.take(); }
     }
 }
+
+// V2 uses the same single-use slot and handle allocator as the existing
+// primitive. No key material or native pointer is returned to Kotlin.
+#[no_mangle]
+pub extern "system" fn Java_io_github_burtvadr_rba_session_NativeEnrollment_startDeviceV2(
+    mut env: JNIEnv, _: JClass, code: JByteArray, host: JByteArray, credential: JByteArray, aad: JByteArray,
+) -> jbyteArray {
+    let result = (|| {
+        if env.get_array_length(&code).ok()? != 6 || env.get_array_length(&host).ok()? != 16 || env.get_array_length(&credential).ok()? != 16 || !(1..=4096).contains(&env.get_array_length(&aad).ok()?) { return None; }
+        let code = Zeroizing::new(env.convert_byte_array(&code).ok()?);
+        let host: [u8;16] = env.convert_byte_array(&host).ok()?.try_into().ok()?;
+        let credential: [u8;16] = env.convert_byte_array(&credential).ok()?.try_into().ok()?;
+        let aad = env.convert_byte_array(&aad).ok()?;
+        let mut active = ACTIVE.lock().ok()?;
+        if active.is_some() { return None; }
+        let mut rng = rand_core::UnwrapErr(getrandom::SysRng);
+        let (share, exchange) = rba_enrollment::start_device_v2(PairingCode::parse(&code).ok()?, &host, &credential, &aad, &mut rng).ok()?;
+        let handle = NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)).ok()?;
+        let mut out = handle.to_be_bytes().to_vec(); out.extend_from_slice(&share);
+        let array = env.byte_array_from_slice(&out).ok()?;
+        *active = Some((handle, exchange)); Some(array)
+    })();
+    match result { Some(array) => array.into_raw(), None => failure(&mut env) }
+}

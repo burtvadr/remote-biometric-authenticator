@@ -326,7 +326,7 @@ fn a_message_payload_vector_parses_into_the_expected_type() {
     let frame = Frame::new(11, payload);
     match Message::from_frame(&frame).unwrap() {
         Message::SessionHelloAck(a) => {
-            assert_eq!(a.protocol_version, 1);
+            assert_eq!(a.protocol_version, rba_protocol::PROTOCOL_VERSION);
             assert_eq!(a.device_key_id.len(), 64);
         }
         other => panic!("expected SESSION_HELLO_ACK, got {}", other.name()),

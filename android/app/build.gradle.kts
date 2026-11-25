@@ -68,6 +68,9 @@ dependencies {
     // The protocol is implemented in Kotlin in a sibling module, independently
     // of the Rust implementation and validated against the shared vectors.
     implementation(project(":protocol"))
+    // Explicit, app-local provider for the public RFC 9266 exporter API.
+    // No global provider registration or hidden platform API reflection.
+    implementation("org.conscrypt:conscrypt-android:2.9.0")
 
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")

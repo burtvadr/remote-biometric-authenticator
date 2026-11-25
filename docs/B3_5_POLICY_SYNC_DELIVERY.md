@@ -1,0 +1,17 @@
+# B.3.5 — Durable policy synchronization
+
+The policy protocol now uses the existing V2 POLICY_OFFER, POLICY_DECISION and POLICY_RECEIPT types. The host authority originates a single offer on a classified, active, unused TLS connection for the explicitly selected credential and verified owner principal. The operation is bound to the local owner, session, base revision, exact canonical digest, and a 60-second monotonic/wall deadline. An accepted vote commits expansion in SQLite; decline or stale/wrong-session decisions do not expand rights. The authority issues only its exact one-shot terminal receipt. Removal is immediate on the host without requiring an online phone, and invalidates affected in-flight authorization. Mixed changes must remove rights first, then offer expansion. An already committed revision can be re-offered after lost delivery, without incrementing the revision or reapplying grants. A stale phone cannot authenticate against a newer host revision.
+
+The device persists a separate canonical policy snapshot in `policy_records` linked to the immutable enrollment record. Initial activation and initial snapshot insertion are transactional. Updates require the exact old snapshot and an authenticated matching receipt, and are serialized in a SQLite transaction. Policy loading rechecks the enrollment/key binding and denies empty policy. Existing local denials are preserved for retained grants; new grants require exact user consent. No policy is installed from an authentication request. The operation owner monitors disconnection during review and closes after receipt. Concrete consent UI and verified local IPC routing remain later integration work.
+
+Development database compatibility: the strict Android schema now includes `policy_records`, foreign-key enforcement and active/pending consistency checks. Existing experimental databases lacking this table are intentionally rejected; no migration or automatic destructive reset. Use a newly initialized disposable test installation and fresh enrollment. Do not delete existing user state automatically. Host schema unchanged.
+
+## Executed here
+
+- Kotlin standalone protocol/conformance suite, JVM target 17, JDK 21: 704 checks (82 wire, 306 messages, 39 policy including 17 new, 25 auth, 59 enrollment, 42 structured traces, 151 existing). Exhaustive text repertoire comparison also passed.
+- Python SQLite host schema: 8/8; Android schema: 4/4 including policy transaction/reopen, stale conditional update and foreign key/cascade test. These are not Android runtime tests.
+- `git diff --check` and archive/patch verification.
+
+## Local verification required
+
+Run `cargo test -p rbad --locked policy_sync_`, full Rust tests, `cargo check --workspace --all-targets --locked`, `make vectors-kt`, both SQLite scripts, Android debug compilation/unit tests/lint and physical Android instrumentation. New Rust tests are unexecuted here (Cargo/rustc unavailable). Verify lost receipt recovery across actual TLS endpoints, policy snapshot reopening and cancellation/revocation races on the device. Do not infer this from standalone JVM tests. No new dependencies; no portable-core extraction. Reconstructed baseline includes B.3.5 Android dispatch patch, not the latest external working tree. The transport-key digest policy approval, B.2.5 coverage analysis, physical hardware acceptance, revocation recovery, startup orphaned-alias cleanup and coordinated runtime cutover remain open. No SEC findings are closed by this delivery.

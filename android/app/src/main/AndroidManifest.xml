@@ -1,51 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-
-    <!--
-      Permissions are the minimum the two transports need. Neither grants the app
-      the ability to read biometric material: the platform biometric stack owns
-      that entirely.
-    -->
+    <!-- V2 candidate: manual TCP endpoint, strong biometrics and explicit listener. -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
-    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
-
-    <!-- BLE transport. -->
-    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
-    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
-    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
-    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-    <!--
-      BLE scanning needs location on API 28-30 and both location permissions there.
-      From API 31 the BLUETOOTH_SCAN permission replaces this.
-    -->
-    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"
-        android:maxSdkVersion="30" />
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
-        android:maxSdkVersion="30" />
-
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
-
-    <!--
-      Background operation. The service only keeps an idle local-network link
-      alive; it does not poll while the connection is healthy. SPECIAL_USE is the
-      honest foreground-service type for a long-lived device link that is neither
-      media nor location.
-    -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
-
-    <!-- The app performs no network access of its own beyond the local link. -->
     <uses-feature android:name="android.hardware.fingerprint" android:required="false" />
-
     <application
-        android:name=".RbaApplication"
         android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="false"
@@ -55,112 +17,20 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.Rba"
         android:usesCleartextTraffic="false">
-
-        <activity
-            android:name=".MainActivity"
-            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode"
-            android:exported="false"
-            android:launchMode="singleTask"
-            android:theme="@style/Theme.Rba" />
-
-        <activity
-            android:name=".AuthPromptActivity"
-            android:excludeFromRecents="true"
-            android:exported="false"
-            android:launchMode="singleTop"
-            android:taskAffinity=""
-            android:theme="@style/Theme.Rba.Transparent" />
-
-        <!--
-          One launcher entry per icon style. Exactly one is enabled at a time;
-          AppIconController switches them without killing the process. The base
-          activity has no LAUNCHER filter, so there is never a duplicate icon.
-        -->
-        <activity-alias
-            android:name=".LauncherAuto"
-            android:enabled="true"
-            android:exported="true"
-            android:icon="@mipmap/ic_launcher_dark"
-            android:label="@string/app_name"
-            android:roundIcon="@mipmap/ic_launcher_dark"
-            android:targetActivity=".MainActivity">
+        <activity android:name=".ui.v2.V2OperatorActivity" android:exported="false" />
+        <activity-alias android:name=".V2Launcher" android:exported="true"
+            android:targetActivity=".ui.v2.V2OperatorActivity">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity-alias>
-
-        <activity-alias
-            android:name=".LauncherLight"
-            android:enabled="false"
-            android:exported="true"
-            android:icon="@mipmap/ic_launcher_light"
-            android:label="@string/app_name"
-            android:roundIcon="@mipmap/ic_launcher_light"
-            android:targetActivity=".MainActivity">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity-alias>
-
-        <activity-alias
-            android:name=".LauncherDark"
-            android:enabled="false"
-            android:exported="true"
-            android:icon="@mipmap/ic_launcher_dark"
-            android:label="@string/app_name"
-            android:roundIcon="@mipmap/ic_launcher_dark"
-            android:targetActivity=".MainActivity">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity-alias>
-
-        <activity-alias
-            android:name=".LauncherMaterial"
-            android:enabled="false"
-            android:exported="true"
-            android:icon="@mipmap/ic_launcher_material"
-            android:label="@string/app_name"
-            android:roundIcon="@mipmap/ic_launcher_material"
-            android:targetActivity=".MainActivity">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity-alias>
-
-        <activity-alias
-            android:name=".LauncherScrcpy"
-            android:enabled="false"
-            android:exported="true"
-            android:icon="@mipmap/ic_launcher_scrcpy"
-            android:label="@string/app_name"
-            android:roundIcon="@mipmap/ic_launcher_scrcpy"
-            android:targetActivity=".MainActivity">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity-alias>
-
-        <service
-            android:name=".service.AuthService"
-            android:exported="false"
+        <activity android:name=".ui.v2.V2NotificationActivity"
+            android:exported="false" android:excludeFromRecents="true" />
+        <service android:name=".service.V2BackgroundService" android:exported="false"
             android:foregroundServiceType="specialUse">
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Keeps a local-network link to a paired host so a fingerprint request can be answered without the app being open." />
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="User-enabled mutually authenticated local-network listener for foreground authentication review." />
         </service>
-
-        <receiver
-            android:name=".service.BootReceiver"
-            android:exported="false">
-            <intent-filter>
-                <action android:name="android.intent.action.BOOT_COMPLETED" />
-            </intent-filter>
-        </receiver>
     </application>
 </manifest>

@@ -9,11 +9,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use rba_protocol::errors::{ProtocolError, Result};
-use rba_protocol::ratelimit::{Limit, RateLimiter};
-use rba_protocol::types::{Transport, RATE_PAIRING, RATE_PAIRING_WINDOW};
+use rba_protocol::ratelimit::RateLimiter;
+use rba_protocol::types::Transport;
 
-const PROMPT_LIMIT: Limit = Limit::new(3, 60);
-const PAIRING_LIMIT: Limit = Limit::new(RATE_PAIRING, RATE_PAIRING_WINDOW);
 const FORMAT: &str = "rba-admission-v1";
 const SECTIONS: [&str; 5] = ["pairing", "wifi", "ble", "accounts", "devices"];
 
@@ -38,11 +36,11 @@ struct Budgets {
 impl Budgets {
     fn new() -> Self {
         Self {
-            pairing: RateLimiter::new(PAIRING_LIMIT),
+            pairing: RateLimiter::new(RateLimiter::pairing_limit()),
             wifi: RateLimiter::for_auth_transport(Transport::Wifi),
             ble: RateLimiter::for_auth_transport(Transport::Ble),
-            accounts: RateLimiter::new(PROMPT_LIMIT),
-            devices: RateLimiter::new(PROMPT_LIMIT),
+            accounts: RateLimiter::new(RateLimiter::prompt_limit()),
+            devices: RateLimiter::new(RateLimiter::prompt_limit()),
             last_admitted: 0,
         }
     }
@@ -83,8 +81,8 @@ impl Budgets {
         let last_admitted = header.strip_prefix(format!("{FORMAT} ").as_str())
             .and_then(|ts| ts.parse().ok()).ok_or_else(invalid_state)?;
         let mut remaining = body;
-        let limits = [PAIRING_LIMIT, RateLimiter::for_auth_transport(Transport::Wifi).limit(),
-            RateLimiter::for_auth_transport(Transport::Ble).limit(), PROMPT_LIMIT, PROMPT_LIMIT];
+        let limits = [RateLimiter::pairing_limit(), RateLimiter::for_auth_transport(Transport::Wifi).limit(),
+            RateLimiter::for_auth_transport(Transport::Ble).limit(), RateLimiter::prompt_limit(), RateLimiter::prompt_limit()];
         let mut decoded = Vec::new();
         for (index, (section, limit)) in SECTIONS.iter().zip(limits).enumerate() {
             remaining = remaining.strip_prefix(format!("[{section}]\n").as_str())
@@ -209,6 +207,32 @@ impl Admission {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rba_protocol::types::{RATE_AUTH_PROMPT, RATE_AUTH_PROMPT_WINDOW, RATE_PAIRING, RATE_PAIRING_WINDOW};
+
+    #[test]
+    fn admission_uses_central_policy_for_new_and_restored_budgets() {
+        let fresh = Budgets::new();
+        let restored = Budgets::decode(&fresh.encode()).unwrap();
+        for budgets in [&fresh, &restored] {
+            assert_eq!(budgets.accounts.limit(), RateLimiter::prompt_limit());
+            assert_eq!(budgets.devices.limit(), RateLimiter::prompt_limit());
+            assert_eq!(budgets.pairing.limit(), RateLimiter::pairing_limit());
+            assert_eq!(budgets.wifi.limit(), RateLimiter::for_auth_transport(Transport::Wifi).limit());
+            assert_eq!(budgets.ble.limit(), RateLimiter::for_auth_transport(Transport::Ble).limit());
+        }
+    }
+
+    #[test]
+    fn prompt_ceiling_is_intentional_even_with_larger_transport_budget() {
+        let mut admission = Admission::open(None).unwrap();
+        for _ in 0..RATE_AUTH_PROMPT {
+            admission.authenticate("alice", "device", Transport::Wifi, 100).unwrap();
+        }
+        assert!(admission.budgets.wifi.peek("device", 101));
+        assert_eq!(admission.authenticate("alice", "device", Transport::Ble, 101),
+            Err(ProtocolError::RateLimited(RATE_AUTH_PROMPT_WINDOW - 1)));
+        admission.authenticate("alice", "device", Transport::Ble, 100 + RATE_AUTH_PROMPT_WINDOW).unwrap();
+    }
 
     fn temp_dir() -> PathBuf {
         std::env::temp_dir().join(format!("rba-admission-{}", rba_protocol::types::Id::random().unwrap().to_hex()))

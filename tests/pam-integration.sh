@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# V2 candidate does not expose the legacy local ABI.
+echo "V2 candidate: live legacy integration test blocked until B.4/B.5 acceptance." >&2
+exit 1
 # PAM integration test: loads the real module into the real libpam and drives real
 # authentication through the whole stack.
 #
