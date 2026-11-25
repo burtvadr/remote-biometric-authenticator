@@ -219,6 +219,17 @@ impl Store {
             Ok(InventoryRecord { id: as_id(id)?, revision, revoked })
         }).collect()
     }
+    /// Standalone user state only. A disabled or renamed identity must not
+    /// silently inherit a previously enrolled principal. System account
+    /// lifecycle tracking is a separate privileged adapter.
+    fn standalone_principal(&self, uid: u32, name: &str) -> Result<Option<Principal>> {
+        let row = self.db.query_row("SELECT id,name,generation,active FROM principals WHERE uid=? ORDER BY active DESC LIMIT 1", [uid], |r| Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,String>(1)?,r.get::<_,Vec<u8>>(2)?,r.get::<_,bool>(3)?))).optional()?;
+        match row {
+            None => Ok(None),
+            Some((id,stored,generation,true)) if stored == name => Ok(Some(Principal{id:as_id(id)?,uid,name:stored,generation:as_id(generation)?})),
+            _ => Err(Error::Denied),
+        }
+    }
     fn tx(&mut self) -> Result<Transaction<'_>> { Ok(self.db.transaction_with_behavior(TransactionBehavior::Immediate)?) }
     fn add_principal(&mut self, p: &Principal, now: i64) -> Result<()> {
         if !valid_id(&p.id) || !valid_id(&p.generation) || p.name.is_empty() || p.name.len()>64 || !p.name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) { return Err(Error::Invalid); }

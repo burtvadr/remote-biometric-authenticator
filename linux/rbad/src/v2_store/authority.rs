@@ -147,6 +147,13 @@ impl Authority {
     }
 
 
+    /// Called only by the standalone same-UID IPC adapter, never by PAM.
+    pub(crate) fn standalone_principal(&mut self, uid:u32, name:&str, create:bool, now:i64)->Result<Principal> {
+        if let Some(p)=self.store.standalone_principal(uid,name)? {return Ok(p)}
+        if !create {return Err(Error::Denied)}
+        let p=Principal{id:random_id()?,uid,name:name.into(),generation:random_id()?};
+        self.store.add_principal(&p,now)?;Ok(p)
+    }
     /// Routing is based on the original locally admitted operation and the
     /// actual classified connection, never on a request ID supplied by a peer.
     pub(crate) fn auth_route(&self, owner: Id, interaction: Id, request: Id, conn: ConnectionId) -> Result<(i64, Instant)> {

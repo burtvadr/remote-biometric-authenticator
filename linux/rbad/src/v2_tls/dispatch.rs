@@ -22,6 +22,7 @@ type Deadline = tokio::time::Instant;
 /// to that interaction, not simply after placing the event in a queue.
 /// Secret fields deliberately have no Debug implementation.
 pub(crate) enum LocalEvent {
+    EnrollmentListening { address: std::net::SocketAddr, shown: oneshot::Sender<()> },
     DisplayNumber { digits: Zeroizing<[u8; 6]>, shown: oneshot::Sender<()> },
     DisplayPairingCode { digits: Zeroizing<[u8; 6]>, shown: oneshot::Sender<()> },
     EnterPairingCode { reply: oneshot::Sender<Zeroizing<[u8; 6]>> },

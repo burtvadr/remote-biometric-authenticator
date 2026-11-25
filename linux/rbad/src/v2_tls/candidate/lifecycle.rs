@@ -69,11 +69,11 @@ fn default_dir()->Result<PathBuf>{
         .ok_or(Error::Invalid)?;
     Ok(base.join("rba/standalone-v2"))
 }
-fn owned_socket(path:&Path)->Result<()> {
+pub(super) fn owned_socket(path:&Path)->Result<()> {
     let m=fs::symlink_metadata(path)?;
     if !m.file_type().is_socket()||m.uid()!=uid()||m.nlink()!=1{return Err(Error::Denied)} Ok(())
 }
-struct SocketGuard(PathBuf);
+pub(super) struct SocketGuard(pub(super) PathBuf);
 impl Drop for SocketGuard{fn drop(&mut self){if owned_socket(&self.0).is_ok(){let _=fs::remove_file(&self.0);}}}
 /// The outer daemon lock is held before binding and until this future exits.
 pub(super) async fn serve_local(dir:&Path,status:&'static str,owner:Owner,shutdown:impl std::future::Future<Output=()>)->Result<()> {
@@ -130,14 +130,18 @@ fn not_listening(e:&Error)->bool{
 fn probe(dir:&Path,request:Request)->Result<Option<Reply>>{
     match query(dir,request){Ok(r)=>Ok(Some(r)),Err(e) if not_listening(&e)=>Ok(None),Err(e)=>Err(e)}
 }
-fn query(dir:&Path,request:Request)->Result<Reply>{
-    private_dir(dir,uid())?;let path=dir.join(SOCKET);owned_socket(&path)?;
+pub(super) fn connect_local(dir:&Path,name:&str)->Result<SyncStream>{
+    private_dir(dir,uid())?;let path=dir.join(name);owned_socket(&path)?;
     let mut stream=SyncStream::connect(path)?;
     // Verify the actual peer, not a PID or a filesystem name.
     let mut cred:libc::ucred=unsafe{std::mem::zeroed()};let mut len=std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     use std::os::fd::AsRawFd;
     if unsafe{libc::getsockopt(stream.as_raw_fd(),libc::SOL_SOCKET,libc::SO_PEERCRED,(&mut cred as *mut libc::ucred).cast(),&mut len)}!=0 || len as usize!=std::mem::size_of::<libc::ucred>()||cred.uid!=uid(){return Err(Error::Denied)}
     stream.set_read_timeout(Some(IO_TIMEOUT))?;stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    Ok(stream)
+}
+fn query(dir:&Path,request:Request)->Result<Reply>{
+    let mut stream=connect_local(dir,SOCKET)?;
     let mut request_bytes=[0u8;5];request_bytes[..4].copy_from_slice(&MAGIC);request_bytes[4]=request.byte();
     stream.write_all(&request_bytes)?;stream.shutdown(std::net::Shutdown::Write)?;
     // Do not turn errors after connection into an absent-server signal.
@@ -225,7 +229,19 @@ pub fn entry()->ExitCode{
                 }
                 Ok(())
             },
-            [a] if a=="help"||a=="--help"=>{println!("rba [devices|start-server|kill-server|status|help|version]\nNo arguments or devices starts the standalone server automatically.\nPairing and authentication IPC are not yet available; system installation is disabled.");Ok(())},
+            [a] if a=="pair"||a=="auth"=>{
+                let dir=default_dir()?; let status=start(&dir)?;
+                super::interaction::client(&dir,&status,if a=="pair" {super::interaction::Request::Pair(EntryDirection::DeviceTypes)} else {super::interaction::Request::Auth(None)})
+            },
+            [a,b,c] if a=="pair"&&b=="--code-entry"=>{
+                let direction=match c.to_str(){Some("host")=>EntryDirection::HostTypes,Some("device")=>EntryDirection::DeviceTypes,_=>return Err(Error::Invalid)};
+                let dir=default_dir()?;let status=start(&dir)?;super::interaction::client(&dir,&status,super::interaction::Request::Pair(direction))
+            },
+            [a,b,c] if a=="auth"&&b=="--device"=>{
+                let id=exact_hex::<16>(c.to_str().ok_or(Error::Invalid)?)?;
+                let dir=default_dir()?;let status=start(&dir)?;super::interaction::client(&dir,&status,super::interaction::Request::Auth(Some(id)))
+            },
+            [a] if a=="help"||a=="--help"=>{println!("rba [devices|pair|auth|start-server|kill-server|status|help|version]\nNo arguments or devices starts the standalone server automatically.\npair [--code-entry device|host]; auth [--device ID]. Device trust must be configured; system installation is disabled.");Ok(())},
             [a] if a=="version"||a=="--version"=>{println!("rba {} (V2 candidate)",env!("CARGO_PKG_VERSION"));Ok(())},
             [a,d] if a=="--initialize-candidate"=>initialize(Path::new(d)),
             [a,d] if a=="--check-candidate"=>check(Path::new(d)),

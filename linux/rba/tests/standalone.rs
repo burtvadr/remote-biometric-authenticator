@@ -101,3 +101,16 @@ fn invalid_lifecycle_request_cannot_stop_server() {
     }
     f.run(&["kill-server"]);
 }
+
+#[test]
+fn interactive_commands_autostart_but_deny_without_trust() {
+    let f=Fixture::new();
+    for args in [&["pair"][..],&["pair","--code-entry","host"][..],&["auth"][..]] {
+        let output=f.cmd().args(args).output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("device trust is not configured"));
+    }
+    assert!(f.run(&["status"]).contains("network authentication disabled"));
+    assert_eq!(f.run(&["devices"]).trim(),"List of devices attached");
+    assert!(!f.data().parent().unwrap().join("operation.sock").exists());
+}

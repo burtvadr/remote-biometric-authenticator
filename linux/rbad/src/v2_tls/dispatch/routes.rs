@@ -60,6 +60,8 @@ impl AdministrativeRoutes {
         let pairing=locked(&self.authority,|a|a.begin_pairing(local.owner,caller,now,mono))?;
         let _guard=LocalGuard{authority:self.authority.clone(),owner:local.owner};
         let listener=local.wait(deadline,async{Ok(TcpListener::bind(address).await?)}).await?;
+        let address=listener.local_addr()?;
+        local.ask(deadline, |shown| LocalEvent::EnrollmentListening { address, shown }).await?;
         let (tcp,_)=local.wait(deadline,async{Ok(listener.accept().await?)}).await?;
         drop(listener); // exactly one transport per admitted pairing
         let channel=local.wait(deadline,accept(tcp,self.authority.clone(),identity,Listener::Enrollment)).await?;

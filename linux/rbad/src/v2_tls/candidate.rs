@@ -9,6 +9,7 @@ use p256::ecdsa::SigningKey;
 use serde::{Deserialize, Serialize};
 mod bootstrap;
 mod lifecycle;
+mod interaction;
 pub use lifecycle::entry;
 use std::{fs::OpenOptions, io::Read, net::SocketAddr, os::unix::fs::OpenOptionsExt, path::Path};
 use tokio::{net::TcpListener, task::JoinSet};
@@ -93,7 +94,7 @@ pub(crate) struct Runtime {
     enrollment_bind:SocketAddr,
 }
 impl Runtime {
-    // Only the future verified IPC adapter may invoke this internal route.
+    // Standalone same-user adapter or future trusted system IPC only.
     pub(crate) async fn enroll(&self,local:LocalLink,caller:Principal,direction:EntryDirection)->Result<ReceiptDelivery>{
         self.administrative.enroll(&self.identity,self.enrollment_bind,local,caller,direction).await
     }
@@ -150,8 +151,10 @@ pub async fn run(dir:&Path,shutdown:impl std::future::Future<Output=()>)->Result
     let listener=TcpListener::bind(m.bind).await?;
     let runtime=Arc::new(Runtime{scheduler:AuthScheduler::new(owner.clone()),administrative:AdministrativeRoutes::new(owner.clone()),owner:owner.clone(),identity:m.identity,signer:m.signer,enrollment_bind:m.enrollment_bind});
     let refresh=refresh(owner.clone(),policy,first);
-    let local=lifecycle::serve_local(dir,"running: configured candidate; trusted local operation IPC pending",owner.clone(),shutdown);
+    let operations=interaction::bind(dir)?;
+    let local=lifecycle::serve_local(dir,"running: configured candidate; standalone CLI only",owner.clone(),shutdown);
     tokio::pin!(refresh,local);
+    let mut local_tasks=JoinSet::new();
     let mut tasks=JoinSet::new();
     let mut tick=tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -159,6 +162,13 @@ pub async fn run(dir:&Path,shutdown:impl std::future::Future<Output=()>)->Result
         tokio::select! {
             biased;
             result=&mut local=>break result,
+            joined=local_tasks.join_next(),if !local_tasks.is_empty()=>{
+                if joined.is_some_and(|r|r.is_err()){break Err(Error::State)}
+            },
+            accepted=operations.listener.accept(),if local_tasks.len()<8=>{
+                let (socket,_)=match accepted{Ok(s)=>s,Err(e)=>break Err(e.into())};
+                let r=runtime.clone();local_tasks.spawn(async move{interaction::serve_connection(socket,r).await;});
+            },
             result=&mut refresh=>break result,
             _=tick.tick()=>{
                 if let Err(e)=runtime.administrative.tick(){break Err(e)}
@@ -177,7 +187,7 @@ pub async fn run(dir:&Path,shutdown:impl std::future::Future<Output=()>)->Result
             }
         }
     };
-    drop(listener);tasks.shutdown().await;result
+    drop(listener);drop(operations);local_tasks.shutdown().await;tasks.shutdown().await;result
 }
 
 #[cfg(test)]
