@@ -7,6 +7,7 @@
 > Keystore/KeyMint failure (`KeyStoreException:-10003`) during EC P-256 key
 > generation. See `docs/B3_7_5_2_GUI_RESTORATION.md` and the `RbaV2Keys` /
 > `RbaV2Enrollment` diagnostic logs. The Linux/CLI side remains functional.
+> aka. (its so fucking secure it doesn't fucking work.)
 
 
 
