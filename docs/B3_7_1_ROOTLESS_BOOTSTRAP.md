@@ -1,5 +1,7 @@
 # B.3.7.1 — Rootless bootstrap and unified lifecycle
 
+The public CLI and lifecycle IPC are updated by [B.3.7.2](B3_7_2_CLI_LIFECYCLE.md). The bootstrap and storage rules below remain in force.
+
 This supersedes the manual first-run provisioning procedure in B3_5_RUNTIME_CANDIDATE.md. The public `rba` executable and internal `rbad` artifact call the same V2 entry. No V1 CLI dispatch, legacy control socket, root escalation, system account creation, PAM changes or service installation occurs.
 
 ## Run as a normal user

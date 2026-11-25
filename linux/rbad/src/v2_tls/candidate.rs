@@ -140,18 +140,17 @@ pub async fn run(dir:&Path,shutdown:impl std::future::Future<Output=()>)->Result
     let data=bootstrap::ensure(dir)?;
     let m=load(&data)?;
     let store=Store::open(&data.join("state"),m.host)?;
-    let Some(policy)=m.policy else {
-        // A fresh instance is running, but it cannot authenticate anyone.
-        // No verifier, authority, TCP listener, or fabricated trust window.
-        let _store=store;
-        return lifecycle::serve_local(dir,"running: device trust not configured; network authentication disabled",shutdown).await;
-    };
     let owner=Arc::new(Mutex::new(Authority::new(store)));
+    let Some(policy)=m.policy else {
+        // Only local lifecycle and read-only inventory are available. No
+        // verifier, TCP listener, or fabricated trust window is installed.
+        return lifecycle::serve_local(dir,"running: device trust not configured; network authentication disabled",owner,shutdown).await;
+    };
     let first=install(&owner,provision(policy.clone()).await?)?;
     let listener=TcpListener::bind(m.bind).await?;
     let runtime=Arc::new(Runtime{scheduler:AuthScheduler::new(owner.clone()),administrative:AdministrativeRoutes::new(owner.clone()),owner:owner.clone(),identity:m.identity,signer:m.signer,enrollment_bind:m.enrollment_bind});
     let refresh=refresh(owner.clone(),policy,first);
-    let local=lifecycle::serve_local(dir,"running: configured candidate; trusted local operation IPC pending",shutdown);
+    let local=lifecycle::serve_local(dir,"running: configured candidate; trusted local operation IPC pending",owner.clone(),shutdown);
     tokio::pin!(refresh,local);
     let mut tasks=JoinSet::new();
     let mut tick=tokio::time::interval(Duration::from_secs(1));

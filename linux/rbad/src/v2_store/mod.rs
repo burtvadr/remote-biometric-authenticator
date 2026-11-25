@@ -91,6 +91,10 @@ pub struct Evidence {
     pub attested_at:i64, pub assurance_until:i64, pub status_checked_at:i64, pub status_until:i64,
 }
 
+/// Public inventory metadata only; never contains keys, chains or tokens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InventoryRecord { pub id: Id, pub revision: i64, pub revoked: bool }
+
 pub struct Store { db: Connection, _lock: Option<File> }
 fn digest(bytes: &[u8]) -> Hash { Sha256::digest(bytes).into() }
 fn valid_id(id: &Id) -> bool { *id != ZERO }
@@ -204,6 +208,16 @@ impl Store {
         let db = Self::open_connection(dir)?;
         validate_db(&db, &host)?;
         Ok(Self { db, _lock: Some(lock) })
+    }
+    /// Standalone inventory for the verified local UID. This is read-only;
+    /// a stored record is not an authorization or proof of a live connection.
+    pub(crate) fn inventory(&self, uid: u32) -> Result<Vec<InventoryRecord>> {
+        let mut stmt = self.db.prepare("SELECT c.id,c.revision,c.revoked_at IS NOT NULL FROM credentials c JOIN principals p ON p.id=c.owner WHERE p.uid=? ORDER BY c.id")?;
+        let rows = stmt.query_map([uid], |r| Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,i64>(1)?,r.get::<_,bool>(2)?)))?;
+        rows.map(|row| {
+            let (id, revision, revoked) = row?;
+            Ok(InventoryRecord { id: as_id(id)?, revision, revoked })
+        }).collect()
     }
     fn tx(&mut self) -> Result<Transaction<'_>> { Ok(self.db.transaction_with_behavior(TransactionBehavior::Immediate)?) }
     fn add_principal(&mut self, p: &Principal, now: i64) -> Result<()> {

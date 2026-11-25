@@ -1,9 +1,11 @@
 # `rba` CLI and control API
 
-Status: **draft for review**. This document describes the intended user-facing
-contract. The current CLI implements `devices`, `status`, `pair`, `auth`,
-`revoke`, `version` and `help`; the rest of the surface below is not implemented
-yet.
+Status: **target contract with staged V2 implementation**. The active V2
+standalone CLI implements `rba` (no arguments), `start-server`, `kill-server`,
+`devices`, `status`, `version` and `help`. See
+[B.3.7.2 lifecycle delivery](B3_7_2_CLI_LIFECYCLE.md) for the exact supported
+surface and limitations. The remaining commands below are the intended product
+contract, not claims of V2 runtime support. No V1 fallback is active.
 
 The CLI is one client of a versioned daemon API, and that API is the boundary
 everything else uses. Replace the old front end once, cleanly, rather than
@@ -31,7 +33,9 @@ putting a new command surface on top of the old one.
 ```text
 rba [global options] <command> [subcommand] [options]
 
-rba                              help, exit 1 (same as adb)
+rba                              initialize/start server and print status
+rba start-server [--foreground]
+rba kill-server
 rba help [command]
 rba version
 rba status
@@ -63,9 +67,12 @@ rba config show|get|set|unset [key] [value]
 rba completion bash|zsh|fish
 ```
 
-`rba` with no arguments prints the same help as `rba help` and exits `1`, like
-`adb`. It does not change behavior based on whether stdout is a terminal.
-`rba help` exits `0`. `rba status` is the one-shot status command.
+`rba` with no arguments initializes/starts the standalone daemon if necessary
+and reports its status. `rba devices` also starts the daemon automatically.
+`rba help`, `rba version`, `rba status` and `rba kill-server` do not start a
+stopped daemon. `rba status` reports stopped when no control socket is listening;
+`rba kill-server` is idempotent. No command requires a service manager for
+standalone execution.
 
 If an interactive screen is added later, it is `rba ui`, a thin client of the
 same API. It must not contain a second implementation of pairing,

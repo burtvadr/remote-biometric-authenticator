@@ -135,6 +135,17 @@ fn check_trust(window:Option<(i64,i64,Instant)>,failed:bool,now:i64,mono:Instant
 impl Authority {
     pub fn new(store: Store) -> Self { Self { store, resources: Resources::new(), peers: HashMap::new(), requests: HashMap::new(), wall_high: None, pairing: None, terminals: HashMap::new(), policy_offers: HashMap::new(), attestation:None, trust_window:None, trust_failed:false } }
     pub fn store(&self) -> &Store { &self.store }
+    /// Snapshot of the durable inventory and currently classified production
+    /// links. Connection state is informational, never an authorization result.
+    pub(crate) fn inventory(&self, uid: u32) -> Result<Vec<(super::InventoryRecord, bool)>> {
+        Ok(self.store.inventory(uid)?.into_iter().map(|record| {
+            let linked = !record.revoked && self.peers.iter().any(|(conn, peer)|
+                peer.peer.credential == record.id && peer.access == PeerState::Active
+                && !self.resources.denied(*conn));
+            (record, linked)
+        }).collect())
+    }
+
 
     /// Routing is based on the original locally admitted operation and the
     /// actual classified connection, never on a request ID supplied by a peer.

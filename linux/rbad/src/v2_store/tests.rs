@@ -512,3 +512,17 @@ fn offline_cleanup_after_retry_expiry_and_unknown_token_rollback() {
     assert_eq!(s.peer_state(&key(3),&id(11),NOW+RETRY).unwrap(),PeerState::Active);
     assert_eq!(s.peer_state(&key(1),&id(10),NOW+RETRY).unwrap(),PeerState::Unknown);
 }
+
+#[test]
+fn standalone_inventory_reports_only_owned_records_and_revocation() {
+    let mut s = ready();
+    s.add_principal(&principal(2,1001),NOW).unwrap();
+    enroll(&mut s,11,2,&key(3),&key(4),&[]).unwrap();
+    assert_eq!(s.inventory(1000).unwrap(),vec![InventoryRecord{id:id(10),revision:1,revoked:false}]);
+    assert_eq!(s.inventory(1001).unwrap(),vec![InventoryRecord{id:id(11),revision:1,revoked:false}]);
+    assert!(s.inventory(1002).unwrap().is_empty());
+    s.revoke(id(10),NOW+1).unwrap();
+    let rows=s.inventory(1000).unwrap();
+    assert_eq!(rows.len(),1);assert_eq!(rows[0].id,id(10));assert!(rows[0].revoked);
+    assert!(!s.inventory(1001).unwrap()[0].revoked);
+}

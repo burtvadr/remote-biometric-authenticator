@@ -19,15 +19,16 @@ impl Fixture {
     fn data(&self)->PathBuf {self.0.join("rba/standalone-v2/instance")}
 }
 impl Drop for Fixture {
-    fn drop(&mut self){let _=self.cmd().arg("stop").stdout(Stdio::null()).stderr(Stdio::null()).status();let _=fs::remove_dir_all(&self.0);}
+    fn drop(&mut self){let _=self.cmd().arg("kill-server").stdout(Stdio::null()).stderr(Stdio::null()).status();let _=fs::remove_dir_all(&self.0);}
 }
 #[test]
 fn zero_config_concurrent_start_and_restart_preserve_identity(){
     let f=Fixture::new();
-    let mut a=f.cmd().stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-    let b=f.cmd().arg("start").output().unwrap();
+    let mut a=f.cmd().arg("devices").stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let b=f.cmd().arg("start-server").output().unwrap();
     assert!(a.wait().unwrap().success());assert!(b.status.success());
     assert!(f.run(&["status"]).contains("network authentication disabled"));
+    assert_eq!(f.run(&["devices"]).trim(),"List of devices attached");
     let data=f.data();let key=fs::read(data.join("host-key.pk8")).unwrap();
     let settings=fs::read(data.join("candidate.json")).unwrap();
     let cert=fs::read(data.join("host-cert.der")).unwrap();
@@ -35,11 +36,68 @@ fn zero_config_concurrent_start_and_restart_preserve_identity(){
     let outer=data.parent().unwrap();
     let duplicate=f.cmd().arg("--run-candidate").arg(outer).output().unwrap();
     assert!(!duplicate.status.success());
-    f.run(&["stop"]);
-    assert!(!f.cmd().arg("status").output().unwrap().status.success());
+    f.run(&["kill-server"]);
+    assert_eq!(f.run(&["status"]).trim(),"RBA stopped");
     f.run(&[]);
     assert_eq!(fs::read(data.join("host-key.pk8")).unwrap(),key);
     assert_eq!(fs::read(data.join("candidate.json")).unwrap(),settings);
     assert_eq!(fs::read(data.join("host-cert.der")).unwrap(),cert);
-    f.run(&["stop"]);
+    f.run(&["kill-server"]);
+}
+
+#[test]
+fn read_only_commands_and_kill_server_do_not_initialize() {
+    let f=Fixture::new();
+    assert!(f.run(&["help"]).contains("start-server"));
+    f.run(&["version"]);
+    assert_eq!(f.run(&["status"]).trim(),"RBA stopped");
+    f.run(&["kill-server"]);
+    assert!(!f.0.exists());
+}
+#[test]
+fn stale_socket_is_recovered_without_replacing_identity() {
+    use std::os::unix::net::UnixListener;
+    let f=Fixture::new();
+    f.run(&["devices"]);f.run(&["kill-server"]);
+    let data=f.data();let key=fs::read(data.join("host-key.pk8")).unwrap();
+    let socket=data.parent().unwrap().join("daemon.sock");
+    drop(UnixListener::bind(&socket).unwrap());
+    assert_eq!(f.run(&["devices"]).trim(),"List of devices attached");
+    assert_eq!(fs::read(data.join("host-key.pk8")).unwrap(),key);
+    f.run(&["kill-server"]);
+    assert!(!socket.exists());
+}
+#[test]
+fn malformed_live_socket_is_not_replaced() {
+    use std::io::{Read,Write};
+    use std::os::unix::net::UnixListener;
+    let f=Fixture::new();
+    f.run(&["devices"]);f.run(&["kill-server"]);
+    let data=f.data();let key=fs::read(data.join("host-key.pk8")).unwrap();
+    let socket=data.parent().unwrap().join("daemon.sock");
+    let listener=UnixListener::bind(&socket).unwrap();
+    let fake=std::thread::spawn(move||{
+        let (mut stream,_)=listener.accept().unwrap();let mut request=Vec::new();
+        stream.read_to_end(&mut request).unwrap();assert_eq!(request.as_slice(),b"RBL2S");
+        stream.write_all(b"BAD!\0\0\0\0").unwrap();
+    });
+    let result=f.cmd().arg("devices").output().unwrap();
+    fake.join().unwrap();assert!(!result.status.success());
+    assert!(socket.exists());assert_eq!(fs::read(data.join("host-key.pk8")).unwrap(),key);
+    assert_eq!(f.run(&["status"]).trim(),"RBA stopped");
+}
+
+#[test]
+fn invalid_lifecycle_request_cannot_stop_server() {
+    use std::{io::{Read,Write},net::Shutdown,os::unix::net::UnixStream,time::Duration};
+    let f=Fixture::new();f.run(&["start-server"]);
+    let socket=f.data().parent().unwrap().join("daemon.sock");
+    for request in [b"RBL2Xextra".as_slice(),b"OLD!X".as_slice(),b"RBL2?".as_slice()] {
+        let mut stream=UnixStream::connect(&socket).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        stream.write_all(request).unwrap();stream.shutdown(Shutdown::Write).unwrap();
+        let mut response=Vec::new();stream.read_to_end(&mut response).unwrap();assert!(response.is_empty());
+        assert!(f.run(&["status"]).contains("running:"));
+    }
+    f.run(&["kill-server"]);
 }
