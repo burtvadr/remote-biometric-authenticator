@@ -1,5 +1,9 @@
 package io.github.burtvadr.rba.keystore
 
+import android.os.Build
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyInfo
+import android.security.keystore.KeyProperties
 import android.security.keystore.UserNotAuthenticatedException
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -8,12 +12,16 @@ import io.github.burtvadr.rba.session.V2DeviceStore
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
+import java.security.KeyFactory
+import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.PrivateKey
 import java.security.Signature
 import java.security.SecureRandom
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
+import java.security.spec.ECGenParameterSpec
+import java.util.UUID
 import java.io.ByteArrayInputStream
 
 /** Must run on physical hardware with enrolled strong biometrics. No mock
@@ -54,4 +62,57 @@ class V2HardwareKeysTest {
             assertTrue("Expected authentication-related denial",generateSequence(failure){it.cause}.any{it is UserNotAuthenticatedException} || failure is java.security.SignatureException)
         } finally { V2HardwareKeys.deleteUnrecorded(keys.id(),keys.transportPoint(),keys.biometricPoint()) }
     }
+
+    /** Level 1 probe: local key metadata and the negative biometric gate,
+     * without requesting attestation. No persisted RBA credential or trust. */
+    @Test fun level1UnattestedBiometricKeyRejectsUnauthenticatedSigning() {
+        val ks=KeyStore.getInstance("AndroidKeyStore").apply{load(null)}
+        val alias="rba-level1-test-biometric-${UUID.randomUUID()}"
+        check(!ks.containsAlias(alias))
+        try {
+            val builder=KeyGenParameterSpec.Builder(alias,KeyProperties.PURPOSE_SIGN)
+                .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
+                .setDigests(KeyProperties.DIGEST_SHA256)
+                .setIsStrongBoxBacked(false)
+                .setUserAuthenticationRequired(true)
+                .setInvalidatedByBiometricEnrollment(true)
+                .setUserAuthenticationValidWhileOnBody(false)
+            if(Build.VERSION.SDK_INT>=30) builder.setUserAuthenticationParameters(0,KeyProperties.AUTH_BIOMETRIC_STRONG)
+            else {
+                @Suppress("DEPRECATION")
+                builder.setUserAuthenticationValidityDurationSeconds(-1)
+            }
+            KeyPairGenerator.getInstance("EC","AndroidKeyStore").apply{initialize(builder.build())}.generateKeyPair()
+            val key=ks.getKey(alias,null) as PrivateKey
+            assertNull(key.encoded)
+            val cert=ks.getCertificate(alias) as X509Certificate
+            assertNull(cert.getExtensionValue("1.3.6.1.4.1.11129.2.1.17"))
+            val info=KeyFactory.getInstance("EC","AndroidKeyStore").getKeySpec(key,KeyInfo::class.java)
+            assertEquals(KeyProperties.ORIGIN_GENERATED,info.origin)
+            assertEquals(256,info.keySize)
+            assertEquals(KeyProperties.PURPOSE_SIGN,info.purposes)
+            assertEquals(setOf(KeyProperties.DIGEST_SHA256),info.digests.toSet())
+            assertTrue(info.isUserAuthenticationRequired)
+            assertTrue(info.isUserAuthenticationRequirementEnforcedBySecureHardware)
+            @Suppress("DEPRECATION")
+            val perUse=info.userAuthenticationValidityDurationSeconds
+            assertEquals(-1,perUse)
+            if(Build.VERSION.SDK_INT>=31) assertTrue(info.securityLevel in setOf(KeyProperties.SECURITY_LEVEL_TRUSTED_ENVIRONMENT,KeyProperties.SECURITY_LEVEL_STRONGBOX))
+            else {
+                @Suppress("DEPRECATION")
+                val hardware=info.isInsideSecureHardware
+                assertTrue(hardware)
+            }
+            if(Build.VERSION.SDK_INT>=30) assertEquals(KeyProperties.AUTH_BIOMETRIC_STRONG,info.userAuthenticationType)
+            assertTrue(info.isInvalidatedByBiometricEnrollment)
+            val challenge=ByteArray(32).apply{SecureRandom().nextBytes(this)}
+            val failure=runCatching{Signature.getInstance("SHA256withECDSA").apply{initSign(key);update(challenge)}.sign()}.exceptionOrNull()
+            assertNotNull("Unauthenticated biometric signing unexpectedly succeeded",failure)
+            assertTrue("Expected authentication-related denial",generateSequence(failure){it.cause}.any{it is UserNotAuthenticatedException} || failure is java.security.SignatureException)
+        } finally {
+            if(ks.containsAlias(alias)) ks.deleteEntry(alias)
+            assertFalse(ks.containsAlias(alias))
+        }
+    }
+
 }

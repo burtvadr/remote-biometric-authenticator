@@ -82,3 +82,10 @@ an invariant. A genuinely offline proof-only test design needs an explicit
 separate assurance model, not a synthetic empty status list. A fresh official
 status response is needed for actual pairing/authentication here. No production
 release preparation or security closure is implied.
+
+## Lower-assurance compatibility work
+
+This profile is Level 0 (strict attestation), even when it uses a debug APK.
+See [Level 1 compatibility testing](B3_7_5_LEVEL1_COMPATIBILITY.md) for the
+separately isolated unattested transport probe and proposed runtime fallback.
+The probe does not alter this profile's acceptance requirements.
