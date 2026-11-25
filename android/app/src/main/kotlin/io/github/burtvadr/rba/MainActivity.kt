@@ -37,6 +37,7 @@ import io.github.burtvadr.rba.session.AuthenticatorSession
 import io.github.burtvadr.rba.session.SessionState
 import io.github.burtvadr.rba.ui.AuthenticatorScreen
 import io.github.burtvadr.rba.ui.BackgroundStatus
+import io.github.burtvadr.rba.ui.presentation
 import io.github.burtvadr.rba.ui.theme.AppTheme
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -106,12 +107,12 @@ class MainActivity : androidx.fragment.app.FragmentActivity() {
                 val discoveredKeyIds by activeSession.discoveredKeyIds.collectAsStateWithLifecycle()
                 val backgroundStatus by background
                 AuthenticatorScreen(
-                    state = state,
+                    state = state.presentation(),
                     deviceId = activeSession.deviceId.toHex(),
                     deviceName = AuthenticatorRuntime.deviceName,
-                    capabilities = AuthenticatorRuntime.capabilities,
-                    hosts = knownHosts,
-                    connectedHostId = connectedHostId,
+                    capabilities = AuthenticatorRuntime.capabilities?.presentation(),
+                    hosts = knownHosts.map { it.presentation() },
+                    connectedHostId = connectedHostId?.toHex(),
                     discoveredKeyIds = discoveredKeyIds,
                     background = backgroundStatus,
                     themeMode = themeMode,
@@ -133,7 +134,10 @@ class MainActivity : androidx.fragment.app.FragmentActivity() {
                     },
                     onConfirmPairing = { code -> activeSession.confirmPairing(code) },
                     onRejectPairing = { activeSession.rejectPairing() },
-                    onForgetHost = { id -> activeSession.forgetHost(id) },
+                    onForgetHost = { id ->
+                        val host = activeSession.knownHosts().singleOrNull { it.hostId.toHex() == id }
+                        host != null && activeSession.forgetHost(host.hostId)
+                    },
                     onFixNotifications = ::openNotificationSettings,
                     onFixOverlay = ::openOverlaySettings,
                     onFixBattery = ::requestBatteryExemption,

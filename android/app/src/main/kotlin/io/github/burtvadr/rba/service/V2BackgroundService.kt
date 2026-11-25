@@ -16,11 +16,14 @@ import io.github.burtvadr.rba.runtime.V2BackgroundRuntime
 import io.github.burtvadr.rba.runtime.V2ForegroundRuntime
 import io.github.burtvadr.rba.runtime.V2NotificationGate
 import io.github.burtvadr.rba.transport.V2ConnectionOwner
+import io.github.burtvadr.rba.transport.V2Discovery
+import io.github.burtvadr.rba.transport.V2DiscoveryHint
+import io.github.burtvadr.rba.session.V2DeviceStore
 import io.github.burtvadr.rba.ui.v2.V2NotificationActivity
 import kotlinx.coroutines.*
 import java.util.UUID
 
-/** An explicitly enabled, single-endpoint listener, not a second runtime.
+/** A single connection owner discovering only locally enrolled credentials.
  * Start only from the V2 foreground activity. No boot start, alarm, overlay,
  * full-screen intent, automatic biometric prompt or approval action. */
 class V2BackgroundService : Service() {
@@ -30,7 +33,7 @@ class V2BackgroundService : Service() {
     override fun onBind(intent:Intent?):IBinder?=null
     override fun onStartCommand(intent:Intent?,flags:Int,startId:Int):Int {
         if(intent?.action==STOP){
-            if(selected?.startId==intent.data?.lastPathSegment && selected!=null)stopSelf()
+            if(selected?.startId==intent.data?.lastPathSegment && selected!=null){V2BackgroundRuntime.userStopped();stopSelf()}
             else if(selected==null)stopSelf(startId)
             return START_NOT_STICKY
         }
@@ -69,8 +72,17 @@ class V2BackgroundService : Service() {
             .setTimeoutAfter(remaining).build()
     }
     private suspend fun listen(s:V2BackgroundRuntime.Selection) {
+        var cursor=0
         try{
             while(currentCoroutineContext().isActive && notificationsAvailable()) {
+                val hints=try{V2Discovery.scan(applicationContext)}catch(e:CancellationException){throw e}catch(_:Exception){emptyList()}
+                val candidates=s.routes.filter{it.summary.state==V2DeviceStore.RecordState.ACTIVE}.mapNotNull{route->
+                    val id=route.summary.host.chunked(2).map{it.toInt(16).toByte()}.toByteArray()
+                    V2DiscoveryHint.enrolled(hints,id,route.hostPoint)?.let{route to it}
+                }
+                if(candidates.isEmpty()){delay(10000);continue}
+                val (route,endpoint)=candidates[cursor.mod(candidates.size)]
+                cursor=if(cursor==Int.MAX_VALUE)0 else cursor+1
                 // Child cancellation (decline/activity stops) must not cancel
                 // the explicitly enabled listener. Service cancellation does.
                 supervisorScope {
@@ -78,7 +90,8 @@ class V2BackgroundService : Service() {
                         val job=currentCoroutineContext().job
                         var ticket:V2NotificationGate.Ticket<V2ConnectionOwner.Ui>?=null
                         try{
-                            V2ForegroundRuntime.awaitAuthentication(applicationContext,s.host,s.port,s.credential){deadline->
+                            V2ForegroundRuntime.awaitAuthentication(applicationContext,endpoint.address,endpoint.port,route.summary.credential,
+                                onConnected={V2BackgroundRuntime.connected(s,route.summary.host)}){deadline->
                                 // Serialize publication with service destruction on Main.
                                 withContext(Dispatchers.Main.immediate){
                                     ensureActive();check(notificationsAvailable() && selected===s)
@@ -91,6 +104,7 @@ class V2BackgroundService : Service() {
                         }finally{
                             // Scope cancellation must remove the exact old
                             // notification and dismiss only its attached UI.
+                            V2BackgroundRuntime.connected(s,null)
                             val ui=ticket?.let{s.gate.release(it)}
                             withContext(NonCancellable+Dispatchers.Main.immediate){
                                 nm.cancel(s.startId,REVIEW_ID);ui?.activity?.finish()

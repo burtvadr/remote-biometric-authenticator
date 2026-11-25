@@ -6,6 +6,7 @@ import io.github.burtvadr.rba.transport.V2ConnectionOwner
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.net.InetSocketAddress
 
 /** Process-wide local routing boundary. No Intent extras may select or approve
@@ -16,8 +17,7 @@ internal object V2ForegroundRuntime {
     private var started = false
     enum class Operation { ENROLL, AUTHENTICATE, POLICY, RECOVER, REVOKE }
     private suspend fun <T> exclusive(work: suspend () -> T): T {
-        check(mutex.tryLock()) { "An operation is already active" }
-        try { return withContext(Dispatchers.IO) { work() } } finally { mutex.unlock() }
+        return mutex.withLock { withContext(Dispatchers.IO) { work() } }
     }
     private suspend fun startup(context: Context) {
         if (!started) {
@@ -25,28 +25,32 @@ internal object V2ForegroundRuntime {
             started = true
         }
     }
-    suspend fun initialize(context: Context) = exclusive {
-        check(!started)
-        V2DeviceStore.initialize(context).use { }
-        startup(context)
-    }
     suspend fun inventory(context: Context) = exclusive {
         startup(context)
         V2DeviceStore.open(context).use { it.inventory() }
+    }
+    suspend fun routes(context:Context) = exclusive {
+        startup(context)
+        V2DeviceStore.open(context).use{it.routes()}
+    }
+    /** Local denial is independent of network reachability. */
+    suspend fun revokeHostLocally(context:Context,hostId:String) = exclusive {
+        startup(context)
+        V2DeviceStore.open(context).use{it.beginHostRevocation(hostId)}
     }
     private fun decode(s: String): ByteArray {
         require(s.matches(Regex("[0-9a-f]{32}")) && s.any { it != '0' })
         return s.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
     }
     /** Same exclusive startup/operation boundary as foreground work. A
-     * background waiter cannot initialize storage, enroll or change policy. */
+     * background waiter cannot enroll or change policy; a missing credential fails closed. */
     suspend fun awaitAuthentication(context: Context, host:String, port:Int, credential:String,
-                                    awaitUi:suspend (Long)->V2ConnectionOwner.Ui?):Boolean = exclusive {
+                                    onConnected:()->Unit = {}, awaitUi:suspend (Long)->V2ConnectionOwner.Ui?):Boolean = exclusive {
         startup(context)
         require(host.isNotBlank() && host.length <= 253 && port in 1..65535)
         val address=InetSocketAddress(host,port);check(!address.isUnresolved)
         V2DeviceStore.open(context).use { store ->
-            V2ConnectionOwner.authenticate(context,store,address,decode(credential),awaitUi)
+            V2ConnectionOwner.authenticate(context,store,address,decode(credential),onConnected,awaitUi)
         }
     }
     suspend fun operate(context: Context, host: String, port: Int, operation: Operation,

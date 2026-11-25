@@ -52,7 +52,7 @@ impl AdministrativeRoutes {
     /// Open an enrollment listener only for a locally admitted pairing. Bind
     /// address comes from protected runtime configuration, not IPC or the peer.
     /// Closing the local receiver or expiring the original pairing ends it.
-    pub(crate) async fn enroll(&self,identity:&Identity,address:SocketAddr,local:LocalLink,caller:Principal,direction:EntryDirection)->Result<ReceiptDelivery>{
+    pub(crate) async fn enroll(&self,identity:&Identity,host:Id,address:SocketAddr,local:LocalLink,caller:Principal,direction:EntryDirection)->Result<ReceiptDelivery>{
         if address.port()==0{return Err(Error::Denied)}
         let (now,mono)=clock()?;
         let deadline=Deadline::from_std(mono+Duration::from_secs(120));
@@ -61,8 +61,10 @@ impl AdministrativeRoutes {
         let _guard=LocalGuard{authority:self.authority.clone(),owner:local.owner};
         let listener=local.wait(deadline,async{Ok(TcpListener::bind(address).await?)}).await?;
         let address=listener.local_addr()?;
+        let advertisement=super::super::discovery::Announcement::publish(address,host,&identity.point,super::super::discovery::Role::Enrollment,Some(pairing));
         local.ask(deadline, |shown| LocalEvent::EnrollmentListening { address, shown }).await?;
         let (tcp,_)=local.wait(deadline,async{Ok(listener.accept().await?)}).await?;
+        drop(advertisement);
         drop(listener); // exactly one transport per admitted pairing
         let channel=local.wait(deadline,accept(tcp,self.authority.clone(),identity,Listener::Enrollment)).await?;
         channel.enroll(local,pairing,direction).await

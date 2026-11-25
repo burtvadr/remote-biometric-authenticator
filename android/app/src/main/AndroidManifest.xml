@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- V2 candidate: manual TCP endpoint, strong biometrics and explicit listener. -->
+    <!-- V2 candidate: original Compose surface; V2 discovery and strong biometrics. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -17,9 +17,71 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.Rba"
         android:usesCleartextTraffic="false">
-        <activity android:name=".ui.v2.V2OperatorActivity" android:exported="false" />
-        <activity-alias android:name=".V2Launcher" android:exported="true"
-            android:targetActivity=".ui.v2.V2OperatorActivity">
+        <activity android:name=".ui.v2.V2MainActivity" android:exported="false" />
+        <activity-alias
+            android:name=".LauncherAuto"
+            android:enabled="true"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_dark"
+            android:label="@string/app_name"
+            android:roundIcon="@mipmap/ic_launcher_dark"
+            android:targetActivity=".ui.v2.V2MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".LauncherLight"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_light"
+            android:label="@string/app_name"
+            android:roundIcon="@mipmap/ic_launcher_light"
+            android:targetActivity=".ui.v2.V2MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".LauncherDark"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_dark"
+            android:label="@string/app_name"
+            android:roundIcon="@mipmap/ic_launcher_dark"
+            android:targetActivity=".ui.v2.V2MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".LauncherMaterial"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_material"
+            android:label="@string/app_name"
+            android:roundIcon="@mipmap/ic_launcher_material"
+            android:targetActivity=".ui.v2.V2MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".LauncherScrcpy"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_scrcpy"
+            android:label="@string/app_name"
+            android:roundIcon="@mipmap/ic_launcher_scrcpy"
+            android:targetActivity=".ui.v2.V2MainActivity">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

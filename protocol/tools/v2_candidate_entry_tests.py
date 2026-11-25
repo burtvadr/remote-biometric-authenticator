@@ -17,7 +17,7 @@ class CandidateEntryTests(unittest.TestCase):
 
     def test_only_v2_components(self):
         self.assertEqual({attr(x, 'name') for x in self.app.findall('activity')},
-                         {'.ui.v2.V2OperatorActivity', '.ui.v2.V2NotificationActivity'})
+                         {'.ui.v2.V2MainActivity', '.ui.v2.V2NotificationActivity'})
         self.assertEqual([attr(x, 'name') for x in self.app.findall('service')],
                          ['.service.V2BackgroundService'])
         self.assertEqual(self.app.findall('receiver'), [])
@@ -25,15 +25,27 @@ class CandidateEntryTests(unittest.TestCase):
 
     def test_only_launcher_exported(self):
         components = [x for x in self.app if x.tag in ('activity', 'activity-alias', 'service', 'receiver', 'provider')]
-        self.assertEqual([attr(x, 'name') for x in components if attr(x, 'exported') == 'true'], ['.V2Launcher'])
+        self.assertEqual({attr(x, 'name') for x in components if attr(x, 'exported') == 'true'}, {'.LauncherAuto', '.LauncherLight', '.LauncherDark', '.LauncherMaterial', '.LauncherScrcpy'})
         aliases = self.app.findall('activity-alias')
-        self.assertEqual(len(aliases), 1)
-        self.assertEqual(attr(aliases[0], 'targetActivity'), '.ui.v2.V2OperatorActivity')
-        self.assertEqual([attr(x, 'name') for x in aliases[0].findall('intent-filter/category')], ['android.intent.category.LAUNCHER'])
+        self.assertEqual(len(aliases), 5)
+        self.assertEqual([attr(a, 'name') for a in aliases if attr(a, 'enabled') == 'true'], ['.LauncherAuto'])
+        for alias in aliases:
+            self.assertEqual(attr(alias, 'targetActivity'), '.ui.v2.V2MainActivity')
+            self.assertEqual([attr(x, 'name') for x in alias.findall('intent-filter/category')], ['android.intent.category.LAUNCHER'])
         for x in components:
             if x.tag != 'activity-alias':
                 self.assertEqual(attr(x, 'exported'), 'false')
                 self.assertEqual(x.findall('intent-filter'), [])
+
+    def test_original_surface_and_no_engineering_launcher(self):
+        base = ROOT / 'android/app/src/main/kotlin/io/github/burtvadr/rba'
+        activity = (base / 'ui/v2/V2MainActivity.kt').read_text()
+        self.assertFalse((base / 'ui/v2/V2OperatorActivity.kt').exists())
+        self.assertIn('AuthenticatorScreen(', activity)
+        self.assertIn('V2Discovery.scan(', activity)
+        self.assertIn('V2ForegroundRuntime.operate(', activity)
+        for forbidden in ('AuthenticatorRuntime', 'HostLink(', 'EditText(', 'Initialize new V2 store', 'Host listener port'):
+            self.assertNotIn(forbidden, activity)
 
     def test_minimal_permissions(self):
         self.assertEqual({attr(x, 'name') for x in self.manifest.findall('uses-permission')}, {

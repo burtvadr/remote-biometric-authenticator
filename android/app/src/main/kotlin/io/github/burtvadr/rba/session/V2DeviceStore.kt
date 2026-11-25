@@ -8,10 +8,13 @@ import android.database.sqlite.SQLiteDatabaseCorruptException
 import io.github.burtvadr.rba.protocol.V2Enrollment
 import io.github.burtvadr.rba.protocol.V2PolicySync
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.security.KeyStore
 import io.github.burtvadr.rba.keystore.V2HardwareKeys
 
-/** App-private, non-backed-up, versioned V2 credential storage. Only explicit
- * initialization creates a database. No V1 reader or destructive migration.
+/** App-private, non-backed-up, versioned V2 credential storage. Automatic initialization is limited to
+ * genuinely fresh state. No V1 reader or destructive migration.
  * The active runtime does not use this store until the coordinated V2 cutover.
  *
  * Key aliases are derived from the credential ID and role. The B.3 key
@@ -88,7 +91,21 @@ internal class V2DeviceStore private constructor(private val db:SQLiteDatabase) 
         }
         private fun openFile(file:File):SQLiteDatabase=SQLiteDatabase.openDatabase(file.absolutePath,null,SQLiteDatabase.OPEN_READWRITE or SQLiteDatabase.NO_LOCALIZED_COLLATORS,
             DatabaseErrorHandler { throw SQLiteDatabaseCorruptException("V2 state corrupt; explicit recovery required") })
-        /** Explicit local operator initialization. An interrupted or missing
+        /** Absence of a DB alone is not evidence of a fresh installation.
+         * Preserve any existing directory (including incomplete initialization)
+         * or V2 key aliases. A failed filesystem/Keystore probe is a hard error. */
+        fun openOrInitializeFresh(context:Context):V2DeviceStore {
+            val dir=directory(context)
+            val opts=arrayOf(LinkOption.NOFOLLOW_LINKS)
+            if (Files.exists(dir.toPath(), *opts)) return open(context)
+            check(Files.notExists(dir.toPath(), *opts)) { "Cannot determine V2 store state" }
+            val keys=KeyStore.getInstance("AndroidKeyStore").apply{load(null)}
+            check(!keys.aliases().asSequence().any{it.startsWith("rba-v2-")}) {
+                "V2 keys exist without their store; recovery required"
+            }
+            return initialize(context)
+        }
+        /** Explicit creation primitive. An interrupted or missing
          * existing store must be handled as a recovery error, never reset. */
         fun initialize(context:Context):V2DeviceStore {
             val dir=directory(context);check(dir.mkdir());val file=path(context);check(file.createNewFile())
@@ -101,7 +118,8 @@ internal class V2DeviceStore private constructor(private val db:SQLiteDatabase) 
             }catch(e:Exception){db.close();throw e}
         }
         fun open(context:Context):V2DeviceStore {
-            val file=path(context);check(file.isFile&&file.length()>0L)
+            val dir=directory(context); val file=path(context)
+            check(Files.isDirectory(dir.toPath(),LinkOption.NOFOLLOW_LINKS) && Files.isRegularFile(file.toPath(),LinkOption.NOFOLLOW_LINKS) && file.length()>0L)
             val db=openFile(file)
             try{configure(db);validate(db);return V2DeviceStore(db)}catch(e:Exception){db.close();throw e}
         }
@@ -203,6 +221,18 @@ internal class V2DeviceStore private constructor(private val db:SQLiteDatabase) 
             if(revocationState(credential)==null)db.insertOrThrow("revocation_records",null,ContentValues().apply{put("credential",hex(credential));put("acknowledged",0)})
         }
     }
+    /** Original unpair action addresses a host, which can own several V2
+     * credentials. Deny all in one transaction; no partial local result. */
+    @Synchronized fun beginHostRevocation(hostId:String){
+        decodeId(hostId)
+        transaction{
+            val active=inventory().filter{it.host==hostId&&it.state==RecordState.ACTIVE}
+            check(active.isNotEmpty())
+            val pins=active.map{V2Enrollment.Pending.decode(checkNotNull(record(decodeId(it.credential),1))).hostKey().toList()}.distinct()
+            check(pins.size==1){"Ambiguous host identity"}
+            for(row in active)db.insertOrThrow("revocation_records",null,ContentValues().apply{put("credential",row.credential);put("acknowledged",0)})
+        }
+    }
     @Synchronized fun revocationAcknowledged(credential:ByteArray):Boolean=checkNotNull(revocationState(credential))==1
     /** Only the revocation TLS owner may load this record. No auth or policy
      * path can see it through active(), even if the network is offline. */
@@ -295,5 +325,16 @@ internal class V2DeviceStore private constructor(private val db:SQLiteDatabase) 
             add(Summary(id,host,state))
         }
     }}
+    data class Route(val summary:Summary,val hostPoint:ByteArray,val location:V2HardwareKeys.Location?)
+    /** Metadata snapshot: never substitutes for load/policy/TLS verification. */
+    @Synchronized fun routes():List<Route> = inventory().map{summary->
+        val id=decodeId(summary.credential)
+        val p=V2Enrollment.Pending.decode(checkNotNull(record(id,if(summary.state==RecordState.PENDING)0 else 1)))
+        check(p.credentialId().contentEquals(id)&&hex(p.hostId())==summary.host)
+        val location=if(summary.state==RecordState.ACTIVE)runCatching{
+            V2HardwareKeys.load(id,p.transportKey(),p.biometricKey()).biometricLocation
+        }.getOrNull()else null
+        Route(summary,p.hostKey(),location)
+    }
     @Synchronized override fun close(){db.close()}
 }

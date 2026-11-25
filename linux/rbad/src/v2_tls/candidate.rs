@@ -88,7 +88,7 @@ fn load(dir:&Path,hardware_test:bool)->Result<Material>{
     Ok(Material{host,bind:s.bind,enrollment_bind:s.enrollment_bind,policy,identity,signer})
 }
 /// Test listeners are scoped to one explicitly selected RFC1918 IPv4 address.
-/// No wildcard, public address, or automatic discovery/listening.
+/// No wildcard or public address; discovery advertises only a bound endpoint.
 fn test_address(ip:std::net::IpAddr)->bool{
     matches!(ip,std::net::IpAddr::V4(v) if v.is_private())
 }
@@ -107,6 +107,7 @@ pub fn check(dir:&Path)->Result<()> {
 pub(crate) struct Runtime {
     pub(crate) owner:Owner,
     identity:Identity,
+    host:Id,
     signer:SigningKey,
     pub(crate) scheduler:AuthScheduler,
     pub(crate) administrative:AdministrativeRoutes,
@@ -115,7 +116,7 @@ pub(crate) struct Runtime {
 impl Runtime {
     // Standalone same-user adapter or future trusted system IPC only.
     pub(crate) async fn enroll(&self,local:LocalLink,caller:Principal,direction:EntryDirection)->Result<ReceiptDelivery>{
-        self.administrative.enroll(&self.identity,self.enrollment_bind,local,caller,direction).await
+        self.administrative.enroll(&self.identity,self.host,self.enrollment_bind,local,caller,direction).await
     }
     async fn production(&self,socket:TcpStream)->Result<()> {
         let channel=accept(socket,self.owner.clone(),&self.identity,Listener::Production).await?;
@@ -197,9 +198,11 @@ async fn serve_network(dir:&Path,m:Material,owner:Owner,policy:Policy,status:wat
         }
         tokio::select!{biased; _=&mut stop=>return Ok(()),_=tokio::time::sleep(RETRY)=>{}}
     };
-    let runtime=Arc::new(Runtime{scheduler:AuthScheduler::new(owner.clone()),administrative:AdministrativeRoutes::new(owner.clone()),owner:owner.clone(),identity:m.identity,signer:m.signer,enrollment_bind:m.enrollment_bind});
+    let runtime=Arc::new(Runtime{scheduler:AuthScheduler::new(owner.clone()),administrative:AdministrativeRoutes::new(owner.clone()),owner:owner.clone(),identity:m.identity,host:m.host,signer:m.signer,enrollment_bind:m.enrollment_bind});
     let refresh=refresh(owner.clone(),policy,first);
     let operations=interaction::bind(dir)?;
+    let bound=listener.local_addr()?;
+    let mut advertisement=discovery::Announcement::publish(bound,runtime.host,&runtime.identity.point,discovery::Role::Authentication,None);
     status.send_replace(ready);
     tokio::pin!(refresh);
     let mut local_tasks=JoinSet::new();
@@ -224,7 +227,13 @@ async fn serve_network(dir:&Path,m:Material,owner:Owner,policy:Policy,status:wat
                 let now=match wall(){Ok(now)=>now,Err(e)=>break Err(e)};
                 // Expiry closes authority access; a later fresh status can
                 // recover it. No synthetic trust window is ever installed.
-                status.send_replace(if a.maintenance(now,Instant::now()).is_ok(){ready}else{pending});
+                let valid=a.maintenance(now,Instant::now()).is_ok();
+                drop(a);
+                let changed=*status.borrow()!=if valid{ready}else{pending};
+                if changed {
+                    advertisement=if valid{discovery::Announcement::publish(bound,runtime.host,&runtime.identity.point,discovery::Role::Authentication,None)}else{None};
+                }
+                status.send_replace(if valid{ready}else{pending});
             },
             joined=tasks.join_next(),if !tasks.is_empty()=>{
                 if joined.is_some_and(|r|r.is_err()){break Err(Error::State)}
@@ -235,7 +244,7 @@ async fn serve_network(dir:&Path,m:Material,owner:Owner,policy:Policy,status:wat
             }
         }
     };
-    drop(listener);drop(operations);local_tasks.shutdown().await;tasks.shutdown().await;result
+    drop(advertisement);drop(listener);drop(operations);local_tasks.shutdown().await;tasks.shutdown().await;result
 }
 
 #[cfg(test)]

@@ -101,13 +101,14 @@ internal object V2ConnectionOwner {
     /** Background wait is allowed to request a foreground UI only after the
      * exact signed AUTH_REQUEST passes all policy and channel checks. The UI
      * handoff shares the original operation deadline and live socket. */
-    suspend fun authenticate(context:Context,store:V2DeviceStore,address:InetSocketAddress,credential:ByteArray,awaitUi:suspend (Long)->Ui?):Boolean=owned {
+    suspend fun authenticate(context:Context,store:V2DeviceStore,address:InetSocketAddress,credential:ByteArray,onConnected:()->Unit={},awaitUi:suspend (Long)->Ui?):Boolean=owned {
         val record=checkNotNull(store.active(credential.copyOf()))
         policy(store,record)
         val keys=V2HardwareKeys.load(record.credentialId(),record.transportKey(),record.biometricKey())
         val channel=V2TlsClient.Channel.enrolled(address,store,record.credentialId(),V2TlsClient.EnrolledPurpose.AUTHENTICATION)
         wire(this,channel).use{w->
             val s=channel.session()
+            onConnected()
             val auth=V2Authentication(s.hostId(),s.credentialId(),s.sessionId(),s.hostNonce(),s.deviceNonce(),s.exporter(),s.hostKey(),keys.biometricPoint())
             try{
                 val request=w.receive(V2Message.Kind.AUTHREQUEST,mono()+30000)
@@ -212,7 +213,7 @@ internal object V2ConnectionOwner {
     /** Concrete runtime startup must call this before launching network/UI
      * operation owners. It opens the canonical store, never a selected file. */
     suspend fun reclaimAtStartup(context:Context):Unit=owned {
-        V2DeviceStore.open(context).use{it.reclaimAtExclusiveStartup()}
+        V2DeviceStore.openOrInitializeFresh(context).use{it.reclaimAtExclusiveStartup()}
     }
     /** Separate locally chosen pending recovery operation; never routes auth. */
     suspend fun recover(store:V2DeviceStore,address:InetSocketAddress,credential:ByteArray):Unit=owned {

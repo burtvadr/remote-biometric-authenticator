@@ -16,7 +16,7 @@ import kotlin.coroutines.resume
 
 /** One cancellable interaction at a time, invoked on the main thread by the
  * operation owner. Dialog dismissal is denial, never approval. */
-internal class V2OperatorDialogs(override val activity: FragmentActivity) : V2ConnectionOwner.Ui {
+internal class V2ReviewDialogs(override val activity: FragmentActivity) : V2ConnectionOwner.Ui {
     private suspend fun ask(title: String, facts: String, digits: Boolean = false, positive: String = "Approve"): String? =
         suspendCancellableCoroutine { c ->
             val content = LinearLayout(activity).apply {
@@ -75,6 +75,10 @@ internal class V2OperatorDialogs(override val activity: FragmentActivity) : V2Co
                 }
             }
         }
+    /** Discovery is not a trusted identity and cannot initiate key generation
+     * without a local, foreground confirmation. */
+    suspend fun confirmDiscoveredPairing(label:String):Boolean =
+        ask("Pair a host", "Nearby pairing request: $label (unverified). Continue only if you have just run rba pair on your own computer.", positive="Continue") != null
     override suspend fun enterNumber(core: Cbor.Value.Map) = ask("Review authentication", V2OperatorText.authentication(core), true, "Submit number")
     override suspend fun enterPairingCode(): ByteArray? = ask("Pair with host", "Enter the six-digit code displayed by your host.", true, "Submit code")?.toByteArray(Charsets.US_ASCII)
     override suspend fun displayPairingCode(code: ByteArray): Boolean = ask("Pairing code", "Enter this code on your host: ${String(code, Charsets.US_ASCII)}\nDo not share it with anyone else.", positive = "Continue") != null

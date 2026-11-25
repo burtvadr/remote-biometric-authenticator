@@ -84,9 +84,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.burtvadr.rba.appearance.AppIconStyle
 import io.github.burtvadr.rba.appearance.ThemeMode
-import io.github.burtvadr.rba.keystore.DeviceAuthKey
-import io.github.burtvadr.rba.session.KnownHost
-import io.github.burtvadr.rba.session.SessionState
 import io.github.burtvadr.rba.ui.theme.FingerprintBadge
 
 /**
@@ -100,21 +97,22 @@ data class BackgroundStatus(
     val canDrawOverlays: Boolean,
     val ignoringBatteryOptimizations: Boolean,
     val fullScreenIntentAllowed: Boolean,
+    val notificationOnly: Boolean = false,
 ) {
     val ready: Boolean
-        get() = notificationsAllowed && canDrawOverlays
+        get() = notificationsAllowed && (notificationOnly || canDrawOverlays)
 }
 
 private enum class Tab { OVERVIEW, SETTINGS }
 
 @Composable
 fun AuthenticatorScreen(
-    state: SessionState,
+    state: ScreenState,
     deviceId: String,
     deviceName: String,
-    capabilities: DeviceAuthKey.Capabilities?,
-    hosts: List<KnownHost>,
-    connectedHostId: io.github.burtvadr.rba.protocol.Id?,
+    capabilities: SecurityPresentation?,
+    hosts: List<HostPresentation>,
+    connectedHostId: String?,
     discoveredKeyIds: Set<String>,
     background: BackgroundStatus,
     themeMode: ThemeMode,
@@ -125,7 +123,7 @@ fun AuthenticatorScreen(
     onDynamicColorChange: (Boolean) -> Unit,
     onConfirmPairing: (String?) -> Boolean,
     onRejectPairing: () -> Unit,
-    onForgetHost: (io.github.burtvadr.rba.protocol.Id) -> Boolean,
+    onForgetHost: (String) -> Boolean,
     onFixNotifications: () -> Unit,
     onFixOverlay: () -> Unit,
     onFixBattery: () -> Unit,
@@ -135,7 +133,7 @@ fun AuthenticatorScreen(
     modifier: Modifier = Modifier,
 ) {
     var selectedTab by rememberSaveable { mutableStateOf(Tab.OVERVIEW.name) }
-    val operatorState = state !is SessionState.Idle
+    val operatorState = state !is ScreenState.Idle
 
     Scaffold(
         modifier = modifier,
@@ -244,13 +242,13 @@ private fun AppBottomBar(selected: Tab, onSelect: (Tab) -> Unit) {
 private fun OverviewScreen(
     deviceId: String,
     deviceName: String,
-    capabilities: DeviceAuthKey.Capabilities?,
-    hosts: List<KnownHost>,
-    connectedHostId: io.github.burtvadr.rba.protocol.Id?,
+    capabilities: SecurityPresentation?,
+    hosts: List<HostPresentation>,
+    connectedHostId: String?,
     discoveredKeyIds: Set<String>,
     background: BackgroundStatus,
     iconStyle: AppIconStyle,
-    onForgetHost: (io.github.burtvadr.rba.protocol.Id) -> Boolean,
+    onForgetHost: (String) -> Boolean,
     onFixNotifications: () -> Unit,
     onFixOverlay: () -> Unit,
     onFixBattery: () -> Unit,
@@ -258,7 +256,7 @@ private fun OverviewScreen(
     modifier: Modifier = Modifier,
 ) {
     var showPairHelp by rememberSaveable { mutableStateOf(false) }
-    var selectedHost by remember { mutableStateOf<KnownHost?>(null) }
+    var selectedHost by remember { mutableStateOf<HostPresentation?>(null) }
 
     LazyColumn(
         modifier = modifier.fillMaxSize(),
@@ -357,7 +355,7 @@ private fun SectionHeader(text: String) {
 @Composable
 private fun HeroCard(
     deviceName: String,
-    hosts: List<KnownHost>,
+    hosts: List<HostPresentation>,
     background: BackgroundStatus,
     iconStyle: AppIconStyle,
     onPairClick: () -> Unit,
@@ -464,8 +462,8 @@ private fun StatusPill(hostCount: Int, background: BackgroundStatus) {
 private enum class HostReachability { CONNECTED, AVAILABLE, NOT_SEEN }
 
 private fun reachabilityOf(
-    host: KnownHost,
-    connectedHostId: io.github.burtvadr.rba.protocol.Id?,
+    host: HostPresentation,
+    connectedHostId: String?,
     discoveredKeyIds: Set<String>,
 ): HostReachability = when {
     connectedHostId != null && host.hostId == connectedHostId -> HostReachability.CONNECTED
@@ -489,10 +487,10 @@ private fun HostStatusBadge(reachability: HostReachability) {
 
 @Composable
 private fun PairedHostsCard(
-    hosts: List<KnownHost>,
-    connectedHostId: io.github.burtvadr.rba.protocol.Id?,
+    hosts: List<HostPresentation>,
+    connectedHostId: String?,
     discoveredKeyIds: Set<String>,
-    onHostClick: (KnownHost) -> Unit,
+    onHostClick: (HostPresentation) -> Unit,
     onHowPairing: () -> Unit,
 ) {
     if (hosts.isEmpty()) {
@@ -536,7 +534,7 @@ private fun PairedHostsCard(
                         headlineContent = { Text(host.hostName) },
                         supportingContent = {
                             Text(
-                                "ID ${host.hostId.toHex().take(16)}…",
+                                "ID ${host.hostId.take(16)}…",
                                 fontFamily = FontFamily.Monospace,
                                 style = MaterialTheme.typography.bodySmall,
                             )
@@ -589,7 +587,7 @@ private fun BackgroundCard(
     ) {
         Column {
             Text(
-                "One idle link; it does not poll while the connection is healthy.",
+                if (status.notificationOnly) "One protected link; reconnects automatically. Open notifications to review requests." else "One idle link; it does not poll while the connection is healthy.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 16.dp),
@@ -603,16 +601,16 @@ private fun BackgroundCard(
             )
             PermissionRow(
                 label = "Open over other apps",
-                description = "Lets the prompt appear over the current app",
+                description = if(status.notificationOnly) "Not required: requests open from notifications" else "Lets the prompt appear over the current app",
                 icon = Icons.Outlined.Layers,
-                ok = status.canDrawOverlays,
+                ok = status.notificationOnly || status.canDrawOverlays,
                 onFix = onFixOverlay,
             )
             PermissionRow(
                 label = "Full-screen fallback",
-                description = "Used when overlay access is unavailable",
+                description = if(status.notificationOnly) "Not required: requests use protected review" else "Used when overlay access is unavailable",
                 icon = Icons.Outlined.Fullscreen,
-                ok = status.fullScreenIntentAllowed,
+                ok = status.notificationOnly || status.fullScreenIntentAllowed,
                 onFix = onFixFullScreen,
             )
             PermissionRow(
@@ -658,7 +656,7 @@ private fun PermissionRow(
 @Composable
 private fun SecurityCard(
     deviceId: String,
-    capabilities: DeviceAuthKey.Capabilities?,
+    capabilities: SecurityPresentation?,
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -1053,10 +1051,10 @@ private fun PairingHelpDialog(onDismiss: () -> Unit) {
 
 @Composable
 private fun HostDetailsDialog(
-    host: KnownHost,
+    host: HostPresentation,
     authenticatorDeviceId: String,
     reachability: HostReachability,
-    onUnpair: (io.github.burtvadr.rba.protocol.Id) -> Boolean,
+    onUnpair: (String) -> Boolean,
     onDismiss: () -> Unit,
 ) {
     var confirmUnpair by rememberSaveable { mutableStateOf(false) }
@@ -1074,11 +1072,11 @@ private fun HostDetailsDialog(
                             HostReachability.NOT_SEEN -> "Not seen recently"
                         },
                     )
-                    DialogField("Host ID", host.hostId.toHex(), monospace = true)
+                    DialogField("Host ID", host.hostId, monospace = true)
                     DialogField("Key ID", host.keyId, monospace = true)
                     DialogField(
                         "Certificate",
-                        if (host.pinnedCertificate != null) "Pinned" else "Not pinned",
+                        if (host.certificatePinned) "Pinned" else "Not pinned",
                     )
                     Text(
                         "Authentication requests from this host are accepted only after " +
@@ -1113,13 +1111,7 @@ private fun HostDetailsDialog(
                             "Requests from this host will be refused immediately.",
                     )
                     Text(
-                        "The host may still list this device. To revoke this device " +
-                            "there as well, run this on the host (as root):",
-                    )
-                    Text(
-                        "rba revoke --device $authenticatorDeviceId",
-                        fontFamily = FontFamily.Monospace,
-                        style = MaterialTheme.typography.bodySmall,
+                        "Authentication is disabled locally first. Host-side revocation is retried when the host is reachable.",
                     )
                 }
             },
@@ -1166,7 +1158,7 @@ private fun DialogField(label: String, value: String, monospace: Boolean = false
 
 @Composable
 private fun OperatorContent(
-    state: SessionState,
+    state: ScreenState,
     iconStyle: AppIconStyle,
     onConfirmPairing: (String?) -> Boolean,
     onRejectPairing: () -> Unit,
@@ -1190,42 +1182,42 @@ private fun OperatorContent(
             )
         }
         when (state) {
-            is SessionState.AwaitingApproval -> RequestPanel(state, waitingForBiometric = false)
-            is SessionState.AwaitingBiometric -> RequestPanel(state, waitingForBiometric = true)
-            is SessionState.PairingAwaitingCode -> PairingWaitingPanel(state.hostName)
-            is SessionState.PairingAwaitingHostCode -> PairingHostCodePanel(
+            is ScreenState.AwaitingApproval -> RequestPanel(state, waitingForBiometric = false)
+            is ScreenState.AwaitingBiometric -> RequestPanel(state, waitingForBiometric = true)
+            is ScreenState.PairingAwaitingCode -> PairingWaitingPanel(state.hostName)
+            is ScreenState.PairingAwaitingHostCode -> PairingHostCodePanel(
                 hostName = state.hostName,
                 code = state.code,
             )
-            is SessionState.PairingAwaitingConfirmation -> PairingCodeEntryPanel(
+            is ScreenState.PairingAwaitingConfirmation -> PairingCodeEntryPanel(
                 hostName = state.hostName,
                 onSubmit = onConfirmPairing,
                 onCancel = onRejectPairing,
             )
-            is SessionState.PairingAwaitingApproval -> PairingHostCodePanel(
+            is ScreenState.PairingAwaitingApproval -> PairingHostCodePanel(
                 hostName = state.hostName,
                 code = state.code,
                 onAllow = { onConfirmPairing(null) },
                 onCancel = onRejectPairing,
             )
-            is SessionState.Approved -> ApprovedPanel(state)
-            is SessionState.Denied -> DeniedPanel(state)
-            is SessionState.PairingFinalizing -> InfoPanel(
+            is ScreenState.Approved -> ApprovedPanel(state)
+            is ScreenState.Denied -> DeniedPanel(state)
+            is ScreenState.PairingFinalizing -> InfoPanel(
                 "Completing pairing",
                 "Waiting for the host to confirm enrollment.",
             )
-            is SessionState.PairingConfirmed -> InfoPanel(
+            is ScreenState.PairingConfirmed -> InfoPanel(
                 "Pairing complete",
                 "This host can now request authentication.",
             )
-            is SessionState.Failed -> FailurePanel(state)
-            SessionState.Idle -> Unit
+            is ScreenState.Failed -> FailurePanel(state)
+            ScreenState.Idle -> Unit
         }
     }
 }
 
 @Composable
-private fun RequestPanel(state: SessionState.AwaitingApproval, waitingForBiometric: Boolean) {
+private fun RequestPanel(state: ScreenState.AwaitingApproval, waitingForBiometric: Boolean) {
     RequestPanel(
         request = state.request,
         hostName = state.hostName,
@@ -1235,7 +1227,7 @@ private fun RequestPanel(state: SessionState.AwaitingApproval, waitingForBiometr
 }
 
 @Composable
-private fun RequestPanel(state: SessionState.AwaitingBiometric, waitingForBiometric: Boolean) {
+private fun RequestPanel(state: ScreenState.AwaitingBiometric, waitingForBiometric: Boolean) {
     RequestPanel(
         request = state.request,
         hostName = state.hostName,
@@ -1246,7 +1238,7 @@ private fun RequestPanel(state: SessionState.AwaitingBiometric, waitingForBiomet
 
 @Composable
 private fun RequestPanel(
-    request: io.github.burtvadr.rba.protocol.AuthRequest,
+    request: RequestPresentation,
     hostName: String,
     hostKeyId: String,
     waitingForBiometric: Boolean,
@@ -1447,7 +1439,7 @@ private fun PairingCodeEntryPanel(
     onSubmit: (String) -> Boolean,
     onCancel: () -> Unit,
 ) {
-    var entered by rememberSaveable { mutableStateOf("") }
+    var entered by remember { mutableStateOf("") }
     var wrongCode by rememberSaveable { mutableStateOf(false) }
     val focusRequester = remember { FocusRequester() }
     LaunchedEffect(Unit) { focusRequester.requestFocus() }
@@ -1519,7 +1511,7 @@ private fun PairingCodeEntryPanel(
 }
 
 @Composable
-private fun ApprovedPanel(state: SessionState.Approved) {
+private fun ApprovedPanel(state: ScreenState.Approved) {
     ResultCard(
         title = "Authenticated",
         body = "Signed for ${state.request.username} on ${state.hostName} " +
@@ -1531,7 +1523,7 @@ private fun ApprovedPanel(state: SessionState.Approved) {
 }
 
 @Composable
-private fun DeniedPanel(state: SessionState.Denied) {
+private fun DeniedPanel(state: ScreenState.Denied) {
     ResultCard(
         title = "Not authorised",
         body = state.reason,
@@ -1542,7 +1534,7 @@ private fun DeniedPanel(state: SessionState.Denied) {
 }
 
 @Composable
-private fun FailurePanel(state: SessionState.Failed) {
+private fun FailurePanel(state: ScreenState.Failed) {
     ResultCard(
         title = "Error",
         body = state.message,
@@ -1595,10 +1587,10 @@ private fun ResultCard(
     }
 }
 
-private fun keyLocationLabel(capabilities: DeviceAuthKey.Capabilities?): String =
+private fun keyLocationLabel(capabilities: SecurityPresentation?): String =
     when (capabilities?.location) {
-        DeviceAuthKey.KeyLocation.STRONGBOX -> "StrongBox"
-        DeviceAuthKey.KeyLocation.HARDWARE -> "Hardware-backed Keystore"
-        DeviceAuthKey.KeyLocation.SOFTWARE -> "Software Keystore"
+        KeyStoragePresentation.STRONGBOX -> "StrongBox"
+        KeyStoragePresentation.HARDWARE -> "Hardware-backed Keystore"
+        KeyStoragePresentation.SOFTWARE -> "Software Keystore"
         null -> "Unknown"
     }

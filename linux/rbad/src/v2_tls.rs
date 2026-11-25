@@ -11,6 +11,7 @@ use rba_protocol::{cbor::Value as V,v2_message::{Kind,Message},v2_wire};
 
 pub(crate) mod dispatch;
 pub mod candidate;
+mod discovery;
 
 
 const EXPORTER: &[u8] = b"EXPORTER-Channel-Binding";
