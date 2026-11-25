@@ -16,6 +16,7 @@ import java.security.KeyFactory
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.PrivateKey
+import java.security.ProviderException
 import java.security.SecureRandom
 import java.security.Signature
 import java.security.cert.X509Certificate
@@ -105,6 +106,19 @@ internal object V2HardwareKeys {
         return Loaded(key, point, chain, location)
     }
 
+    // StrongBox is preferred, not required by the host's hardware policy.
+    // Some implementations report a generic, permanent KeyMint failure instead
+    // of StrongBoxUnavailableException. A separate TEE attempt is not a retry
+    // of the failed StrongBox operation. Never relax the key specification.
+    private fun canTryTee(failure: ProviderException): Boolean {
+        if (failure is StrongBoxUnavailableException) return true
+        if (Build.VERSION.SDK_INT < 33) return false
+        val ks = generateSequence<Throwable>(failure) { it.cause }.take(8)
+            .filterIsInstance<KeyStoreException>().firstOrNull() ?: return false
+        return ks.numericErrorCode == KeyStoreException.ERROR_KEYMINT_FAILURE &&
+            !ks.isTransientFailure && !ks.isSystemError
+    }
+
     @Suppress("DEPRECATION")
     private fun generateOne(ks: KeyStore, name: String, role: Role, challenge: ByteArray, preferStrongBox: Boolean): Loaded {
         require(challenge.size == 32)
@@ -130,13 +144,18 @@ internal object V2HardwareKeys {
         try {
             if (preferStrongBox) {
                 try { generate(true) }
-                catch (_: StrongBoxUnavailableException) {
-                    // Only explicit hardware unavailability permits the TEE attempt.
-                    // An ambiguous failure that left an alias is not retried.
-                    check(!ks.containsAlias(name))
-                    Log.i("RbaV2Keys", "role=$role StrongBox unavailable; trying TEE with unchanged attestation requirements")
+                catch (failure: ProviderException) {
+                    // Do not overwrite even a partially generated key. An
+                    // inspection/attestation failure never enters this branch.
+                    if (!canTryTee(failure) || ks.containsAlias(name)) throw failure
+                    generationFailure(role, true, "generation", failure)
+                    Log.i("RbaV2Keys", "role=$role StrongBox generation failed; trying TEE once with unchanged attestation requirements")
                     requestedStrongBox = false
-                    generate(false)
+                    try { generate(false) }
+                    catch (teeFailure: Exception) {
+                        teeFailure.addSuppressed(failure)
+                        throw teeFailure
+                    }
                 }
             } else generate(false)
         } catch (failure: Exception) {
