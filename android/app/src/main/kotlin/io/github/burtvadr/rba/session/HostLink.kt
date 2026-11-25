@@ -342,22 +342,17 @@ class HostLink(
                     }
 
                     is Message.AuthRequestMessage -> {
-                        if (message.v.hostId != hello.hostId || message.v.hostKeyId != hello.hostKeyId) {
-                            // The request must carry the identity that opened this
-                            // connection. Its session id is per-request, not the
-                            // transport's SESSION_HELLO id.
+                        if (message.v.hostId != hello.hostId) {
+                            // AuthRequest has no hostKeyId field. The pinned link's
+                            // SESSION_HELLO already matched the stored host id and key id.
+                            // The request session id is independent of the transport hello.
                             Log.w(TAG, "authentication request does not match the open session")
                             break
                         }
-                        // The decision is made when the request arrives, not when
-                        // the link was opened: a host can become paired (or start
-                        // pairing) while this very connection is alive.
-                        val knownNow = session.knownHosts().any { it.hostId == hello.hostId }
-                        if (pairingParked || (!pinnedLink && knownNow)) {
-                            // An unpinned link to a host this device already trusts
-                            // could be a relay. Fail closed and let the pinned
-                            // attempt win.
-                            Log.w(TAG, "refusing an authentication request on an unpinned link")
+                        // Never accept authentication on a bootstrap connection,
+                        // even if the host record changes during this exchange.
+                        if (pairingParked || !pinnedLink) {
+                            Log.w(TAG, "refusing an authentication request outside a pinned auth link")
                             break
                         }
                         session.offerRequest(message.v)
