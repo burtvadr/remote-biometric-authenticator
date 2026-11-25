@@ -169,7 +169,11 @@ fn review(s:&mut impl Write,p:&[u8])->Result<()>{
     let mut p=[0u8;33];p[..32].copy_from_slice(&context);p[32]=grant;write_packet(s,APPROVE,&p)
 }
 pub(super) fn client(dir:&Path,status:&str,request:Request)->Result<()> {
-    if status.contains("network authentication disabled"){eprintln!("RBA: device trust is not configured; pairing and authentication are unavailable.");return Err(Error::Denied)}
+    if status.contains("network authentication disabled"){
+        if status.contains("waiting for verified Android status"){eprintln!("RBA: waiting for verified Android attestation status and listener readiness; check profile status and daemon.log.");}
+        else{eprintln!("RBA: device trust is not configured; pairing and authentication are unavailable.");}
+        return Err(Error::Denied)
+    }
     if !io::stdin().is_terminal()||!io::stdout().is_terminal(){eprintln!("RBA: interactive terminal required.");return Err(Error::Denied)}
     let mut s=lifecycle::connect_local(dir,SOCKET)?;s.set_read_timeout(Some(Duration::from_secs(request.seconds()+2)))?;
     s.write_all(MAGIC)?;
@@ -185,7 +189,7 @@ pub(super) fn client(dir:&Path,status:&str,request:Request)->Result<()> {
         SHOW_CODE if matches!(request,Request::Pair(EntryDirection::DeviceTypes))&&phase==1=>{show_code(&p,"Enter this pairing code on your phone")?;write_packet(&mut s,ACK,&[])?;phase=2;},
         ENTER_CODE if matches!(request,Request::Pair(EntryDirection::HostTypes))&&phase==1&&p.is_empty()=>{let a=answer("Enter the pairing code shown on your phone: ")?;let code=digits(&a)?;write_packet(&mut s,CODE,code.as_slice())?;phase=2;},
         REVIEW if matches!(request,Request::Pair(_))&&phase==2=>{review(&mut s,&p)?;phase=3;},
-        AUTH_OK if matches!(request,Request::Auth(_))&&phase==1&&p.is_empty()=>{println!("Authentication successful.");return Ok(())},
+        AUTH_OK if matches!(request,Request::Auth(_))&&phase==1&&p.is_empty()=>{println!("{}",if status.contains("hardware test") {"Hardware-test authentication successful (standalone only)."} else {"Authentication successful."});return Ok(())},
         PAIR_COMMITTED if matches!(request,Request::Pair(_))&&phase==3&&p.is_empty()=>{println!("Host enrollment committed. Confirm completion on your phone; recover the pending receipt if needed.");return Ok(())},
         FAILED if p.is_empty()=>{eprintln!("RBA: operation not completed locally. Check device selection, trust and connection; inspect inventory before retrying enrollment.");return Err(Error::Denied)},
         _=>return Err(Error::Invalid),

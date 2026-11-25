@@ -23,7 +23,7 @@ const MAX_STATUS: usize = 16 * 1024 * 1024;
 fn denied(ok: bool) -> Result<()> { if ok { Ok(()) } else { Err(Error::Denied) } }
 fn ssl<T>(r: std::result::Result<T, openssl::error::ErrorStack>) -> Result<T> { r.map_err(|_| Error::Denied) }
 
-/// Administrator-provisioned release identity and security floors. No defaults.
+/// Explicitly provisioned app identity and security floors. No implicit signer.
 /// A different signer or package is a different enrollment trust policy.
 #[derive(Clone)]
 pub struct Policy {
@@ -36,8 +36,21 @@ pub struct Policy {
     pub minimum_boot_patch: u64, // YYYYMMDD
 }
 impl Policy {
+    /// The debug package is deliberately distinct from the release package.
+    /// Only the isolated standalone runtime may select this policy. Hardware,
+    /// verified boot, key role, patch-date validity and revocation checks stay on.
+    pub(crate) fn hardware_test(signer:Hash)->Result<Self>{
+        let p=Self{package_name:"io.github.burtvadr.rba.debug".into(),release_signer:signer,
+            minimum_app_version:1,minimum_os_version:90000,minimum_os_patch:201808,
+            minimum_vendor_patch:20180801,minimum_boot_patch:20180801};
+        p.validate()?;Ok(p)
+    }
     pub(crate) fn validate(&self) -> Result<()> {
-        denied(self.package_name == "io.github.burtvadr.rba" && self.release_signer != [0;32]
+        let package_ok=self.package_name == "io.github.burtvadr.rba" ||
+            (self.package_name == "io.github.burtvadr.rba.debug" &&
+             self.minimum_app_version==1 && self.minimum_os_version==90000 &&
+             self.minimum_os_patch==201808 && self.minimum_vendor_patch==20180801 && self.minimum_boot_patch==20180801);
+        denied(package_ok && self.release_signer != [0;32]
             && self.minimum_app_version > 0 && self.minimum_os_version >= 90000
             && description::patch_date(self.minimum_os_patch,false)
             && description::patch_date(self.minimum_vendor_patch,true)

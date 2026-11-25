@@ -39,16 +39,16 @@ fn write_private(path:&Path,bytes:&[u8])->Result<()> {
     let mut f=OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW|libc::O_CLOEXEC).open(path)?;
     f.write_all(bytes)?;f.sync_all()?;Ok(())
 }
-fn verify(data:&Path)->Result<()> {
-    let m=load(data)?;Store::open(&data.join("state"),m.host)?;Ok(())
+fn verify(data:&Path,hardware_test:bool)->Result<()> {
+    let m=load(data,hardware_test)?;Store::open(&data.join("state"),m.host)?;Ok(())
 }
 /// Requires the outer daemon lock. Publish all files and SQLite together by
 /// renaming a completed sibling directory. Never replace an existing identity.
-pub(super) fn ensure(dir:&Path)->Result<PathBuf>{
+pub(super) fn ensure(dir:&Path,hardware_test:bool)->Result<PathBuf>{
     let data=dir.join("instance");let pending=dir.join("bootstrap.pending");
     if !absent(&data)?{
         if !absent(&pending)?{return Err(Error::State)}
-        verify(&data)?;return Ok(data)
+        verify(&data,hardware_test)?;return Ok(data)
     }
     // Do not overwrite legacy layouts, unknown material or partial published state.
     for item in fs::read_dir(dir)?{
@@ -60,7 +60,7 @@ pub(super) fn ensure(dir:&Path)->Result<PathBuf>{
         let host=super::super::random::<16>()?;
         let cert=rcgen::generate_simple_self_signed(vec!["rbad".into()]).map_err(|_|Error::State)?;
         let key=Zeroizing::new(cert.key_pair.serialize_der());
-        let s=Settings{host_id:hex::encode(host),bind:"127.0.0.1:8765".parse().map_err(|_|Error::State)?,enrollment_bind:"127.0.0.1:8766".parse().map_err(|_|Error::State)?,release_signer:None,minimum_app_version:0,minimum_os_version:0,minimum_os_patch:0,minimum_vendor_patch:0,minimum_boot_patch:0};
+        let s=Settings{hardware_test,host_id:hex::encode(host),bind:"127.0.0.1:8765".parse().map_err(|_|Error::State)?,enrollment_bind:"127.0.0.1:8766".parse().map_err(|_|Error::State)?,release_signer:None,minimum_app_version:0,minimum_os_version:0,minimum_os_patch:0,minimum_vendor_patch:0,minimum_boot_patch:0};
         write_private(&pending.join("candidate.json"),&serde_json::to_vec_pretty(&s).map_err(|_|Error::State)?)?;
         write_private(&pending.join("host-key.pk8"),key.as_slice())?;
         write_private(&pending.join("host-cert.der"),cert.cert.der().as_ref())?;
@@ -70,10 +70,32 @@ pub(super) fn ensure(dir:&Path)->Result<PathBuf>{
     }
     // A complete interrupted staging directory can be published on retry;
     // incomplete staging is preserved and fails closed for diagnosis.
-    verify(&pending)?;
+    verify(&pending,hardware_test)?;
     fs::rename(&pending,&data)?;
     File::open(dir)?.sync_all()?;
     Ok(data)
+}
+
+/// Configure a stopped isolated instance. Do not silently repin an existing
+/// signer. Changing the local LAN address does not change the trust identity.
+pub(super) fn configure_test(dir:&Path,signer:[u8;32],ip:std::net::IpAddr)->Result<()> {
+    if !test_address(ip){return Err(Error::Invalid)}
+    let policy=Policy::hardware_test(signer)?;
+    let _lock=lock(dir)?;
+    let data=ensure(dir,true)?;
+    let current:Settings=serde_json::from_slice(&read_private(&data,"candidate.json",4096)?).map_err(|_|Error::Invalid)?;
+    let desired=Settings{hardware_test:true,host_id:current.host_id.clone(),bind:SocketAddr::new(ip,8765),enrollment_bind:SocketAddr::new(ip,8766),release_signer:Some(hex::encode(signer)),
+        minimum_app_version:policy.minimum_app_version,minimum_os_version:policy.minimum_os_version,minimum_os_patch:policy.minimum_os_patch,
+        minimum_vendor_patch:policy.minimum_vendor_patch,minimum_boot_patch:policy.minimum_boot_patch};
+    if current==desired{return Ok(())}
+    if current.release_signer.is_some()&&current.release_signer!=desired.release_signer{return Err(Error::Denied)}
+    // No sockets before verified trust. Binding the selected interface is
+    // checked by the runtime; configuration never opens a network listener.
+    let pending=data.join(format!("candidate-{}.pending",hex::encode(super::super::random::<16>()?)));
+    write_private(&pending,&serde_json::to_vec_pretty(&desired).map_err(|_|Error::State)?)?;
+    fs::rename(&pending,data.join("candidate.json"))?;
+    File::open(&data)?.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -91,17 +113,41 @@ mod tests {
     #[test] fn first_run_is_idempotent_and_exclusive(){
         let f=Fixture::new();let lock1=lock(&f.0).unwrap();
         assert!(lock(&f.0).is_err());
-        let d=ensure(&f.0).unwrap();let key=fs::read(d.join("host-key.pk8")).unwrap();
-        let id=load(&d).unwrap().host;assert!(load(&d).unwrap().policy.is_none());
-        drop(lock1);let _lock2=lock(&f.0).unwrap();assert_eq!(ensure(&f.0).unwrap(),d);
-        assert_eq!(load(&d).unwrap().host,id);assert_eq!(fs::read(d.join("host-key.pk8")).unwrap(),key);
-        fs::remove_file(d.join("host-cert.der")).unwrap();assert!(ensure(&f.0).is_err());
+        let d=ensure(&f.0,false).unwrap();let key=fs::read(d.join("host-key.pk8")).unwrap();
+        let id=load(&d,false).unwrap().host;assert!(load(&d,false).unwrap().policy.is_none());
+        drop(lock1);let _lock2=lock(&f.0).unwrap();assert_eq!(ensure(&f.0,false).unwrap(),d);
+        assert_eq!(load(&d,false).unwrap().host,id);assert_eq!(fs::read(d.join("host-key.pk8")).unwrap(),key);
+        fs::remove_file(d.join("host-cert.der")).unwrap();assert!(ensure(&f.0,false).is_err());
         assert_eq!(fs::read(d.join("host-key.pk8")).unwrap(),key);
+    }
+    #[test] fn hardware_test_identity_and_state_are_isolated(){
+        let normal=Fixture::new();let test=Fixture::new();
+        let _a=lock(&normal.0).unwrap();let _b=lock(&test.0).unwrap();
+        let d=ensure(&normal.0,false).unwrap();let t=ensure(&test.0,true).unwrap();
+        let normal=load(&d,false).unwrap();let test=load(&t,true).unwrap();
+        assert_ne!(normal.host,test.host);assert!(test.policy.is_none());
+        assert!(load(&d,true).is_err());assert!(load(&t,false).is_err());
+        assert!(ensure(d.parent().unwrap(),true).is_err());
+        assert!(ensure(t.parent().unwrap(),false).is_err());
+    }
+    #[test] fn hardware_test_configuration_is_pinned_and_idempotent(){
+        let f=Fixture::new();let ip="192.168.10.20".parse().unwrap();
+        assert!(configure_test(&f.0,[0;32],ip).is_err());
+        assert!(configure_test(&f.0,[1;32],"0.0.0.0".parse().unwrap()).is_err());
+        configure_test(&f.0,[1;32],ip).unwrap();
+        let data=f.0.join("instance");let before=fs::read(data.join("candidate.json")).unwrap();
+        let m=load(&data,true).unwrap();assert_eq!(m.bind,"192.168.10.20:8765".parse().unwrap());
+        assert_eq!(m.policy.unwrap().package_name,"io.github.burtvadr.rba.debug");
+        configure_test(&f.0,[1;32],ip).unwrap();assert_eq!(fs::read(data.join("candidate.json")).unwrap(),before);
+        assert!(configure_test(&f.0,[2;32],ip).is_err());assert_eq!(fs::read(data.join("candidate.json")).unwrap(),before);
+        configure_test(&f.0,[1;32],"192.168.10.21".parse().unwrap()).unwrap();
+        let updated=load(&data,true).unwrap();assert_eq!(updated.host,m.host);assert_eq!(updated.bind,"192.168.10.21:8765".parse().unwrap());
+        assert!(load(&data,false).is_err());
     }
     #[test] fn incomplete_bootstrap_is_preserved(){
         let f=Fixture::new();let _lock=lock(&f.0).unwrap();let p=f.0.join("bootstrap.pending");mkdir(&p).unwrap();
         write_private(&p.join("host-key.pk8"),b"partial").unwrap();
-        assert!(ensure(&f.0).is_err());assert_eq!(fs::read(p.join("host-key.pk8")).unwrap(),b"partial");
+        assert!(ensure(&f.0,false).is_err());assert_eq!(fs::read(p.join("host-key.pk8")).unwrap(),b"partial");
         assert!(absent(&f.0.join("instance")).unwrap());
     }
 }

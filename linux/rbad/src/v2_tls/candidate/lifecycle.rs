@@ -63,11 +63,11 @@ fn read_reply(mut stream:impl Read,request:Request)->Result<Reply>{
     Ok(reply)
 }
 fn uid()->u32{unsafe{libc::geteuid()}}
-fn default_dir()->Result<PathBuf>{
+fn default_dir(hardware_test:bool)->Result<PathBuf>{
     let base=std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).filter(|p|p.is_absolute())
         .or_else(||std::env::var_os("HOME").map(PathBuf::from).filter(|p|p.is_absolute()).map(|p|p.join(".local/share")))
         .ok_or(Error::Invalid)?;
-    Ok(base.join("rba/standalone-v2"))
+    Ok(base.join(if hardware_test{"rba/hardware-test-v2"}else{"rba/standalone-v2"}))
 }
 pub(super) fn owned_socket(path:&Path)->Result<()> {
     let m=fs::symlink_metadata(path)?;
@@ -76,7 +76,7 @@ pub(super) fn owned_socket(path:&Path)->Result<()> {
 pub(super) struct SocketGuard(pub(super) PathBuf);
 impl Drop for SocketGuard{fn drop(&mut self){if owned_socket(&self.0).is_ok(){let _=fs::remove_file(&self.0);}}}
 /// The outer daemon lock is held before binding and until this future exits.
-pub(super) async fn serve_local(dir:&Path,status:&'static str,owner:Owner,shutdown:impl std::future::Future<Output=()>)->Result<()> {
+pub(super) async fn serve_local(dir:&Path,status:watch::Receiver<&'static str>,owner:Owner,shutdown:impl std::future::Future<Output=()>)->Result<()> {
     let path=dir.join(SOCKET);
     match fs::symlink_metadata(&path){
         Ok(_)=>{owned_socket(&path)?;fs::remove_file(&path)?;},
@@ -102,7 +102,7 @@ pub(super) async fn serve_local(dir:&Path,status:&'static str,owner:Owner,shutdo
                         // reject trailing input before any operation is performed.
                         let mut extra=[0u8;1];if stream.read(&mut extra).await?!=0{return Err(Error::Invalid)}
                         let reply=match request{
-                            Request::Status=>Reply::Status{message:status.into()},
+                            Request::Status=>Reply::Status{message:(*status.borrow()).into()},
                             Request::Stop=>Reply::Stopping,
                             Request::Devices=>inventory(&owner,peer_uid).unwrap_or(Reply::Failed),
                         };
@@ -150,7 +150,7 @@ fn query(dir:&Path,request:Request)->Result<Reply>{
 fn status(dir:&Path)->Result<Option<String>>{
     match probe(dir,Request::Status)?{Some(Reply::Status{message})=>Ok(Some(message)),None=>Ok(None),_=>Err(Error::State)}
 }
-fn start(dir:&Path)->Result<String>{
+fn start(dir:&Path,hardware_test:bool)->Result<String>{
     if let Some(message)=status(dir)?{return Ok(message)}
     bootstrap::create_root(dir)?;
     let path=dir.join("daemon.log");
@@ -159,7 +159,7 @@ fn start(dir:&Path)->Result<String>{
     let m=log.metadata()?;let p=fs::symlink_metadata(&path)?;
     if !m.is_file()||m.uid()!=uid()||m.mode()&0o7777!=0o600||m.nlink()!=1||m.ino()!=p.ino()||m.dev()!=p.dev(){return Err(Error::Denied)}
     let mut cmd=Command::new(std::env::current_exe()?);
-    cmd.arg("--run-candidate").arg(dir).stdin(Stdio::null()).stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log));
+    cmd.arg(if hardware_test{"--run-hardware-test"}else{"--run-candidate"}).arg(dir).stdin(Stdio::null()).stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log));
     // Separate the daemon from the launching terminal; no shell or sudo.
     unsafe{cmd.pre_exec(||{if libc::setsid()<0{Err(io::Error::last_os_error())}else{Ok(())}});}
     let mut child=cmd.spawn()?;
@@ -201,25 +201,27 @@ fn stop(dir:&Path)->Result<()> {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
-fn foreground(dir:&Path)->Result<()> {
+fn foreground(dir:&Path,hardware_test:bool)->Result<()> {
     let rt=tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async{
         let mut term=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        run(dir,async{tokio::select!{_ = tokio::signal::ctrl_c()=>{},_ = term.recv()=>{}}}).await
+        run(dir,hardware_test,async{tokio::select!{_ = tokio::signal::ctrl_c()=>{},_ = term.recv()=>{}}}).await
     })
 }
 /// Shared entry for the public rba executable and internal rbad artifact.
 pub fn entry()->ExitCode{
-    let args:Vec<_>=std::env::args_os().skip(1).collect();
+    let mut args:Vec<_>=std::env::args_os().skip(1).collect();
+    let hardware_test=args.first().is_some_and(|a|a=="--hardware-test");
+    if hardware_test{args.remove(0);}
     let result:Result<()>=(||{
         match args.as_slice(){
-            []=>{let d=default_dir()?;println!("RBA {}",start(&d)?);Ok(())},
-            [a] if a=="start-server"||a=="start"=>{println!("RBA {}",start(&default_dir()?)?);Ok(())},
-            [a,b] if a=="start-server"&&b=="--foreground"=>foreground(&default_dir()?),
-            [a] if a=="status"=>{println!("RBA {}",status(&default_dir()?)?.as_deref().unwrap_or("stopped"));Ok(())},
-            [a] if a=="kill-server"||a=="stop"=>{stop(&default_dir()?)?;println!("RBA stopped");Ok(())},
+            []=>{let d=default_dir(hardware_test)?;println!("RBA {}",start(&d,hardware_test)?);Ok(())},
+            [a] if a=="start-server"||a=="start"=>{println!("RBA {}",start(&default_dir(hardware_test)?,hardware_test)?);Ok(())},
+            [a,b] if a=="start-server"&&b=="--foreground"=>foreground(&default_dir(hardware_test)?,hardware_test),
+            [a] if a=="status"=>{println!("RBA {}",status(&default_dir(hardware_test)?)?.as_deref().unwrap_or("stopped"));Ok(())},
+            [a] if a=="kill-server"||a=="stop"=>{stop(&default_dir(hardware_test)?)?;println!("RBA stopped");Ok(())},
             [a] if a=="devices"=>{
-                let dir=default_dir()?;let message=start(&dir)?;
+                let dir=default_dir(hardware_test)?;let message=start(&dir,hardware_test)?;
                 let Reply::Devices{rows}=query(&dir,Request::Devices)? else{return Err(Error::State)};
                 if message.contains("network authentication disabled"){eprintln!("RBA {message}");}
                 println!("List of devices attached");
@@ -230,22 +232,29 @@ pub fn entry()->ExitCode{
                 Ok(())
             },
             [a] if a=="pair"||a=="auth"=>{
-                let dir=default_dir()?; let status=start(&dir)?;
+                let dir=default_dir(hardware_test)?; let status=start(&dir,hardware_test)?;
                 super::interaction::client(&dir,&status,if a=="pair" {super::interaction::Request::Pair(EntryDirection::DeviceTypes)} else {super::interaction::Request::Auth(None)})
             },
             [a,b,c] if a=="pair"&&b=="--code-entry"=>{
                 let direction=match c.to_str(){Some("host")=>EntryDirection::HostTypes,Some("device")=>EntryDirection::DeviceTypes,_=>return Err(Error::Invalid)};
-                let dir=default_dir()?;let status=start(&dir)?;super::interaction::client(&dir,&status,super::interaction::Request::Pair(direction))
+                let dir=default_dir(hardware_test)?;let status=start(&dir,hardware_test)?;super::interaction::client(&dir,&status,super::interaction::Request::Pair(direction))
             },
             [a,b,c] if a=="auth"&&b=="--device"=>{
                 let id=exact_hex::<16>(c.to_str().ok_or(Error::Invalid)?)?;
-                let dir=default_dir()?;let status=start(&dir)?;super::interaction::client(&dir,&status,super::interaction::Request::Auth(Some(id)))
+                let dir=default_dir(hardware_test)?;let status=start(&dir,hardware_test)?;super::interaction::client(&dir,&status,super::interaction::Request::Auth(Some(id)))
             },
-            [a] if a=="help"||a=="--help"=>{println!("rba [devices|pair|auth|start-server|kill-server|status|help|version]\nNo arguments or devices starts the standalone server automatically.\npair [--code-entry device|host]; auth [--device ID]. Device trust must be configured; system installation is disabled.");Ok(())},
+            [a,b,c,d,e] if hardware_test&&a=="configure"&&b=="--signer"&&d=="--listen"=>{
+                let signer=exact_hex::<32>(c.to_str().ok_or(Error::Invalid)?)?;
+                let ip=e.to_str().ok_or(Error::Invalid)?.parse().map_err(|_|Error::Invalid)?;
+                bootstrap::configure_test(&default_dir(true)?,signer,ip)?;
+                println!("Hardware-test profile configured. Run rba --hardware-test start-server; device operations require verified Android status.");Ok(())
+            },
+            [a] if a=="help"||a=="--help"=>{println!("rba [devices|pair|auth|start-server|kill-server|status|help|version]\nNo arguments or devices starts the standalone server automatically.\npair [--code-entry device|host]; auth [--device ID]. Device trust must be configured; system installation is disabled.\nOptional isolated test profile: rba --hardware-test configure --signer SHA256 --listen PRIVATE_IPV4\nPrefix test commands with --hardware-test; production state is separate.");Ok(())},
             [a] if a=="version"||a=="--version"=>{println!("rba {} (V2 candidate)",env!("CARGO_PKG_VERSION"));Ok(())},
-            [a,d] if a=="--initialize-candidate"=>initialize(Path::new(d)),
-            [a,d] if a=="--check-candidate"=>check(Path::new(d)),
-            [a,d] if a=="--run-candidate"=>foreground(Path::new(d)),
+            [a,d] if !hardware_test&&a=="--initialize-candidate"=>initialize(Path::new(d)),
+            [a,d] if !hardware_test&&a=="--check-candidate"=>check(Path::new(d)),
+            [a,d] if !hardware_test&&a=="--run-candidate"=>foreground(Path::new(d),false),
+            [a,d] if !hardware_test&&a=="--run-hardware-test"=>foreground(Path::new(d),true),
             _=>Err(Error::Invalid),
         }
     })();

@@ -160,3 +160,15 @@ fn transport_digest_profile_never_expands_biometric_digest_policy(){
     for n in ["transport_sha_only","transport_none_only"] { assert!(verify(&mut v,&chain(n),false,NOW).is_err()); }
     assert!(verify(&mut v,&chain("bio_none"),true,NOW).is_err());
 }
+
+#[test]
+fn hardware_test_policy_pins_debug_package_and_signer(){
+    let debug=Policy::hardware_test([0x44;32]).unwrap();
+    assert_eq!(debug.package_name,"io.github.burtvadr.rba.debug");
+    assert!(Policy::hardware_test([0;32]).is_err());
+    let mut changed=debug.clone();changed.minimum_os_patch=0;assert!(changed.validate().is_err());
+    let mut changed=debug.clone();changed.package_name="another.debug".into();assert!(changed.validate().is_err());
+    // Existing release-signed fixture must not enroll in the debug profile.
+    let mut v=AndroidAttestationVerifier::new(debug,&[fixture("root")],snapshot(br#"{"entries":{}}"#)).unwrap();
+    assert!(verify(&mut v,&chain("biometric"),true,NOW).is_err());
+}

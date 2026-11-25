@@ -19,7 +19,7 @@ impl Fixture {
     fn data(&self)->PathBuf {self.0.join("rba/standalone-v2/instance")}
 }
 impl Drop for Fixture {
-    fn drop(&mut self){let _=self.cmd().arg("kill-server").stdout(Stdio::null()).stderr(Stdio::null()).status();let _=fs::remove_dir_all(&self.0);}
+    fn drop(&mut self){let _=self.cmd().args(["--hardware-test","kill-server"]).stdout(Stdio::null()).stderr(Stdio::null()).status();let _=self.cmd().arg("kill-server").stdout(Stdio::null()).stderr(Stdio::null()).status();let _=fs::remove_dir_all(&self.0);}
 }
 #[test]
 fn zero_config_concurrent_start_and_restart_preserve_identity(){
@@ -113,4 +113,22 @@ fn interactive_commands_autostart_but_deny_without_trust() {
     assert!(f.run(&["status"]).contains("network authentication disabled"));
     assert_eq!(f.run(&["devices"]).trim(),"List of devices attached");
     assert!(!f.data().parent().unwrap().join("operation.sock").exists());
+}
+
+#[test]
+fn hardware_test_cli_isolated_and_unconfigured_fail_closed(){
+    let f=Fixture::new();
+    assert!(f.run(&["--hardware-test","status"]).contains("stopped"));assert!(!f.0.exists());
+    f.run(&["devices"]);f.run(&["--hardware-test","devices"]);
+    let test=f.0.join("rba/hardware-test-v2/instance");let normal=f.data();
+    assert_ne!(fs::read(test.join("host-key.pk8")).unwrap(),fs::read(normal.join("host-key.pk8")).unwrap());
+    assert!(f.run(&["--hardware-test","status"]).contains("hardware test"));
+    assert!(f.run(&["status"]).contains("network authentication disabled"));
+    assert!(!f.cmd().args(["--hardware-test","pair"]).output().unwrap().status.success());
+    let signer="44".repeat(32);
+    assert!(!f.cmd().args(["--hardware-test","configure","--signer",&signer,"--listen","0.0.0.0"]).output().unwrap().status.success());
+    f.run(&["--hardware-test","kill-server"]);assert!(f.run(&["status"]).contains("running:"));
+    assert!(!f.cmd().arg("--check-candidate").arg(test.parent().unwrap()).output().unwrap().status.success());
+    assert!(!f.cmd().args(["configure","--signer",&signer,"--listen","192.168.1.2"]).output().unwrap().status.success());
+    assert!(!test.parent().unwrap().join("operation.sock").exists());
 }

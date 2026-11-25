@@ -12,15 +12,17 @@ mod lifecycle;
 mod interaction;
 pub use lifecycle::entry;
 use std::{fs::OpenOptions, io::Read, net::SocketAddr, os::unix::fs::OpenOptionsExt, path::Path};
-use tokio::{net::TcpListener, task::JoinSet};
+use tokio::{net::TcpListener, task::JoinSet, sync::{watch,oneshot}};
 use zeroize::Zeroizing;
 
 const MAX_TASKS: usize = 32;
 const RETRY: Duration = Duration::from_secs(30);
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Settings {
+    #[serde(default)]
+    hardware_test: bool,
     host_id: String,
     bind: SocketAddr,
     enrollment_bind: SocketAddr,
@@ -44,19 +46,31 @@ fn read_private(dir:&Path,name:&str,max:usize)->Result<Vec<u8>> {
     if data.is_empty()||data.len()>max{return Err(Error::Invalid)} Ok(data)
 }
 struct Material { host:Id, bind:SocketAddr, enrollment_bind:SocketAddr, policy:Option<Policy>, identity:Identity, signer:SigningKey }
-fn load(dir:&Path)->Result<Material>{
+fn load(dir:&Path,hardware_test:bool)->Result<Material>{
     private_dir(dir,unsafe{libc::geteuid()})?;
     let s:Settings=serde_json::from_slice(&read_private(dir,"candidate.json",4096)?).map_err(|_|Error::Invalid)?;
+    if s.hardware_test!=hardware_test{return Err(Error::Denied)}
     if s.bind.port()==0||s.enrollment_bind.port()==0||s.bind.port()==s.enrollment_bind.port(){return Err(Error::Invalid)}
     let host=exact_hex::<16>(&s.host_id)?;
     let policy=match s.release_signer {
         Some(release_signer)=>{
-            let policy=Policy{package_name:"io.github.burtvadr.rba".into(),release_signer:exact_hex::<32>(&release_signer)?,
-                minimum_app_version:s.minimum_app_version,minimum_os_version:s.minimum_os_version,minimum_os_patch:s.minimum_os_patch,
-                minimum_vendor_patch:s.minimum_vendor_patch,minimum_boot_patch:s.minimum_boot_patch};
+            let signer=exact_hex::<32>(&release_signer)?;
+            let policy=if hardware_test{
+                let p=Policy::hardware_test(signer)?;
+                if !test_address(s.bind.ip()) || s.enrollment_bind.ip()!=s.bind.ip() ||
+                    s.bind.port()!=8765 || s.enrollment_bind.port()!=8766 ||
+                    [s.minimum_app_version,s.minimum_os_version,s.minimum_os_patch,s.minimum_vendor_patch,s.minimum_boot_patch]!=
+                    [p.minimum_app_version,p.minimum_os_version,p.minimum_os_patch,p.minimum_vendor_patch,p.minimum_boot_patch]{return Err(Error::Denied)}
+                p
+            }else{
+                Policy{package_name:"io.github.burtvadr.rba".into(),release_signer:signer,
+                    minimum_app_version:s.minimum_app_version,minimum_os_version:s.minimum_os_version,minimum_os_patch:s.minimum_os_patch,
+                    minimum_vendor_patch:s.minimum_vendor_patch,minimum_boot_patch:s.minimum_boot_patch}
+            };
             policy.validate()?;Some(policy)
         },
         None=>{
+            if hardware_test && (!s.bind.ip().is_loopback() || !s.enrollment_bind.ip().is_loopback()){return Err(Error::Denied)}
             if [s.minimum_app_version,s.minimum_os_version,s.minimum_os_patch,s.minimum_vendor_patch,s.minimum_boot_patch]!=[0;5]{return Err(Error::Invalid)}
             None
         }
@@ -73,16 +87,21 @@ fn load(dir:&Path)->Result<Material>{
     identity.config(Listener::Production,BTreeMap::new())?;
     Ok(Material{host,bind:s.bind,enrollment_bind:s.enrollment_bind,policy,identity,signer})
 }
+/// Test listeners are scoped to one explicitly selected RFC1918 IPv4 address.
+/// No wildcard, public address, or automatic discovery/listening.
+fn test_address(ip:std::net::IpAddr)->bool{
+    matches!(ip,std::net::IpAddr::V4(v) if v.is_private())
+}
 /// Idempotent initialization, serialized against every running instance.
 pub fn initialize(dir:&Path)->Result<()> {
     let _lock=bootstrap::lock(dir)?;
-    bootstrap::ensure(dir).map(|_|())
+    bootstrap::ensure(dir,false).map(|_|())
 }
 /// Local validation only, without network access.
 pub fn check(dir:&Path)->Result<()> {
     let _lock=bootstrap::lock_existing(dir)?;
     let data=dir.join("instance");
-    let m=load(&data)?;Store::open(&data.join("state"),m.host)?;Ok(())
+    let m=load(&data,false)?;Store::open(&data.join("state"),m.host)?;Ok(())
 }
 
 pub(crate) struct Runtime {
@@ -134,26 +153,55 @@ async fn refresh(owner:Owner,policy:Policy,first:Instant)->Result<()> {
     }
 }
 /// No network listener is bound before trust provisioning and transactional revalidation.
-/// A bounded task set owns accepted connections; shutdown aborts and joins all
-/// of them. The legacy control socket is never opened by this runtime.
-pub async fn run(dir:&Path,shutdown:impl std::future::Future<Output=()>)->Result<()> {
+/// Local lifecycle is available independently of the status fetch. No synthetic
+/// revocation status, even for hardware testing.
+pub async fn run(dir:&Path,hardware_test:bool,shutdown:impl std::future::Future<Output=()>)->Result<()> {
     let _lock=bootstrap::lock(dir)?;
-    let data=bootstrap::ensure(dir)?;
-    let m=load(&data)?;
+    let data=bootstrap::ensure(dir,hardware_test)?;
+    let mut m=load(&data,hardware_test)?;
     let store=Store::open(&data.join("state"),m.host)?;
     let owner=Arc::new(Mutex::new(Authority::new(store)));
-    let Some(policy)=m.policy else {
-        // Only local lifecycle and read-only inventory are available. No
-        // verifier, TCP listener, or fabricated trust window is installed.
-        return lifecycle::serve_local(dir,"running: device trust not configured; network authentication disabled",owner,shutdown).await;
+    let Some(policy)=m.policy.take() else {
+        let message=if hardware_test{"running: hardware test; device trust not configured; network authentication disabled"}
+            else{"running: device trust not configured; network authentication disabled"};
+        let (_tx,rx)=watch::channel(message);
+        return lifecycle::serve_local(dir,rx,owner,shutdown).await;
     };
-    let first=install(&owner,provision(policy.clone()).await?)?;
-    let listener=TcpListener::bind(m.bind).await?;
+    let (pending,ready)=if hardware_test{
+        ("running: hardware test; waiting for verified Android status and listener readiness; network authentication disabled",
+         "running: hardware test; verified Android status; standalone CLI only")
+    }else{
+        ("running: waiting for verified Android status and listener readiness; network authentication disabled",
+         "running: configured candidate; standalone CLI only")
+    };
+    let (status,rx)=watch::channel(pending);
+    let local=lifecycle::serve_local(dir,rx,owner.clone(),shutdown);
+    let (stop,stop_rx)=oneshot::channel();
+    let network=serve_network(dir,m,owner,policy,status,pending,ready,stop_rx);
+    tokio::pin!(local,network);
+    tokio::select!{
+        biased;
+        result=&mut local=>{let _=stop.send(());let network_result=network.await;result.and(network_result)},
+        result=&mut network=>result,
+    }
+}
+async fn serve_network(dir:&Path,m:Material,owner:Owner,policy:Policy,status:watch::Sender<&'static str>,pending:&'static str,ready:&'static str,mut stop:oneshot::Receiver<()>)->Result<()> {
+    let (first,listener)=loop{
+        let provisioned=tokio::select!{biased; _=&mut stop=>return Ok(()),result=provision(policy.clone())=>result};
+        match provisioned.and_then(|v|install(&owner,v)){
+            Ok(expiry)=>match TcpListener::bind(m.bind).await{
+                Ok(listener)=>break (expiry,listener),
+                Err(e)=>{eprintln!("RBA: cannot bind {}: {e}; retrying in 30 seconds",m.bind);}
+            },
+            Err(_)=>{eprintln!("RBA: Android attestation status unavailable; retrying in 30 seconds");}
+        }
+        tokio::select!{biased; _=&mut stop=>return Ok(()),_=tokio::time::sleep(RETRY)=>{}}
+    };
     let runtime=Arc::new(Runtime{scheduler:AuthScheduler::new(owner.clone()),administrative:AdministrativeRoutes::new(owner.clone()),owner:owner.clone(),identity:m.identity,signer:m.signer,enrollment_bind:m.enrollment_bind});
     let refresh=refresh(owner.clone(),policy,first);
     let operations=interaction::bind(dir)?;
-    let local=lifecycle::serve_local(dir,"running: configured candidate; standalone CLI only",owner.clone(),shutdown);
-    tokio::pin!(refresh,local);
+    status.send_replace(ready);
+    tokio::pin!(refresh);
     let mut local_tasks=JoinSet::new();
     let mut tasks=JoinSet::new();
     let mut tick=tokio::time::interval(Duration::from_secs(1));
@@ -161,7 +209,7 @@ pub async fn run(dir:&Path,shutdown:impl std::future::Future<Output=()>)->Result
     let result=loop {
         tokio::select! {
             biased;
-            result=&mut local=>break result,
+            _=&mut stop=>break Ok(()),
             joined=local_tasks.join_next(),if !local_tasks.is_empty()=>{
                 if joined.is_some_and(|r|r.is_err()){break Err(Error::State)}
             },
@@ -176,7 +224,7 @@ pub async fn run(dir:&Path,shutdown:impl std::future::Future<Output=()>)->Result
                 let now=match wall(){Ok(now)=>now,Err(e)=>break Err(e)};
                 // Expiry closes authority access; a later fresh status can
                 // recover it. No synthetic trust window is ever installed.
-                let _=a.maintenance(now,Instant::now());
+                status.send_replace(if a.maintenance(now,Instant::now()).is_ok(){ready}else{pending});
             },
             joined=tasks.join_next(),if !tasks.is_empty()=>{
                 if joined.is_some_and(|r|r.is_err()){break Err(Error::State)}
@@ -196,6 +244,10 @@ mod tests {
     #[test] fn candidate_ids_are_exact_and_nonzero(){
         assert_eq!(exact_hex::<2>("012a").unwrap(),[1,42]);
         for s in ["0000","012A","012","012aa","0x12"," 123"] {assert!(exact_hex::<2>(s).is_err());}
+    }
+    #[test] fn hardware_test_lan_scope_is_explicit(){
+        for ip in ["10.0.0.1","172.16.0.2","192.168.1.4"]{assert!(test_address(ip.parse().unwrap()));}
+        for ip in ["0.0.0.0","127.0.0.1","8.8.8.8","169.254.0.1","::","fd00::1"]{assert!(!test_address(ip.parse().unwrap()));}
     }
     #[test] fn candidate_refresh_does_not_spin_on_short_cache(){
         let before=Instant::now();let next=next_refresh(before+Duration::from_secs(1));

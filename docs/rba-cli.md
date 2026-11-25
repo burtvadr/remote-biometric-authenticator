@@ -409,3 +409,12 @@ share trust state.
 5. **Multi-host/multi-device.** The README now says one or more devices and hosts.
    The current app keeps one host link at a time. Decide the model before the CLI
    grows commands that assume it.
+
+## Isolated hardware-testing profile (B.3.7.4 candidate)
+
+Use `rba --hardware-test configure --signer SHA256 --listen PRIVATE_IPV4`
+with the verified debug APK signer and selected LAN address, then prefix
+`start-server`, `status`, `pair`, `devices`, `auth` and `kill-server` with
+`--hardware-test`. See [hardware-test workflow](B3_7_4_HARDWARE_TEST.md).
+Default standalone state and trust are unchanged; actual device operations
+require verified Android revocation status, even though startup does not.
